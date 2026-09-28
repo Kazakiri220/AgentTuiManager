@@ -13,6 +13,7 @@ import { ensureMacPtySpawnHelper } from './macos-pty-helper'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { TerminalStateReplay } from './terminal-state-replay'
 import { claudeWindowsHookLauncher, claudeWindowsHookCommand } from './claude-hook-launcher'
+import { initialPromptArgs } from './session-continuation'
 
 function argument(name: string): string {
   const index = process.argv.indexOf(name)
@@ -261,7 +262,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
       // without this it falls back to a 30-row repaint with no terminal scrollback.
       ...(process.platform === 'win32' && command.agentKind === 'codex' ? { conptyInheritCursor: true } : {}),
     }
-    terminal = spawnAgentTerminal(command.agentKind, command.executable, args, spawnOptions)
+    terminal = spawnAgentTerminal(command.agentKind, command.executable, initialPromptArgs(command.agentKind, args, command.initialPrompt), spawnOptions)
     terminalStateReplay = command.agentKind === 'codex'
       ? new TerminalStateReplay(command.cols, command.rows, 10_000, (data) => terminal?.write(data))
       : undefined

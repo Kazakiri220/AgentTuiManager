@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, readdir, rename, unlink, writeFile } from 'node:fs/promises'
 import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
+import { resolveNetworkRetry } from './agent-network-retry'
+import { autoCompactArgs } from '../src/shared/auto-compact'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import type { AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
@@ -33,6 +35,7 @@ export interface HostRecord {
 }
 
 export interface StartHostOptions {
+  initialPrompt?: string
   sessionId?: string
   displayName?: string
   agentKind: AgentKind
@@ -386,7 +389,7 @@ export class SessionHostManager {
       cols: options.cols,
       rows: options.rows,
       ...(options.maxContinueRetries === undefined ? {} : { maxContinueRetries: options.maxContinueRetries }),
-      ...(options.agentConfig?.enabled ? { agentConfig: { ...options.agentConfig, extraArgs: [...options.agentConfig.extraArgs] } } : {}),
+      ...(options.agentConfig ? { agentConfig: { ...options.agentConfig, extraArgs: [...options.agentConfig.extraArgs] } } : {}),
       ...(options.agentProxy?.enabled ? { agentProxy: { ...options.agentProxy } } : {}),
       ...(options.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
       pid: 0,
@@ -429,19 +432,21 @@ export class SessionHostManager {
         ? await this.resolveAgentConfig?.(options.agentConfig.profileId, options.agentKind, options.args)
         : undefined
       if (options.agentConfig?.enabled && options.agentConfig.profileId && !configured) throw new Error('独立配置不可用，未启动 Agent')
+      const retry = await resolveNetworkRetry(options.agentKind, configured?.args ?? options.args, options.agentConfig?.networkRetry)
       const proxyEnvironment = options.agentProxy?.enabled && options.agentProxy.proxyId
         ? await this.resolveAgentProxy?.(options.agentProxy.proxyId)
         : undefined
       if (options.agentProxy?.enabled && options.agentProxy.proxyId && !proxyEnvironment) throw new Error('代理配置不可用，未启动 Agent')
       handle.send({
         type: 'start',
+        ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
         agentKind: options.agentKind,
         executable: options.executable,
-        args: configured?.args ?? options.args,
+        args: autoCompactArgs(options.agentKind, retry.args, options.agentConfig?.autoCompactTokens),
         cwd: options.cwd,
         cols: options.cols,
         rows: options.rows,
-        ...((configured || proxyEnvironment) ? { environment: { ...configured?.environment, ...proxyEnvironment } } : {}),
+        ...((configured || proxyEnvironment || Object.keys(retry.environment).length) ? { environment: { ...configured?.environment, ...proxyEnvironment, ...retry.environment } } : {}),
       })
       const event = await raceChild(handle.nextEvent(this.timeoutMs))
       if (event.type !== 'ready') {

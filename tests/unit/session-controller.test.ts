@@ -87,6 +87,19 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it('carries retry-only configuration through start, edit and native restart', async () => {
+    const { controller, starts, manager } = fixture()
+    const agentConfig = { enabled: false, source: 'local' as const, extraArgs: [], hasApiKey: false, networkRetry: { codexStreamRetries: 20 } }
+    const session = await controller.startSession({ ...request(true), agentConfig })
+    expect(starts[0]?.agentConfig).toEqual(agentConfig)
+    const edited = { ...agentConfig, networkRetry: { codexStreamRetries: 30 } }
+    await controller.updateSessionConfig(session.sessionId, edited)
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', { agentConfig: edited })
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]?.agentConfig).toEqual(edited)
+    expect(controller.listSessions()[0]?.agentConfig).toEqual(edited)
+  })
   it('keeps a structured Codex approval pending when the terminal returns to an idle prompt', async () => {
     vi.useFakeTimers()
     try {
@@ -122,7 +135,7 @@ describe('SessionController recovery evidence', () => {
     const catalog = { list: () => [], upsert: vi.fn(async () => undefined), flush: vi.fn(async () => undefined), remove: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) }
     const controller = new SessionController(manager, undefined, undefined, undefined, undefined, undefined, undefined, undefined, catalog)
     const session = await controller.startSession(request())
-    const config = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
+    const config = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3, errorRecoveryAttempts: 4, errorRecoveryCooldownMinutes: 8 }
     await controller.saveUnattendedSettings(session.sessionId, config)
     expect(catalog.upsert).toHaveBeenLastCalledWith(expect.objectContaining({ summary: expect.objectContaining({ unattended: expect.objectContaining(config) }) }))
     expect(catalog.flush).toHaveBeenCalled()
@@ -132,7 +145,7 @@ describe('SessionController recovery evidence', () => {
   it('saves inactive settings and retains them across enable/disable without resetting delay', async () => {
     const { controller } = fixture()
     const session = await controller.startSession(request())
-    const input = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
+    const input = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3, errorRecoveryAttempts: 4, errorRecoveryCooldownMinutes: 8 }
     await controller.saveUnattendedSettings(session.sessionId, input)
     expect(controller.listSessions()[0]!.unattended).toMatchObject(input)
     await controller.setUnattendedMode(session.sessionId, { ...input, enabled: true })

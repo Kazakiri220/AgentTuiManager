@@ -1,6 +1,8 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
+import { parseAutoCompactTokens } from '../src/shared/auto-compact'
+import { parseNetworkRetry, type NetworkRetrySettings } from '../src/shared/network-retry'
 
 import type { AgentConfigInput, AgentConfigSource, AgentConfigSummary } from '../src/shared/manager-api'
 
@@ -11,6 +13,8 @@ export interface SecureConfigurationCodec {
 }
 
 export interface StoredAgentConfig {
+  autoCompactTokens?: number
+  networkRetry?: NetworkRetrySettings
   profileId: string
   source: Exclude<AgentConfigSource, 'local'>
   baseUrl?: string
@@ -33,6 +37,8 @@ interface EncryptedEnvelope {
 
 function summary(profile: StoredAgentConfig): AgentConfigSummary {
   return {
+    ...(profile.autoCompactTokens === undefined ? {} : { autoCompactTokens: profile.autoCompactTokens }),
+    ...(profile.networkRetry ? { networkRetry: { ...profile.networkRetry } } : {}),
     enabled: true,
     source: profile.source,
     profileId: profile.profileId,
@@ -75,12 +81,16 @@ export class AgentConfigurationStore {
   }
 
   async save(input: AgentConfigInput, existingProfileId?: string): Promise<AgentConfigSummary> {
-    if (!input.enabled || input.source === 'local') return AgentConfigurationStore.localSummary()
+    const networkRetry = parseNetworkRetry(input.networkRetry)
+    const autoCompactTokens = parseAutoCompactTokens(input.autoCompactTokens)
+    if (!input.enabled || input.source === 'local') return AgentConfigurationStore.localSummary(networkRetry, autoCompactTokens)
     if (!this.codec.isEncryptionAvailable()) throw new Error('当前系统无法使用安全存储，独立配置未保存')
     const profileId = existingProfileId && this.profiles.has(existingProfileId) ? existingProfileId : randomUUID()
     const previous = this.profiles.get(profileId)
     const apiKey = input.clearApiKey ? undefined : input.apiKey ?? previous?.apiKey
     const profile: StoredAgentConfig = {
+      ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }),
+      ...(networkRetry ? { networkRetry } : {}),
       profileId,
       source: input.source,
       ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
@@ -105,8 +115,8 @@ export class AgentConfigurationStore {
     await this.persist()
   }
 
-  static localSummary(): AgentConfigSummary {
-    return { enabled: false, source: 'local', extraArgs: [], hasApiKey: false }
+  static localSummary(networkRetry?: NetworkRetrySettings, autoCompactTokens?: number): AgentConfigSummary {
+    return { enabled: false, source: 'local', extraArgs: [], hasApiKey: false, ...(networkRetry ? { networkRetry: { ...networkRetry } } : {}), ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }) }
   }
 
   private async persist(): Promise<void> {

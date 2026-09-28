@@ -1,5 +1,5 @@
 import type { ApprovalRequest, SessionSummary, UnattendedSettings } from '../src/shared/manager-api'
-import { approvalEnterCount, approvalEnterDelay, normalizeUnattendedEndWords, selectedRecoveryEndWord } from '../src/shared/unattended-settings'
+import { approvalEnterCount, approvalEnterDelay, errorRecoveryPolicy, normalizeUnattendedEndWords, selectedRecoveryEndWord } from '../src/shared/unattended-settings'
 
 export interface UnattendedAudit {
   sessionId: string; action: string; message: string
@@ -11,6 +11,7 @@ interface Mode {
   restartFailures?: number
   nextErrorRecoveryAt?: number
   errorRecoveries?: number
+  lastReplyAt?: number
   approvalEnter?: { at: number; epoch: number | undefined; requestId: string; remaining: number; total: number }
   inputRevision?: number
 }
@@ -47,7 +48,7 @@ export class UnattendedSupervisor {
     if (session.userStopRequested || ['stopped', 'completed', 'failed'].includes(session.status)) throw new Error('请先启动 Agent，再开启无监管模式')
     const endWords = normalizeUnattendedEndWords(settings)
     if (!settings.recoveryWord?.trim() || settings.recoveryWord.length > 2000 || /[\x00-\x1f\x7f]/.test(settings.recoveryWord)) throw new Error('恢复词必须为一行且不超过 2000 字符')
-    const value = { enabled: true, endWord: endWords[0]!, endWords, recoveryEndWord: selectedRecoveryEndWord(settings), recoveryWord: settings.recoveryWord.trim(), approvalEnterDelaySeconds: approvalEnterDelay(settings), approvalEnterCount: approvalEnterCount(settings) }
+    const value = { enabled: true, endWord: endWords[0]!, endWords, recoveryEndWord: selectedRecoveryEndWord(settings), recoveryWord: settings.recoveryWord.trim(), approvalEnterDelaySeconds: approvalEnterDelay(settings), approvalEnterCount: approvalEnterCount(settings), ...errorRecoveryPolicy(settings) }
     this.modes.set(id, { settings: value, startedAt: this.now(), nextAt: this.now() + 5000, busy: false, restarts: [] })
     this.port.changed(id, value)
     this.port.audit({ sessionId: id, action: 'unattended_enabled', message: '已开启无监管：包括高风险在内的全部审批将自动批准', details: { endWord: value.endWord, endWords: JSON.stringify(endWords), recoveryEndWord: value.recoveryEndWord } })
@@ -68,6 +69,11 @@ export class UnattendedSupervisor {
     if (mode && timestamp >= mode.startedAt && timestamp >= (mode.assistant?.timestamp ?? 0)) {
       // Retain only a completion marker, never a potentially huge answer.
       const candidate = text.trim()
+      if (candidate && timestamp > (mode.lastReplyAt ?? mode.startedAt)) {
+        mode.lastReplyAt = timestamp
+        mode.errorRecoveries = 0
+        mode.nextErrorRecoveryAt = undefined
+      }
       mode.assistant = { text: mode.settings.endWords.includes(candidate) ? candidate : '', timestamp }
     }
   }
@@ -193,23 +199,32 @@ export class UnattendedSupervisor {
         return
       }
       if (this.now() - (session.activityUpdatedAt ?? mode.startedAt) < 5000) return
-      if (session.activity === 'error') {
-        if (this.now() < (mode.nextErrorRecoveryAt ?? 0)) {
-          this.waiting(id, mode, '网络或模型异常，退避后继续恢复；无监管保持开启')
-          return
-        }
-        mode.errorRecoveries = Math.min((mode.errorRecoveries ?? 0) + 1, 5)
-        mode.nextErrorRecoveryAt = this.now() + Math.min(30 * 2 ** (mode.errorRecoveries - 1), 300) * 1000
-      } else {
+      if (mode.nextErrorRecoveryAt !== undefined) {
+        if (this.now() < mode.nextErrorRecoveryAt) return
+        mode.nextErrorRecoveryAt = undefined
+        mode.errorRecoveries = 0
+        this.port.audit({ sessionId: id, action: 'unattended_backoff_finished', message: '异常退避已到期，重新尝试发送恢复消息' })
+      }
+      if (session.activity !== 'error') {
         mode.errorRecoveries = 0
         mode.nextErrorRecoveryAt = undefined
       }
       this.waiting(id, mode)
       if (!session.nativeSessionId) throw new Error('尚未取得原生会话 ID，无法可靠识别结束词，已暂停')
       mode.assistant = undefined
+      const recoveringError = session.activity === 'error'
       await this.port.send(id, recoveryMessage(mode.settings))
       if (!current()) return
       mode.nextAt = this.now() + 10000
+      if (recoveringError) {
+        // Count submitted recovery attempts, not repeated polling of one error.
+        mode.errorRecoveries = (mode.errorRecoveries ?? 0) + 1
+        const policy = errorRecoveryPolicy(mode.settings)
+        if (mode.errorRecoveries >= policy.errorRecoveryAttempts) {
+          mode.nextErrorRecoveryAt = this.now() + policy.errorRecoveryCooldownMinutes * 60_000
+          this.waiting(id, mode, '网络或模型异常，已连续尝试恢复 ' + mode.errorRecoveries + ' 次；退避 ' + policy.errorRecoveryCooldownMinutes + ' 分钟，将于 ' + new Date(mode.nextErrorRecoveryAt).toLocaleString('zh-CN', { hour12: false }) + ' 后自动重试；无监管保持开启')
+        }
+      }
       this.port.audit({ sessionId: id, action: 'unattended_recovery_sent', message: 'Agent 待命且未输出结束词，已提交恢复消息（不等待接收回执）' })
     } catch (error) {
       if (current()) this.disable(id, '无监管已暂停：' + (error instanceof Error ? error.message : String(error)))

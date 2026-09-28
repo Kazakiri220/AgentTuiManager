@@ -2,6 +2,18 @@ import { describe, expect, it } from 'vitest'
 import { approvalEnterCount, approvalEnterDelay, normalizeUnattendedEndWords, parseUnattendedSettings, selectedRecoveryEndWord } from '../../src/shared/unattended-settings'
 
 describe('unattended end word migration and validation', () => {
+  it('defaults legacy backoff settings and preserves explicit settings through serialization', () => {
+    const legacy = { enabled: false, endWord: 'DONE', recoveryWord: 'continue' }
+    expect(parseUnattendedSettings(legacy)).toMatchObject({ errorRecoveryAttempts: 3, errorRecoveryCooldownMinutes: 1 })
+    const saved = parseUnattendedSettings({ ...legacy, errorRecoveryAttempts: 7, errorRecoveryCooldownMinutes: 12 })
+    expect(parseUnattendedSettings(JSON.parse(JSON.stringify(saved)))).toEqual(saved)
+    for (const value of [0, -1, 101, 1.5, NaN, Infinity, null, '3']) {
+      expect(() => parseUnattendedSettings({ ...legacy, errorRecoveryAttempts: value })).toThrow('1～100')
+    }
+    for (const value of [0, -1, 1441, 1.5, NaN, Infinity, null, '1']) {
+      expect(() => parseUnattendedSettings({ ...legacy, errorRecoveryCooldownMinutes: value })).toThrow('1～1440')
+    }
+  })
   it('retains delay and count across the IPC settings parser', () => {
     const settings = parseUnattendedSettings({ enabled: true, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 })
     expect(settings).toMatchObject({ approvalEnterDelaySeconds: 7, approvalEnterCount: 3 })

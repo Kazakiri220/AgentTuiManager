@@ -26,6 +26,74 @@ function fixture() {
 }
 
 describe('per-window unattended mode', () => {
+  it('retries in bounded rounds, expires backoff without extending it and keeps approvals live', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, errorRecoveryAttempts: 2, errorRecoveryCooldownMinutes: 2 })
+    f.sessions.get('a')!.activity = 'error'
+    f.time(16000); await f.supervisor.tick('a')
+    for (let i = 0; i < 60; i++) await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(1)
+    f.time(26000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(2)
+    expect(f.port.changed).toHaveBeenLastCalledWith('a', expect.objectContaining({ reason: expect.stringContaining('退避 2 分钟') }))
+    f.pending([{ sessionId: 'a', requestId: 'during-backoff' } as ApprovalRequest])
+    f.time(30000); await f.supervisor.tick('a'); f.pending([])
+    expect(f.port.approve).toHaveBeenCalledWith('during-backoff')
+    f.time(145999)
+    for (let i = 0; i < 60; i++) await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(2)
+    f.time(146000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(3)
+    expect(f.port.audit).toHaveBeenCalledWith(expect.objectContaining({ action: 'unattended_backoff_finished' }))
+    f.time(156000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(4)
+    f.time(276000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(5)
+    expect(f.supervisor.enabled('a')).toBe(true)
+  })
+
+  it('does not send into a running agent or draft at expiry, and retries when ready', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, errorRecoveryAttempts: 1, errorRecoveryCooldownMinutes: 1 })
+    f.sessions.get('a')!.activity = 'error'
+    f.time(16000); await f.supervisor.tick('a')
+    f.sessions.get('a')!.activity = 'running'
+    f.time(76000); await f.supervisor.tick('a')
+    f.sessions.get('a')!.activity = 'error'
+    f.port.ready.mockReturnValue(false)
+    await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(1)
+    f.port.ready.mockReturnValue(true)
+    await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(2)
+  })
+
+  it('clears the error streak on a fresh assistant reply without affecting another window', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, errorRecoveryAttempts: 1, errorRecoveryCooldownMinutes: 10 })
+    f.supervisor.enable('b', settings)
+    f.sessions.get('a')!.activity = 'error'
+    f.time(16000); await f.supervisor.tick('a')
+    f.supervisor.observe('a', 'Finished this step; more remains', 17000)
+    f.sessions.get('a')!.activity = 'idle'
+    f.time(26000); await f.supervisor.tick('a'); await f.supervisor.tick('b')
+    expect(f.port.send).toHaveBeenCalledTimes(3)
+    expect(f.port.send).toHaveBeenLastCalledWith('b', recoveryMessage(settings))
+  })
+
+  it('does not let repeated transcript observations cancel a new backoff', async () => {
+    const f = fixture()
+    f.supervisor.enable('a', { ...settings, errorRecoveryAttempts: 1, errorRecoveryCooldownMinutes: 1 })
+    f.supervisor.observe('a', 'Previous reply', 11000)
+    f.sessions.get('a')!.activity = 'error'
+    f.time(16000); await f.supervisor.tick('a')
+    f.supervisor.observe('a', 'Previous reply', 11000)
+    f.time(26000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(1)
+    f.time(76000); await f.supervisor.tick('a')
+    expect(f.port.send).toHaveBeenCalledTimes(2)
+  })
+
   it('approves during recovery cooldown instead of waiting ten seconds', async () => {
     const f = fixture()
     f.time(16000); await f.supervisor.tick('a')
@@ -171,6 +239,7 @@ describe('per-window unattended mode', () => {
 
   it('backs off repeated model errors without logging or sending on every tick', async () => {
     const f = fixture()
+    f.supervisor.enable('a', { ...settings, errorRecoveryAttempts: 1, errorRecoveryCooldownMinutes: 1 })
     f.sessions.get('a')!.activity = 'error'
     f.time(16000)
     await f.supervisor.tick('a')
@@ -178,7 +247,7 @@ describe('per-window unattended mode', () => {
     for (let i = 0; i < 60; i++) await f.supervisor.tick('a')
     expect(f.port.send).toHaveBeenCalledTimes(1)
     expect(f.port.audit.mock.calls.filter(([entry]) => entry.action === 'unattended_waiting')).toHaveLength(1)
-    f.time(46000)
+    f.time(76000)
     await f.supervisor.tick('a')
     expect(f.port.send).toHaveBeenCalledTimes(2)
     expect(f.supervisor.enabled('a')).toBe(true)

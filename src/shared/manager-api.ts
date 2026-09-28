@@ -1,4 +1,5 @@
 import type { HostEvent } from './protocol'
+import type { NetworkRetrySettings } from './network-retry'
 import type { SessionState } from './session-state'
 
 export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi' | 'deepseek'
@@ -23,6 +24,8 @@ export interface AgentEnvironmentSummary {
 export type AgentConfigSource = 'local' | 'custom' | 'ccswitch'
 
 export interface AgentConfigInput {
+  autoCompactTokens?: number
+  networkRetry?: NetworkRetrySettings
   enabled: boolean
   source: AgentConfigSource
   baseUrl?: string
@@ -35,6 +38,8 @@ export interface AgentConfigInput {
 }
 
 export interface AgentConfigSummary {
+  autoCompactTokens?: number
+  networkRetry?: NetworkRetrySettings
   enabled: boolean
   source: AgentConfigSource
   profileId?: string
@@ -471,6 +476,7 @@ export const IPC_CHANNELS = {
   listTokenUsageDetails: 'agent-manager:list-token-usage-details',
   exportAuditEntries: 'agent-manager:export-audit-entries',
   startSession: 'agent-manager:start-session',
+  createContinuation: 'agent-manager:create-continuation',
   write: 'agent-manager:write',
   resize: 'agent-manager:resize',
   stopSession: 'agent-manager:stop-session',
@@ -537,6 +543,7 @@ export interface AgentManagerApi {
   listTokenUsageDetails?(query?: TokenUsageQuery): Promise<TokenUsagePage>
   exportAuditEntries(entryIds: string[]): Promise<string | undefined>
   startSession(request: StartSessionRequest): Promise<SessionSummary>
+  createContinuation?(sessionId: string): Promise<{ session: SessionSummary; warning?: string }>
   write(sessionId: string, data: string): Promise<void> | void
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
   stopSession(sessionId: string): Promise<void>
@@ -602,5 +609,7 @@ export interface UnattendedSettings {
   /** Optional one-shot Enter workaround after auto approval. 0 disables it. */
   approvalEnterDelaySeconds?: number
   approvalEnterCount?: number
+  errorRecoveryAttempts?: number
+  errorRecoveryCooldownMinutes?: number
   reason?: string
 }

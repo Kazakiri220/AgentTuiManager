@@ -252,6 +252,8 @@ button:disabled { cursor: default; opacity: .55; }
 .launcher-scrim-hidden { display: none; }
 .launcher-dismiss-hint { position: absolute; bottom: 16px; left: 16px; max-width: calc(100vw - 690px); margin: 0; padding: 8px 10px; color: #d7c28e; background: #30291a; border: 1px solid #604d25; border-radius: 5px; font-size: 9px; }
 .agent-launcher { position: fixed; z-index: 25; top: 54px; right: 0; width: min(640px, 100vw); height: calc(100vh - 54px); display: grid; grid-template-rows: 64px auto minmax(0, 1fr) 66px; color: var(--text); background: #161f22; border-left: 1px solid #485559; box-shadow: -18px 0 44px rgba(0, 0, 0, .42); }
+.session-continuation-dialog { grid-template-rows: 64px minmax(0, 1fr) 66px; }
+.session-continuation-dialog .launcher-content { display: block; overflow: auto; }
 .launcher-head { display: flex; align-items: center; gap: 11px; padding: 0 18px; border-bottom: 1px solid var(--line); }
 .launcher-head h1 { flex: 1; margin: 0; font-size: 17px; }
 .launcher-workspace-row { display: grid; grid-template-columns: 80px minmax(0, 1fr); gap: 10px; align-items: center; padding: 12px 18px; border-bottom: 1px solid #2c383c; }
@@ -403,6 +405,18 @@ button:disabled { cursor: default; opacity: .55; }
 .agent-editor :disabled { cursor: not-allowed; }
 
 .modal-backdrop { position: fixed; z-index: 20; inset: 54px 0 0; display: flex; justify-content: flex-end; background: rgba(3, 7, 8, .58); }
+.continuation-confirm-backdrop { inset: 0; align-items: center; justify-content: center; }
+.continuation-confirm-dialog { width: min(500px, calc(100vw - 32px)); max-height: min(520px, calc(100vh - 32px)); display: grid; grid-template-rows: auto minmax(0, 1fr) auto; color: var(--text); background: #161f22; border: 1px solid #485559; border-radius: 7px; box-shadow: 0 16px 40px rgba(0,0,0,.42); overflow: hidden; }
+.continuation-confirm-dialog > header, .continuation-confirm-dialog > footer { display: flex; align-items: center; gap: 10px; padding: 14px 18px; background: var(--panel); }
+.continuation-confirm-dialog > header { border-bottom: 1px solid var(--line); }
+.continuation-confirm-dialog > header h2 { margin: 0; font-size: 17px; }
+.continuation-confirm-dialog > footer { justify-content: flex-end; border-top: 1px solid var(--line); }
+.continuation-confirm-dialog > footer > span { margin-right: auto; color: var(--muted); font-size: 9px; }
+.continuation-confirm-body { min-height: 0; overflow: auto; padding: 18px; }
+.continuation-confirm-body p { margin: 0 0 13px; color: #bdc9c8; font-size: 10px; }
+.continuation-confirm-body strong { color: var(--text); }
+.continuation-confirm-note { padding: 10px 11px; color: #aebfc3 !important; background: var(--blue-soft); border-left: 3px solid var(--blue); border-radius: 4px; }
+.continuation-confirm-error { padding: 8px 10px; color: #ffd9d9 !important; background: var(--red-soft); border: 1px solid #754045; border-radius: 5px; overflow-wrap: anywhere; }
 .agent-form, .rules-dialog { width: min(640px, 100vw); height: calc(100vh - 54px); overflow: auto; padding: 18px; color: var(--text); background: #161f22; border-left: 1px solid #485559; box-shadow: -18px 0 44px rgba(0, 0, 0, .42); }
 .agent-form { display: flex; flex-direction: column; }
 .agent-form header, .agent-form footer, .rules-dialog header, .rules-dialog footer { display: flex; align-items: center; justify-content: space-between; gap: 10px; }

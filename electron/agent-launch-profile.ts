@@ -8,6 +8,7 @@ export interface AgentLaunchOverrides {
 }
 
 const CODEX_API_KEY_ENV = 'AGENT_TUI_MANAGER_CODEX_API_KEY'
+const ISOLATED_CODEX_PROVIDER_ID = 'agent-tui-manager'
 
 function providerPathSegment(providerId: string): string {
   return /^[A-Za-z0-9_-]+$/.test(providerId) ? providerId : JSON.stringify(providerId)
@@ -16,9 +17,19 @@ function providerPathSegment(providerId: string): string {
 function codexProviderArguments(profile: StoredAgentConfig, provider: CodexGlobalProvider): string[] {
   if (!profile.baseUrl && !profile.apiKey) return []
   if (provider.id === 'openai' && !provider.configurable) {
+    if (profile.baseUrl) {
+      const path = `model_providers.${ISOLATED_CODEX_PROVIDER_ID}`
+      return [
+        '-c', `model_provider=${ISOLATED_CODEX_PROVIDER_ID}`,
+        '-c', `${path}.name=${JSON.stringify('Agent TUI Manager')}`,
+        '-c', `${path}.base_url=${JSON.stringify(profile.baseUrl)}`,
+        ...(profile.apiKey ? ['-c', `${path}.env_key=${CODEX_API_KEY_ENV}`] : []),
+        '-c', `${path}.wire_api=responses`,
+        '-c', `${path}.requires_openai_auth=false`,
+      ]
+    }
     return [
       '-c', 'model_provider=openai',
-      ...(profile.baseUrl ? ['-c', `openai_base_url=${profile.baseUrl}`] : []),
     ]
   }
   if (!provider.configurable) {
@@ -60,10 +71,9 @@ function configuredArgs(agentKind: AgentKind, baseArgs: string[], profile: Store
   if (overrides.length === 0) return args
   if (agentKind === 'codex') {
     const resumeIndex = args.indexOf('resume')
-    // Provider/model overrides must stay in the root invocation. Putting them
-    // after `resume <id>` changes the config scope in Codex and can prevent the
-    // session-level PermissionRequest hook from handling approvals. User-entered
-    // resume flags are already part of baseArgs and remain after the session id.
+    // Provider 和模型覆盖必须留在根命令。放到 `resume <id>` 之后会改变
+    // Codex 配置作用域，可能导致会话级 PermissionRequest Hook 无法处理审批。
+    // 用户填写的恢复参数已包含在 baseArgs 中，仍保留在会话 ID 之后。
     const insertion = resumeIndex >= 0 ? resumeIndex : args.length
     return [...args.slice(0, insertion), ...overrides, ...args.slice(insertion)]
   }
@@ -83,9 +93,8 @@ export function applyAgentLaunchProfile(
 ): AgentLaunchOverrides {
   const environment: Record<string, string> = {}
   if (agentKind === 'claude') {
-    // Claude Code can load provider-routing variables from ~/.claude/settings.json
-    // after process startup. Its host-managed mode prevents those settings from
-    // replacing this one PTY's explicit provider without modifying the file.
+    // Claude Code 启动后可能从 ~/.claude/settings.json 加载 Provider 路由变量。
+    // Host 托管模式阻止这些设置替换当前 PTY 显式指定的 Provider，同时不修改原文件。
     if (profile.baseUrl || profile.apiKey) {
       environment.CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST = '1'
       environment.CLAUDE_CODE_USE_BEDROCK = ''
@@ -98,21 +107,22 @@ export function applyAgentLaunchProfile(
       const officialAnthropic = !profile.baseUrl || (() => {
         try { return new URL(profile.baseUrl).hostname.toLowerCase() === 'api.anthropic.com' } catch { return false }
       })()
-      // Custom Claude gateways (including the common CCSwitch layout) use an
-      // Authorization token. The official Anthropic endpoint uses x-api-key.
+      // 自定义 Claude 网关（包括常见 CCSwitch 布局）使用 Authorization Token，
+      // Anthropic 官方端点使用 x-api-key。
       environment.ANTHROPIC_AUTH_TOKEN = officialAnthropic ? '' : profile.apiKey
       environment.ANTHROPIC_API_KEY = officialAnthropic ? profile.apiKey : ''
     }
   } else if (agentKind === 'codex') {
-    // Codex selects its endpoint from model_provider, not OPENAI_BASE_URL when
-    // config.toml already names a custom provider. The temporary -c overrides
-    // above select a per-process provider; only its env_key carries the secret.
+    // config.toml 已指定自定义 Provider 时，Codex 根据 model_provider 选择端点，
+    // 而不是读取 OPENAI_BASE_URL。上面的临时 -c 只为当前进程选择 Provider，
+    // 密钥仅通过该 Provider 的 env_key 传入。
     if (profile.apiKey) {
-      environment[codexProvider.id === 'openai' && !codexProvider.configurable ? 'OPENAI_API_KEY' : CODEX_API_KEY_ENV] = profile.apiKey
+      const isolatedProvider = codexProvider.id === 'openai' && !codexProvider.configurable && Boolean(profile.baseUrl)
+      environment[isolatedProvider ? CODEX_API_KEY_ENV : codexProvider.id === 'openai' && !codexProvider.configurable ? 'OPENAI_API_KEY' : CODEX_API_KEY_ENV] = profile.apiKey
     }
   } else if (agentKind === 'deepseek') {
-    // DeepSeek Harness resolves these official variables per request. Model
-    // selection remains in its own Web settings because dsh has no model CLI flag.
+    // DeepSeek Harness 每次请求都会解析这些官方变量。dsh 没有模型 CLI 参数，
+    // 因此模型仍在它自己的 Web 设置中选择。
     if (profile.baseUrl) environment.DEEPSEEK_BASE_URL = profile.baseUrl
     if (profile.apiKey) environment.DEEPSEEK_API_KEY = profile.apiKey
   } else {

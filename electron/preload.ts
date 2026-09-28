@@ -14,6 +14,7 @@ const api: AgentManagerApi = {
   listTokenUsageDetails: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageDetails, query),
   exportAuditEntries: (entryIds) => ipcRenderer.invoke(IPC_CHANNELS.exportAuditEntries, entryIds),
   startSession: (request: StartSessionRequest) => ipcRenderer.invoke(IPC_CHANNELS.startSession, request),
+  createContinuation: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.createContinuation, sessionId),
   write: (sessionId, data) => ipcRenderer.invoke(IPC_CHANNELS.write, sessionId, data),
   resize: (sessionId, cols, rows) => ipcRenderer.invoke(IPC_CHANNELS.resize, sessionId, cols, rows),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.stopSession, sessionId),

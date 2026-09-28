@@ -1,5 +1,8 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
 import { statSync } from 'node:fs'
+import { parseNetworkRetry } from '../src/shared/network-retry'
+import { parseAutoCompactTokens } from '../src/shared/auto-compact'
+import { SessionContinuationService } from './session-continuation-service'
 import { writeFile } from 'node:fs/promises'
 import { delimiter, isAbsolute, join } from 'node:path'
 
@@ -296,7 +299,10 @@ function optionalConfigText(value: unknown, name: string, max: number): string |
 function agentConfigInput(value: unknown): AgentConfigInput {
   if (!value || typeof value !== 'object') throw new Error('独立配置格式无效')
   const input = value as Record<string, unknown>
-  if (input.enabled !== true) return { enabled: false, source: 'local' }
+  const networkRetry = parseNetworkRetry(input.networkRetry)
+  const autoCompactTokens = parseAutoCompactTokens(input.autoCompactTokens)
+  const compaction = autoCompactTokens === undefined ? {} : { autoCompactTokens }
+  if (input.enabled !== true) return { enabled: false, source: 'local', ...compaction, ...(networkRetry ? { networkRetry } : {}) }
   const source = String(input.source)
   if (source !== 'custom' && source !== 'ccswitch') throw new Error('独立配置来源无效')
   const providerId = optionalConfigText(input.providerId, 'providerId', 256)
@@ -307,6 +313,8 @@ function agentConfigInput(value: unknown): AgentConfigInput {
       enabled: true,
       source,
       providerId,
+      ...(networkRetry ? { networkRetry } : {}),
+      ...compaction,
       ...(providerName ? { providerName } : {}),
     }
   }
@@ -326,6 +334,8 @@ function agentConfigInput(value: unknown): AgentConfigInput {
     ...(apiKey ? { apiKey } : {}),
     ...(model ? { model } : {}),
     extraArgs,
+    ...(networkRetry ? { networkRetry } : {}),
+    ...compaction,
     ...(input.clearApiKey === true ? { clearApiKey: true } : {}),
     ...(providerId ? { providerId } : {}),
     ...(providerName ? { providerName } : {}),
@@ -333,10 +343,11 @@ function agentConfigInput(value: unknown): AgentConfigInput {
 }
 
 async function resolvedAgentConfig(agentKind: AgentKind, input: AgentConfigInput): Promise<AgentConfigInput> {
+  parseAutoCompactTokens(input.autoCompactTokens, agentKind)
   if (!input.enabled || input.source !== 'ccswitch') return input
   if (agentKind !== 'codex' && agentKind !== 'claude') throw new Error('CCSwitch 当前仅支持 Codex 和 Claude Code')
   if (!input.providerId) throw new Error('请选择一个 CCSwitch Provider')
-  return ccSwitchProviderReader.import(agentKind, input.providerId)
+  return { ...await ccSwitchProviderReader.import(agentKind, input.providerId), ...(input.networkRetry ? { networkRetry: input.networkRetry } : {}), ...(input.autoCompactTokens === undefined ? {} : { autoCompactTokens: input.autoCompactTokens }) }
 }
 
 function validatedAgentKind(value: unknown): AgentKind {
@@ -747,6 +758,16 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     const query = value && typeof value === 'object' ? value as import('../src/shared/manager-api').TokenUsageQuery : {}
     return tokenUsageStore.listDetails(query, controller.listSessions())
   })
+  const continuations = new SessionContinuationService(controller, agentConfigurationStore, agentProxyStore)
+  ipcMain.handle(IPC_CHANNELS.createContinuation, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const sourceId = sessionId(id)
+    const result = await continuations.create(sourceId)
+    recordAudit({ level: result.warning ? 'warning' : 'info', category: 'session', action: 'session_continuation_created',
+      message: result.warning ?? `${result.session.displayName} 已启动，并通过 CLI 首条提示词请求读取旧会话继续开发`, sessionId: result.session.sessionId,
+      details: { sourceSessionId: sourceId } })
+    return result
+  })
   ipcMain.handle(IPC_CHANNELS.startSession, async (event, request: unknown) => {
     trustedRenderer(event)
     const validated = startRequest(request)
@@ -756,7 +777,10 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     try {
       const agentConfig = validated.agentConfig && !('hasApiKey' in validated.agentConfig)
         ? await agentConfigurationStore.save(await resolvedAgentConfig(validated.agentKind, validated.agentConfig))
-        : AgentConfigurationStore.localSummary()
+        : AgentConfigurationStore.localSummary(
+          validated.agentConfig?.networkRetry,
+          validated.agentConfig?.autoCompactTokens,
+        )
       createdProfileId = agentConfig.profileId
       const agentProxy = validated.agentProxy && !('hasPassword' in validated.agentProxy)
         ? await agentProxyStore.save(validated.agentProxy)
@@ -923,9 +947,10 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     const session = controller.listSessions().find((item) => item.sessionId === target)
     if (!session) throw new Error('Agent 不存在或已删除')
     const existingProfileId = session.agentConfig?.profileId
+    parseAutoCompactTokens(input.autoCompactTokens, session.agentKind)
     const summary = input.enabled
       ? await agentConfigurationStore.save(await resolvedAgentConfig(session.agentKind, input), existingProfileId)
-      : AgentConfigurationStore.localSummary()
+      : AgentConfigurationStore.localSummary(input.networkRetry, input.autoCompactTokens)
     await controller.updateSessionConfig(target, summary)
     tokenUsageStore.noteSessionConfig(target, summary)
     if (!summary.enabled && existingProfileId) await agentConfigurationStore.remove(existingProfileId)

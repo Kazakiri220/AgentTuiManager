@@ -732,6 +732,38 @@ describe('App terminal wall', () => {
     expect(document.querySelector('.terminal-grid > article')?.getAttribute('data-testid')).toBe('terminal-tile-session-2')
   })
 
+  it('starts with per-Agent retries without enabling independent API configuration', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('工作区')).not.toHaveValue(''))
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    expect(screen.getByRole('switch', { name: '启用独立配置' })).not.toBeChecked()
+    fireEvent.change(screen.getByLabelText('流式断线重连次数（0–100）'), { target: { value: '30' } })
+    fireEvent.change(screen.getByLabelText('HTTP 请求重试次数（0–100）'), { target: { value: '0' } })
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentConfig: { enabled: false, source: 'local', networkRetry: { codexStreamRetries: 30, codexRequestRetries: 0 } },
+    })))
+  })
+
+  it('loads and edits retries without changing an independent provider', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{
+      ...session, agentConfig: { enabled: true, source: 'custom', profileId: 'config-b', baseUrl: 'https://b.example/v1', model: 'model-b', hasApiKey: true, extraArgs: ['--search'], networkRetry: { codexStreamRetries: 20 } },
+    }])
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: '编辑 Codex API 重构' }))
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    expect(screen.getByLabelText('流式断线重连次数（0–100）')).toHaveValue(20)
+    fireEvent.change(screen.getByLabelText('流式断线重连次数（0–100）'), { target: { value: '40' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
+    await waitFor(() => expect(api.updateSessionConfig).toHaveBeenCalledWith('session-1', {
+      enabled: true, source: 'custom', baseUrl: 'https://b.example/v1', model: 'model-b', extraArgs: ['--search'], networkRetry: { codexStreamRetries: 40 },
+    }))
+  })
+
   it('opens and saves disabled-by-default Continue keyword rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
@@ -786,6 +818,37 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
     expect(await screen.findByText(/CCSwitch 当前仅支持 Codex 和 Claude Code/)).toBeInTheDocument()
     expect(api.listCCSwitchProviders).not.toHaveBeenCalled()
+  })
+
+  it('submits CCSwitch with Codex retries 100 and auto compact 500K', async () => {
+    vi.mocked(api.listCCSwitchProviders).mockResolvedValue([{
+      id: 'cc-provider-1', name: 'Team Gateway', agentKind: 'codex',
+      baseUrl: 'https://gateway.example/v1', model: 'gpt-5.6',
+      isCurrent: true, hasApiKey: true,
+    }])
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    expect(await screen.findByText('Team Gateway')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('流式断线重连次数（0–100）'), { target: { value: '100' } })
+    fireEvent.change(screen.getByLabelText('HTTP 请求重试次数（0–100）'), { target: { value: '100' } })
+    fireEvent.change(screen.getByLabelText('自动压缩阈值（K Tokens）'), { target: { value: '500' } })
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
+      agentConfig: {
+        autoCompactTokens: 500_000,
+        networkRetry: { codexStreamRetries: 100, codexRequestRetries: 100 },
+        enabled: true,
+        source: 'ccswitch',
+        providerId: 'cc-provider-1',
+        providerName: 'Team Gateway',
+      },
+    })))
   })
 
   it.each(['codex', 'claude', 'deepseek', 'pi'] as const)('updates installed %s and refreshes its version', async (kind) => {

@@ -274,6 +274,35 @@ describe('SessionHostManager integration', () => {
     expect(storedRecord).toContain('profile-1')
   })
 
+  it.each([false, true])('passes retry settings to the child with independent configuration %s', async (enabled) => {
+    const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-retries-'))
+    tempRoots.push(root)
+    const runtimeDir = join(root, 'runtime')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace, { recursive: true })
+    const resolveAgentConfig = vi.fn(async (_id: string, _kind: string, args: string[]) => ({ args, environment: { ANTHROPIC_AUTH_TOKEN: 'fixture-only-token' } }))
+    const manager = new SessionHostManager({ runtimeDir, hostEntry: HOST_ENTRY, resolveAgentConfig })
+    const networkRetry = { claudeRequestRetries: 12, claudeRetryWatchdog: false }
+    // A nonexistent explicit settings file leaves args intact; this Node fixture
+    // is not Claude and must not receive Host-generated Claude CLI flags.
+    const handle = await manager.start({
+      agentKind: 'claude', executable: process.execPath,
+      args: ['-e', "process.stdout.write('retry=' + process.env.CLAUDE_CODE_MAX_RETRIES + ';watchdog=' + process.env.CLAUDE_CODE_RETRY_WATCHDOG + ';token=' + (process.env.ANTHROPIC_AUTH_TOKEN || '')); setInterval(() => {}, 1000)", '--', '--settings', 'missing-fixture-settings.json'],
+      cwd: workspace, cols: 100, rows: 24,
+      agentConfig: { enabled, source: enabled ? 'custom' : 'local', ...(enabled ? { profileId: 'fixture-profile' } : {}), extraArgs: [], hasApiKey: enabled, networkRetry },
+    })
+    handles.push(handle)
+    startedHosts.push({ manager, hostId: handle.hostId, runtimeDir })
+    await expect.poll(() => handle.replay(), { timeout: 5_000 }).toContain('retry=12;watchdog=0')
+    if (enabled) {
+      expect(await handle.replay()).toContain('token=fixture-only-token')
+      expect(resolveAgentConfig).toHaveBeenCalledTimes(1)
+    } else expect(resolveAgentConfig).not.toHaveBeenCalled()
+    const record = await readFile(join(runtimeDir, `host-${handle.hostId}.json`), 'utf8')
+    expect(JSON.parse(record).agentConfig.networkRetry).toEqual(networkRetry)
+    expect(record).not.toContain('fixture-only-token')
+  })
+
   it('injects an HTTP proxy only into the target Host and never persists credentials', async () => {
     const root = await mkdtemp(join(tmpdir(), 'agent-tui-host-proxy-'))
     tempRoots.push(root)

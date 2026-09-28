@@ -47,10 +47,27 @@ describe('applyAgentLaunchProfile', () => {
     ])
   })
 
-  it('uses the built-in OpenAI override without defining an unmergeable provider', () => {
+  it('creates a complete process-local provider for an isolated OpenAI-compatible endpoint', () => {
     const result = applyAgentLaunchProfile('codex', [], profile(), { id: 'openai', configurable: false })
+    expect(result.environment).toEqual({ AGENT_TUI_MANAGER_CODEX_API_KEY: 'secret-key' })
+    expect(result.args).toEqual([
+      '--feature', 'enabled',
+      '-c', 'model_provider=agent-tui-manager',
+      '-c', 'model_providers.agent-tui-manager.name="Agent TUI Manager"',
+      '-c', 'model_providers.agent-tui-manager.base_url="https://gateway.example/v1"',
+      '-c', 'model_providers.agent-tui-manager.env_key=AGENT_TUI_MANAGER_CODEX_API_KEY',
+      '-c', 'model_providers.agent-tui-manager.wire_api=responses',
+      '-c', 'model_providers.agent-tui-manager.requires_openai_auth=false',
+      '--model', 'model-x',
+    ])
+    expect(result.args.join(' ')).not.toContain('model_providers.openai')
+    expect(result.args.join(' ')).not.toContain('secret-key')
+  })
+
+  it('keeps the built-in OpenAI provider when only its API key is isolated', () => {
+    const result = applyAgentLaunchProfile('codex', [], profile({ baseUrl: undefined }), { id: 'openai', configurable: false })
     expect(result.environment).toEqual({ OPENAI_API_KEY: 'secret-key' })
-    expect(result.args).toContain('openai_base_url=https://gateway.example/v1')
+    expect(result.args).toContain('model_provider=openai')
     expect(result.args.join(' ')).not.toContain('model_providers.openai')
   })
 

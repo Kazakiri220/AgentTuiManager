@@ -1,6 +1,7 @@
 export type HostCommand =
   | {
       type: 'start'
+      initialPrompt?: string
       agentKind: import('./manager-api').AgentKind
       executable: string
       args: string[]

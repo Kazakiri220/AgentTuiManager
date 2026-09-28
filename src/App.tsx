@@ -1,6 +1,10 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import NetworkRetryControls from './NetworkRetryControls'
+import AutoCompactControls from './AutoCompactControls'
+import SessionContinuationDialog from './SessionContinuationDialog'
+import type { NetworkRetrySettings } from './shared/network-retry'
 import UnattendedControls from './UnattendedControls'
 import { useStoppedSessionGrace } from './useStoppedSessionGrace'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus, type SessionDisplayStatus } from './shared/session-state'
@@ -64,7 +68,7 @@ interface OverviewPreferences {
   statusFilter?: SessionDisplayStatus[]
 }
 
-type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review' | 'full-auto'
+type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review' | 'full-auto' | 'continuation'
 
 function readOverviewPreferences(): OverviewPreferences {
   const fallback: OverviewPreferences = { overviewMode: 'wall', groupByWorkspace: false }
@@ -166,6 +170,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const [args, setArgs] = useState('')
   const [maxContinueRetries, setMaxContinueRetries] = useState(3)
   const [configEnabled, setConfigEnabled] = useState(false)
+  const [networkRetry, setNetworkRetry] = useState<NetworkRetrySettings>({})
+  const [autoCompactTokens, setAutoCompactTokens] = useState<number>()
   const [configSource, setConfigSource] = useState<Exclude<AgentConfigSource, 'local'>>('custom')
   const [configBaseUrl, setConfigBaseUrl] = useState('')
   const [configApiKey, setConfigApiKey] = useState('')
@@ -317,6 +323,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   }
 
   const changeKind = (kind: AgentKind): void => {
+    setAutoCompactTokens(undefined)
     ccSwitchRequest.current += 1
     setCCSwitchProviders([]); setCCSwitchProviderId(''); setCCSwitchLoading(false)
     setAgentKind(kind)
@@ -492,18 +499,22 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       maxContinueRetries,
       ...(nativeSessionId ? { nativeSessionId } : {}),
       agentConfig: configEnabled && configSource === 'ccswitch' ? {
+        ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }),
+        ...(Object.keys(networkRetry).length ? { networkRetry } : {}),
         enabled: true,
         source: 'ccswitch',
         providerId: ccSwitchProviderId,
         providerName: ccSwitchProviders.find((item) => item.id === ccSwitchProviderId)?.name,
       } : configEnabled ? {
+        ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }),
+        ...(Object.keys(networkRetry).length ? { networkRetry } : {}),
         enabled: true,
         source: 'custom',
         ...(configBaseUrl.trim() ? { baseUrl: configBaseUrl.trim() } : {}),
         ...(configApiKey.trim() ? { apiKey: configApiKey.trim() } : {}),
         ...(agentKind !== 'deepseek' && configModel.trim() ? { model: configModel.trim() } : {}),
         extraArgs: configArgs.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
-      } : { enabled: false, source: 'local' },
+      } : { enabled: false, source: 'local', ...(Object.keys(networkRetry).length ? { networkRetry } : {}), ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }) },
       agentProxy: proxyEnabled ? {
         enabled: true, protocol: 'http', host: proxyHost.trim(), port: proxyPort,
         ...(proxyUsername.trim() ? { username: proxyUsername.trim() } : {}),
@@ -611,6 +622,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 不写入 Host 注册表、审计正文或终端回放；Manager 启动 Agent 时才临时解密。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
           </div>
+          <NetworkRetryControls agentKind={agentKind} value={networkRetry} onChange={setNetworkRetry} />
+          <AutoCompactControls kind={agentKind} value={autoCompactTokens} onChange={setAutoCompactTokens} />
           <div className='launcher-proxy-section'>
             <div className='launcher-section-title'><h2>HTTP 代理</h2><span>独立于模型配置</span></div>
             <label className='launcher-config-toggle'><span><strong>为这个 Agent 使用代理</strong><small>默认关闭；开启后仅向这个 Agent 进程注入代理，不修改系统或原生 Agent 配置。</small></span><input type='checkbox' role='switch' aria-label='启用 HTTP 代理' checked={proxyEnabled} onChange={(event) => setProxyEnabled(event.target.checked)} /></label>
@@ -635,6 +648,8 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
   const [displayName, setDisplayName] = useState(session.displayName)
   const [editTab, setEditTab] = useState<'basic' | 'config'>('basic')
   const [configEnabled, setConfigEnabled] = useState(session.agentConfig?.enabled ?? false)
+  const [networkRetry, setNetworkRetry] = useState<NetworkRetrySettings>(session.agentConfig?.networkRetry ?? {})
+  const [autoCompactTokens, setAutoCompactTokens] = useState(session.agentConfig?.autoCompactTokens)
   const [configSource, setConfigSource] = useState<Exclude<AgentConfigSource, 'local'>>(session.agentConfig?.source === 'ccswitch' ? 'ccswitch' : 'custom')
   const [configBaseUrl, setConfigBaseUrl] = useState(session.agentConfig?.baseUrl ?? '')
   const [configApiKey, setConfigApiKey] = useState('')
@@ -664,6 +679,8 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
   useEffect(() => {
     setDisplayName(session.displayName)
     setConfigEnabled(session.agentConfig?.enabled ?? false)
+    setNetworkRetry(session.agentConfig?.networkRetry ?? {})
+    setAutoCompactTokens(session.agentConfig?.autoCompactTokens)
     setConfigSource(session.agentConfig?.source === 'ccswitch' ? 'ccswitch' : 'custom')
     setConfigBaseUrl(session.agentConfig?.baseUrl ?? '')
     setConfigApiKey('')
@@ -719,11 +736,15 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
       if (typeof window.agentManager.updateSessionProxy !== 'function') throw new Error('代理配置功能需要重启 Manager 后启用')
       await window.agentManager.renameSession(session.sessionId, displayName)
       await window.agentManager.updateSessionConfig(session.sessionId, configEnabled && configSource === 'ccswitch' ? {
+        ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }),
+        ...(Object.keys(networkRetry).length ? { networkRetry } : {}),
         enabled: true,
         source: 'ccswitch',
         providerId: ccSwitchProviderId,
         providerName: ccSwitchProviders.find((item) => item.id === ccSwitchProviderId)?.name ?? session.agentConfig?.providerName,
       } : configEnabled ? {
+        ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }),
+        ...(Object.keys(networkRetry).length ? { networkRetry } : {}),
         enabled: true,
         source: 'custom',
         ...(configBaseUrl.trim() ? { baseUrl: configBaseUrl.trim() } : {}),
@@ -731,7 +752,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
         ...(session.agentKind !== 'deepseek' && configModel.trim() ? { model: configModel.trim() } : {}),
         extraArgs: configArgs.split(/\r?\n/).map((item) => item.trim()).filter(Boolean),
         ...(clearApiKey ? { clearApiKey: true } : {}),
-      } : { enabled: false, source: 'local' })
+      } : { enabled: false, source: 'local', ...(Object.keys(networkRetry).length ? { networkRetry } : {}), ...(autoCompactTokens === undefined ? {} : { autoCompactTokens }) })
       await window.agentManager.updateSessionProxy(session.sessionId, proxyEnabled ? {
         enabled: true, protocol: 'http', host: proxyHost.trim(), port: proxyPort,
         ...(proxyUsername.trim() ? { username: proxyUsername.trim() } : {}),
@@ -773,6 +794,8 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 只保存在 Manager 的加密配置中，不修改 Agent 本机配置。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
           </div>
+          <NetworkRetryControls agentKind={session.agentKind} value={networkRetry} onChange={setNetworkRetry} />
+          <AutoCompactControls kind={session.agentKind} value={autoCompactTokens} onChange={setAutoCompactTokens} />
           <div className='launcher-proxy-section'>
             <div className='launcher-section-title'><h2>HTTP 代理</h2><span>下次启动或恢复时生效</span></div>
             <label className='launcher-config-toggle'><span><strong>为这个 Agent 使用代理</strong><small>关闭后直接使用本机网络；不会修改系统代理或 Agent 原生配置。</small></span><input type='checkbox' role='switch' aria-label='编辑 HTTP 代理' checked={proxyEnabled} onChange={(event) => setProxyEnabled(event.target.checked)} /></label>
@@ -809,6 +832,7 @@ export default function App(): JSX.Element {
   const [showLlmReviewSettings, setShowLlmReviewSettings] = useState(false)
   const [llmReviewInitialView, setLlmReviewInitialView] = useState<'settings' | 'results'>('settings')
   const [showEditor, setShowEditor] = useState(false)
+  const [continuationSource, setContinuationSource] = useState<SessionSummary>()
   const [editingSessionId, setEditingSessionId] = useState<string>()
   const [showNotifications, setShowNotifications] = useState(false)
   const [notificationMounted, setNotificationMounted] = useState(false)
@@ -834,6 +858,7 @@ export default function App(): JSX.Element {
     writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
   }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder, statusFilter])
   const closeOtherOverlays = useCallback((except: OverlayKind): void => {
+    if (except !== 'continuation') setContinuationSource(undefined)
     if (except !== 'agent-form') setShowForm(false)
     if (except !== 'agent-editor') setShowEditor(false)
     if (except !== 'approval-rules') setShowApprovalRules(false)
@@ -1137,6 +1162,7 @@ export default function App(): JSX.Element {
                 hidden={!selected && (!overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId)}
                 onOpen={() => setSelectedId(session.sessionId)}
                 onEdit={() => openAgentEditor(session.sessionId)}
+                onContinuation={() => { closeOtherOverlays('continuation'); setContinuationSource(session) }}
                 onFullAuto={() => openFullAuto(session.sessionId)}
                 draggable={!selected && overviewMode === 'wall'}
                 dragging={draggingSessionId === session.sessionId}
@@ -1158,6 +1184,7 @@ export default function App(): JSX.Element {
       </div>
       {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace) => { setActiveWorkspace(workspace); setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
       {editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}
+      {continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}
       {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
       {showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}
       {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}

@@ -111,6 +111,16 @@ async function matchingJsonl(root: string, sessionId: string): Promise<string | 
   return undefined
 }
 
+export async function findNativeSessionTranscriptPath(agentKind: AgentKind, sessionId: string): Promise<string | undefined> {
+  if (!/^[a-zA-Z0-9-]{8,128}$/.test(sessionId)) return undefined
+  if (agentKind === 'codex') {
+    const root = process.env.CODEX_HOME || join(homedir(), '.codex')
+    return await matchingJsonl(join(root, 'sessions'), sessionId) ?? await matchingJsonl(join(root, 'archived_sessions'), sessionId)
+  }
+  if (agentKind === 'claude') return matchingJsonl(join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects'), sessionId)
+  return undefined
+}
+
 function append(entries: TranscriptEntry[], role: TranscriptEntry['role'], text: string, title?: string): void {
   if (!text && !title) return
   const previous = entries.at(-1)

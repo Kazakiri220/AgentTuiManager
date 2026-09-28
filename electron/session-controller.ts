@@ -4,7 +4,7 @@ import { TerminalInputState } from './terminal-input-state'
 import { terminalReplayText } from './terminal-state-replay'
 import { UnattendedSupervisor, type UnattendedAudit } from './unattended-supervisor'
 import type { UnattendedSettings } from '../src/shared/manager-api'
-import { approvalEnterCount, approvalEnterDelay, parseUnattendedSettings, selectedRecoveryEndWord } from '../src/shared/unattended-settings'
+import { approvalEnterCount, approvalEnterDelay, errorRecoveryPolicy, parseUnattendedSettings, selectedRecoveryEndWord } from '../src/shared/unattended-settings'
 
 import type { HostHandle, HostMetadataUpdate, HostRecord, SessionHostManager, StartHostOptions } from './session-host-manager'
 import type { HostEvent, HostExitFact } from '../src/shared/protocol'
@@ -280,6 +280,7 @@ export class SessionController {
     selectedRecoveryEndWord(settings)
     approvalEnterDelay(settings)
     approvalEnterCount(settings)
+    errorRecoveryPolicy(settings)
     if (typeof settings.recoveryWord !== 'string') throw new Error('恢复词必须为文本')
     await this.setFullAutoMode(sessionId, false)
     this.cancelHookApprovalContinue(managed)
@@ -443,13 +444,19 @@ export class SessionController {
     if (submitted) this.setActivity(managed, 'running')
   }
 
-  async startSession(request: StartSessionRequest): Promise<SessionSummary> {
+  continuationSource(sessionId: string): { summary: SessionSummary; request: StartSessionRequest } {
+    const managed = this.required(sessionId)
+    if (!managed.request || !managed.summary.nativeSessionId) throw new Error('当前窗口尚未绑定原生会话，请等待会话建立后再试')
+    return structuredClone({ summary: managed.summary, request: managed.request })
+  }
+
+  async startSession(request: StartSessionRequest, initialPrompt?: string): Promise<SessionSummary> {
     const adapter = createAgentAdapter(request.agentKind)
     const nativeCapture = !request.nativeSessionId && adapter.supportsNativeSessions
       ? await this.prepareNativeCapture(request.agentKind, request.workspace)
       : undefined
     const sessionId = randomUUID()
-    const handle = await this.manager.start(this.hostOptions(request, sessionId))
+    const handle = await this.manager.start({ ...this.hostOptions(request, sessionId), ...(initialPrompt ? { initialPrompt } : {}) })
     const managed: ManagedSession = {
       summary: {
         sessionId,
@@ -932,7 +939,7 @@ export class SessionController {
     const managed = this.required(sessionId)
     const normalized = { ...config, extraArgs: [...config.extraArgs] }
     if (!isTerminalStatus(managed.summary.status)) {
-      await this.manager.updateMetadata(managed.handle.hostId, { agentConfig: normalized.enabled ? normalized : null })
+      await this.manager.updateMetadata(managed.handle.hostId, { agentConfig: normalized.enabled || normalized.networkRetry || normalized.autoCompactTokens !== undefined ? normalized : null })
     }
     managed.summary = { ...managed.summary, agentConfig: normalized }
     if (managed.request) managed.request = { ...managed.request, agentConfig: normalized }
@@ -1058,7 +1065,7 @@ export class SessionController {
       cols: request.cols,
       rows: request.rows,
       maxContinueRetries: request.maxContinueRetries,
-      ...(managed.summary.agentConfig?.enabled ? { agentConfig: { ...managed.summary.agentConfig, extraArgs: [...managed.summary.agentConfig.extraArgs] } } : {}),
+      ...(managed.summary.agentConfig ? { agentConfig: { ...managed.summary.agentConfig, extraArgs: [...managed.summary.agentConfig.extraArgs] } } : {}),
       ...(managed.summary.agentProxy?.enabled ? { agentProxy: { ...managed.summary.agentProxy } } : {}),
       ...(managed.summary.nativeSessionId ? { nativeSessionId: managed.summary.nativeSessionId } : {}),
       ...(managed.summary.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
@@ -1482,7 +1489,7 @@ export class SessionController {
         cols: managed.request?.cols ?? 80,
         rows: managed.request?.rows ?? 24,
         maxContinueRetries: managed.request?.maxContinueRetries,
-        ...(managed.summary.agentConfig?.enabled ? { agentConfig: { ...managed.summary.agentConfig, extraArgs: [...managed.summary.agentConfig.extraArgs] } } : {}),
+        ...(managed.summary.agentConfig ? { agentConfig: { ...managed.summary.agentConfig, extraArgs: [...managed.summary.agentConfig.extraArgs] } } : {}),
         ...(managed.summary.agentProxy?.enabled ? { agentProxy: { ...managed.summary.agentProxy } } : {}),
         ...(managed.summary.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
         ...(managed.summary.nativeSessionId ? { nativeSessionId: managed.summary.nativeSessionId } : {}),
@@ -1879,7 +1886,7 @@ export class SessionController {
       cols: request.cols,
       rows: request.rows,
       maxContinueRetries: request.maxContinueRetries,
-      ...(request.agentConfig && 'hasApiKey' in request.agentConfig && request.agentConfig.enabled
+      ...(request.agentConfig && 'hasApiKey' in request.agentConfig
         ? { agentConfig: { ...request.agentConfig, extraArgs: [...request.agentConfig.extraArgs] } }
         : {}),
       ...(request.agentProxy && 'hasPassword' in request.agentProxy && request.agentProxy.enabled

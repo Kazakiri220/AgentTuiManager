@@ -8,6 +8,8 @@ export default function UnattendedControls({ session, onChanged }: { session: Se
   const [recoveryWord, setRecoveryWord] = useState(session.unattended?.recoveryWord ?? 'continue')
   const [enterDelay, setEnterDelay] = useState(session.unattended?.approvalEnterDelaySeconds ?? 5)
   const [enterCount, setEnterCount] = useState(session.unattended?.approvalEnterCount ?? 1)
+  const [errorAttempts, setErrorAttempts] = useState(session.unattended?.errorRecoveryAttempts ?? 3)
+  const [errorCooldown, setErrorCooldown] = useState(session.unattended?.errorRecoveryCooldownMinutes ?? 1)
   const [saved, setSaved] = useState(false)
   const [confirmed, setConfirmed] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -21,7 +23,7 @@ export default function UnattendedControls({ session, onChanged }: { session: Se
     try {
       if (!window.agentManager.setUnattendedMode) throw new Error('请重启新版 Manager 后使用无监管模式')
       const endWords = active ? session.unattended?.endWords : normalizeUnattendedEndWords({ endWords: endWordsText.split(/\r?\n/) })
-      const settings = { enabled: saveOnly ? false : !active, endWord: endWords?.[0] ?? session.unattended?.endWord, endWords, recoveryEndWord: selectedEndWord, recoveryWord, approvalEnterDelaySeconds: enterDelay, approvalEnterCount: enterCount }
+      const settings = { enabled: saveOnly ? false : !active, endWord: endWords?.[0] ?? session.unattended?.endWord, endWords, recoveryEndWord: selectedEndWord, recoveryWord, approvalEnterDelaySeconds: enterDelay, approvalEnterCount: enterCount, errorRecoveryAttempts: errorAttempts, errorRecoveryCooldownMinutes: errorCooldown }
       if (saveOnly) {
         if (!window.agentManager.saveUnattendedSettings) throw new Error('请重启新版 Manager 后保存配置')
         await window.agentManager.saveUnattendedSettings(session.sessionId, settings)
@@ -44,7 +46,10 @@ export default function UnattendedControls({ session, onChanged }: { session: Se
     <label>Agent 恢复词<input aria-label='Agent 恢复词' value={recoveryWord} maxLength={2000} disabled={active || busy} onChange={event => setRecoveryWord(event.target.value)} /></label>
     <p>只拼接上面选中的一个词：如果没有剩余任务，仅输出 {selectedEndWord || '选中的结束词'}，不要输出其他内容。其他结束词仍可用于识别完成。</p>
     <p>待命持续 5 秒且未完成时发送恢复提示。仅匹配 Agent 自己的完整回复；恢复消息、用户输入和终端回显中的结束词不会触发停止。待审批时只批准，不发恢复词。</p>
-    <p>阶段性完成但没有结束词时继续任务；网络或模型连续异常按 30 秒至 5 分钟退避恢复，不因重试耗尽关闭。恢复消息不等待接收回执。连续退出先冷却再恢复原生会话，不另开新会话。</p>
+    <p>阶段性完成但没有结束词时继续任务。恢复消息不等待接收回执。连续退出先冷却再恢复原生会话，不另开新会话。</p>
+    <label>异常恢复尝试次数<input type='number' aria-label='异常恢复尝试次数' min={1} max={100} step={1} value={errorAttempts} disabled={active || busy} onChange={event => { setErrorAttempts(event.target.valueAsNumber); setSaved(false) }} /></label>
+    <label>异常退避时间（分钟）<input type='number' aria-label='异常退避时间（分钟）' min={1} max={1440} step={1} value={errorCooldown} disabled={active || busy} onChange={event => { setErrorCooldown(event.target.valueAsNumber); setSaved(false) }} /></label>
+    <p>网络或模型异常时，每轮最多发送上述次数的恢复消息（间隔至少 10 秒），再等待指定分钟数。到期自动开始下一轮，不因次数耗尽关闭。计数按实际发送次数，不按状态检查次数；收到正常回复后清零。退避不影响工具审批，待审批、运行中或有未提交输入时仍不发恢复词。</p>
     <p>手动停止、Esc / Ctrl+C 会关闭无监管。缺少原生会话、终端连接无响应或提交状态不安全时仍需人工处理。保存的配置会保留；Manager 重启后需重新开启无监管。</p>
     <label>审批后补按 Enter 延迟（秒）<input type='number' aria-label='审批后补按 Enter 延迟（秒）' min={0} max={60} step={1} value={enterDelay} disabled={active || busy} onChange={event => setEnterDelay(event.target.valueAsNumber)} /></label>
     <label>Enter 发送次数<input type='number' aria-label='Enter 发送次数' min={1} max={20} step={1} value={enterCount} disabled={active || busy} onChange={event => { setEnterCount(event.target.valueAsNumber); setSaved(false) }} /></label>

@@ -1,5 +1,13 @@
 import type { UnattendedSettings } from './manager-api'
 
+export function errorRecoveryPolicy(settings: Pick<UnattendedSettings, 'errorRecoveryAttempts' | 'errorRecoveryCooldownMinutes'>) {
+  const errorRecoveryAttempts = settings.errorRecoveryAttempts === undefined ? 3 : settings.errorRecoveryAttempts
+  const errorRecoveryCooldownMinutes = settings.errorRecoveryCooldownMinutes === undefined ? 1 : settings.errorRecoveryCooldownMinutes
+  if (!Number.isInteger(errorRecoveryAttempts) || errorRecoveryAttempts < 1 || errorRecoveryAttempts > 100) throw new Error('异常恢复尝试次数必须为 1～100 的整数')
+  if (!Number.isInteger(errorRecoveryCooldownMinutes) || errorRecoveryCooldownMinutes < 1 || errorRecoveryCooldownMinutes > 1440) throw new Error('异常退避时间必须为 1～1440 的整数分钟')
+  return { errorRecoveryAttempts, errorRecoveryCooldownMinutes }
+}
+
 export function approvalEnterCount(settings: Pick<UnattendedSettings, 'approvalEnterCount'>): number {
   const count = settings.approvalEnterCount === undefined ? 1 : settings.approvalEnterCount
   if (!Number.isInteger(count) || count < 1 || count > 20) throw new Error('Enter 发送次数必须为 1～20 的整数')
@@ -15,7 +23,7 @@ export function parseUnattendedSettings(value: unknown): UnattendedSettings {
   if (typeof input.recoveryWord !== 'string' || !input.recoveryWord.trim() || input.recoveryWord.length > 2000 || /[\x00-\x1f\x7f]/.test(input.recoveryWord)) throw new Error('恢复词必须为一行且不超过 2000 字符')
   return { enabled: input.enabled, endWord: endWords[0], endWords,
     recoveryEndWord: selectedRecoveryEndWord(input), recoveryWord: input.recoveryWord.trim(),
-    approvalEnterDelaySeconds: approvalEnterDelay(input), approvalEnterCount: approvalEnterCount(input) }
+    approvalEnterDelaySeconds: approvalEnterDelay(input), approvalEnterCount: approvalEnterCount(input), ...errorRecoveryPolicy(input) }
 }
 
 export function approvalEnterDelay(settings: Pick<UnattendedSettings, 'approvalEnterDelaySeconds'>): number {
