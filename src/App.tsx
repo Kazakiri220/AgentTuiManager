@@ -1,6 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import { useTerminalRetention } from './use-terminal-retention'
 import CCSwitchProviderList from './CCSwitchProviderList'
 import FavoriteWorkspaces from './FavoriteWorkspaces'
 import CollapsiblePanel from './CollapsiblePanel'
@@ -1016,9 +1017,15 @@ export default function App(): JSX.Element {
   const overviewPendingCount = groupByWorkspace ? pendingCount : totalPendingCount
   const attentionSessions = useMemo(() => sessions.filter((session) => session.status === 'needs_attention'), [sessions])
   const activeWorkspaceName = currentWorkspace?.split(/[\\/]/).filter(Boolean).at(-1) ?? '尚未选择工作区'
-  const mountedSessions = selected
-    ? sessions.filter((session) => session.sessionId === selected.sessionId)
-    : orderedSessions
+  const terminalSessionIds = useMemo(() => orderedSessions.map(session => session.sessionId), [orderedSessions])
+  const visibleTerminalIds = useMemo(() => [
+    // Only Codex has a Host-side terminal protocol responder. Other TUIs still
+    // need their renderer to answer probes even before their first visible frame.
+    ...orderedSessions.filter(session => session.agentKind !== 'codex').map(session => session.sessionId),
+    ...(selected ? [selected.sessionId] : overviewMode === 'list' ? (activeListSessionId ? [activeListSessionId] : [])
+      : overviewSessions.map(session => session.sessionId)),
+  ], [orderedSessions, selected?.sessionId, overviewMode, activeListSessionId, overviewSessions])
+  const retainedTerminals = useTerminalRetention(terminalSessionIds, visibleTerminalIds)
 
   const approveNotification = async (request: ApprovalRequest): Promise<void> => {
     setNotificationBusyId(request.requestId)
@@ -1148,7 +1155,7 @@ export default function App(): JSX.Element {
                 }}
                 onDragEnd={() => setListDraggingId(undefined)}
                 onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside></CollapsiblePanel>}
-              <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
+              <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{orderedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
                 approval={approvals.find((request) => request.sessionId === session.sessionId)}
@@ -1156,7 +1163,8 @@ export default function App(): JSX.Element {
                 onActivate={() => setWallActiveId(session.sessionId)}
                 detail={Boolean(selected)}
                 embedded={overviewMode === 'list' && !selected}
-                hidden={!selected && (!overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId)}
+                hidden={selected ? session.sessionId !== selected.sessionId : !overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId}
+                retained={retainedTerminals.has(session.sessionId)}
                 onOpen={() => setSelectedId(session.sessionId)}
                 onEdit={() => openAgentEditor(session.sessionId)}
                 onContinuation={() => { closeOtherOverlays('continuation'); setContinuationSource(session) }}

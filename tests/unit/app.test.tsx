@@ -173,6 +173,92 @@ describe('App terminal wall', () => {
     expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
   })
 
+  it('loads only the visible Agent on initial list view and reuses recently viewed terminals', async () => {
+    window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'list' }))
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'second', displayName: 'Second' }])
+    render(<App />)
+    await screen.findByRole('button', { name: '切换到 Second' })
+    expect(api.terminalReplay).toHaveBeenCalledTimes(1)
+    expect(api.terminalReplay).toHaveBeenCalledWith(session.sessionId)
+    fireEvent.click(screen.getByRole('button', { name: '切换到 Second' }))
+    expect(api.terminalReplay).toHaveBeenCalledTimes(2)
+    fireEvent.click(screen.getByRole('button', { name: '切换到 Codex API 重构' }))
+    expect(api.terminalReplay).toHaveBeenCalledTimes(2)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+    expect(api.setActiveSession).toHaveBeenLastCalledWith(session.sessionId)
+  })
+
+  it('retains other terminals and subscriptions through detail roundtrips', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'second', displayName: 'Second' }])
+    render(<App />)
+    const first = await screen.findByTestId('terminal-tile-session-1')
+    const second = screen.getByTestId('terminal-tile-second')
+    expect(api.terminalReplay).toHaveBeenCalledTimes(2)
+    const subscriptions = vi.mocked(api.subscribe).mock.calls.length
+    for (let index = 0; index < 3; index++) {
+      fireEvent.click(first)
+      expect(second).toHaveClass('terminal-card-hidden')
+      expect(second.isConnected).toBe(true)
+      fireEvent.click(screen.getByRole('button', { name: '返回总览' }))
+      expect(second).not.toHaveClass('terminal-card-hidden')
+    }
+    expect(api.terminalReplay).toHaveBeenCalledTimes(2)
+    expect(api.subscribe).toHaveBeenCalledTimes(subscriptions)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+  })
+
+  it('preserves already viewed history across many Agent switches without replaying or disposing it', async () => {
+    window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'list' }))
+    vi.mocked(api.listSessions).mockResolvedValue(Array.from({ length: 8 }, (_, i) => ({ ...session, sessionId: 'cache-' + i, displayName: 'Cache ' + i })))
+    render(<App />)
+    await screen.findByRole('button', { name: '切换到 Cache 7' })
+    expect(Terminal).toHaveBeenCalledTimes(1)
+    for (let i = 1; i < 8; i++) fireEvent.click(screen.getByRole('button', { name: '切换到 Cache ' + i }))
+    expect(Terminal).toHaveBeenCalledTimes(8)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '切换到 Cache 6' }))
+    expect(Terminal).toHaveBeenCalledTimes(8)
+    fireEvent.click(screen.getByRole('button', { name: '切换到 Cache 0' }))
+    expect(Terminal).toHaveBeenCalledTimes(8)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+    expect(api.terminalReplay).toHaveBeenCalledTimes(8)
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('cache-0')
+  })
+
+  it('keeps hidden non-Codex terminal protocol responders mounted before their first visit', async () => {
+    window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'list' }))
+    vi.mocked(api.listSessions).mockResolvedValue([session,
+      { ...session, sessionId: 'claude-background', agentKind: 'claude' },
+      { ...session, sessionId: 'shell-background', agentKind: 'generic' },
+      { ...session, sessionId: 'codex-background', agentKind: 'codex' },
+    ])
+    render(<App />)
+    await screen.findByTestId('terminal-tile-session-1')
+    expect(api.terminalReplay).toHaveBeenCalledTimes(3)
+    expect(api.terminalReplay).toHaveBeenCalledWith('claude-background')
+    expect(api.terminalReplay).toHaveBeenCalledWith('shell-background')
+    expect(api.terminalReplay).not.toHaveBeenCalledWith('codex-background')
+    fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /总览/ }))
+    expect(api.terminalReplay).toHaveBeenCalledTimes(4)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+  })
+
+  it('does not initially replay other workspaces and releases a removed cached Agent', async () => {
+    window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'wall', groupByWorkspace: true }))
+    const listeners: Array<Parameters<AgentManagerApi['subscribe']>[0]> = []
+    vi.mocked(api.subscribe).mockImplementation(listener => { listeners.push(listener); return () => undefined })
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'second', displayName: 'Second', workspace: 'B:\\projects\\docs' }])
+    render(<App />)
+    await screen.findByTestId('terminal-tile-session-1')
+    expect(api.terminalReplay).toHaveBeenCalledTimes(1)
+    fireEvent.click(within(document.querySelector('.sidebar') as HTMLElement).getByRole('button', { name: /docs/ }))
+    expect(api.terminalReplay).toHaveBeenCalledTimes(2)
+    act(() => listeners.forEach(listener => listener({ type: 'sessions-changed', sessionId: session.sessionId, session: null, approvals: [] })))
+    expect(screen.queryByTestId('terminal-tile-session-1')).not.toBeInTheDocument()
+    expect(terminalMocks.dispose).toHaveBeenCalledTimes(1)
+    expect(screen.getByTestId('terminal-tile-second')).not.toHaveClass('terminal-card-hidden')
+  })
+
   it('opens DeepSeek in an authenticated top-level window, never an iframe', async () => {
     vi.mocked(api.listSessions).mockResolvedValue([{
       ...session,

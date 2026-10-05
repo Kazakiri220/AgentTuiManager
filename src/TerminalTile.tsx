@@ -6,6 +6,7 @@ import type { ApprovalRequest, SessionSummary } from './shared/manager-api'
 import { approvalReviewLabel } from './shared/approval-review-label'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus } from './shared/session-state'
 import { TerminalWriteWatchdog } from './terminal-write-watchdog'
+import { writeTerminalOutput } from './terminal-output'
 import DeepSeekStartupOutput from './DeepSeekStartupOutput'
 import { deepSeekWebUrl as validateDeepSeekWebUrl } from './shared/deepseek-web-url'
 import codexLogoUrl from '../logo/codex.png'
@@ -93,6 +94,7 @@ interface TerminalTileProps {
   detail?: boolean
   embedded?: boolean
   hidden?: boolean
+  retained?: boolean
   active?: boolean
   onActivate?: () => void
   onOpen?: () => void
@@ -106,7 +108,7 @@ interface TerminalTileProps {
   onDragOver?: () => void
 }
 
-export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, active = false, onActivate, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
@@ -117,7 +119,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
   const deepSeekWebUrl = validateDeepSeekWebUrl(session.webUrl)
 
   useEffect(() => {
-    if (terminalEnded || deepSeekWeb) return
+    if (terminalEnded || deepSeekWeb || !retained) return
     const host = hostRef.current
     if (!host) return
     const terminal = new Terminal({
@@ -286,7 +288,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       })
       // Never inject escape sequences at transport chunk boundaries: output may
       // end halfway through a CSI/OSC command. The visual cover hides resize frames.
-      terminal.write(output, completeWrite)
+      writeTerminalOutput(terminal, output, completeWrite, completeWrite.progress)
     }
     const flushTerminalInput = (): void => {
       inputFrame = 0
@@ -581,8 +583,9 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       if (terminal.options.fontSize !== fontSize) {
         terminal.options.fontSize = fontSize
         // xterm re-measures its cell box after the font changes, so fit the grid on the
-        // next frame when the new metrics are available rather than with stale ones.
-        scheduleResize()
+        // next frame. The outer size change has already settled; do not add a second
+        // 180ms debounce just to read the updated font metrics.
+        scheduleResize(false)
         return
       }
       const cell = terminalCellSize(terminal)
@@ -615,10 +618,11 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       sendPtyResize(cols, rows)
       if (forceRedraw || manualRedrawRequested) scheduleResize()
     }
-    const scheduleResize = (): void => {
+    const scheduleResize = (debounce = true): void => {
       cancelAnimationFrame(resizeFrame)
       if (ptyResizeTimer) clearTimeout(ptyResizeTimer)
       resizeFrame = requestAnimationFrame(() => {
+        if (!debounce) { fitTerminal(); return }
         // Debounce the grid and PTY together, not just the PTY. Otherwise live
         // output uses old columns for 180ms while xterm already uses new ones.
         ptyResizeTimer = setTimeout(() => {
@@ -628,7 +632,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       })
     }
     scheduleResize()
-    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(scheduleResize)
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => scheduleResize())
     observer?.observe(host)
     return () => {
       disposed = true
@@ -667,7 +671,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       refreshButton.remove()
       terminal.dispose()
     }
-  }, [session.sessionId, terminalEnded, deepSeekWeb])
+  }, [session.sessionId, terminalEnded, deepSeekWeb, retained])
 
   useEffect(() => {
     if (session.status === 'starting' || session.status === 'recovering' || session.status === 'running') {

@@ -288,7 +288,7 @@ interface FileCursor {
 
 /** Complete JSONL records with bounded memory. Keep a partial final line for the
  * next poll, and never skip newly appended records because later output is large. */
-async function* nativeLines(cursor: FileCursor, end: number): AsyncIterable<string> {
+async function* nativeLines(cursor: FileCursor, end: number, current: () => boolean): AsyncIterable<string> {
   const file = await fs.open(cursor.path, 'r')
   const buffer = Buffer.allocUnsafe(64 * 1024)
   const partial = cursor.partial
@@ -301,14 +301,20 @@ async function* nativeLines(cursor: FileCursor, end: number): AsyncIterable<stri
     partial.chunks.push(Buffer.from(part)); partial.length += part.length
   }
   try {
-    while (cursor.offset < end) {
+    while (cursor.offset < end && current()) {
       const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, end - cursor.offset), cursor.offset)
-      if (!bytesRead) return
+      if (!bytesRead || !current()) return
+      const bytes = buffer.subarray(0, bytesRead)
       let segment = 0
-      for (let index = 0; index < bytesRead; index += 1) {
-        if (buffer[index] !== 0x0a) continue
-        append(buffer.subarray(segment, index))
-        if (!partial.discarding) yield Buffer.concat(partial.chunks, partial.length).toString('utf8')
+      for (let index = bytes.indexOf(0x0a, segment); index >= 0; index = bytes.indexOf(0x0a, segment)) {
+        // Most records fit in this buffer. Decode them directly, without a
+        // byte-by-byte JS scan or allocating/copying intermediate buffers.
+        if (!partial.length && !partial.discarding) {
+          if (index > segment) yield buffer.subarray(segment, index).toString('utf8')
+        } else {
+          append(buffer.subarray(segment, index))
+          if (!partial.discarding) yield Buffer.concat(partial.chunks, partial.length).toString('utf8')
+        }
         partial.chunks = []; partial.length = 0; partial.discarding = false; segment = index + 1
       }
       append(buffer.subarray(segment, bytesRead))
@@ -323,6 +329,9 @@ export class NativeSessionActivityMonitor {
   private readonly missingUntil = new Map<string, number>()
   private timer?: ReturnType<typeof setTimeout>
   private stopped = false
+  private started = false
+  private generation = 0
+  private inFlight?: { generation: number; promise: Promise<boolean> }
 
   constructor(
     private readonly sessions: () => NativeActivitySession[],
@@ -331,11 +340,19 @@ export class NativeSessionActivityMonitor {
   ) {}
 
   start(): void {
+    if (this.started) return
+    this.started = true
     this.stopped = false
+    const generation = ++this.generation
     const tick = async (): Promise<void> => {
-      try { await this.poll() } finally {
-        if (!this.stopped) {
-          this.timer = setTimeout(() => { void tick() }, 2000)
+      let backlog = false
+      try { backlog = await this.pollOnce(generation) } catch {
+        // A transient discovery failure must not terminate monitoring.
+      } finally {
+        if (this.current(generation) && this.started) {
+          // Yield to the event loop between bounded catchup slices. Idle files
+          // retain the normal interval; a backlog never waits two seconds.
+          this.timer = setTimeout(() => { this.timer = undefined; void tick() }, backlog ? 0 : 2000)
           this.timer.unref?.()
         }
       }
@@ -345,17 +362,51 @@ export class NativeSessionActivityMonitor {
 
   stop(): void {
     this.stopped = true
+    this.started = false
+    this.generation += 1
     if (this.timer) clearTimeout(this.timer)
+    this.timer = undefined
   }
 
   async poll(): Promise<void> {
-    const sessions = this.sessions().filter((session) => activityId(session)
-      && (session.agentKind === 'codex' || session.agentKind === 'claude')
-      && (!['completed', 'stopped', 'failed'].includes(session.status) || session.unattended?.enabled))
+    await this.pollOnce(this.generation)
+  }
+
+  private current(generation: number): boolean {
+    return !this.stopped && this.generation === generation
+  }
+
+  /** Coalesce concurrent polls; a restarted run waits for the cancelled reader
+   * to close before reusing its cursor and complete, unpublished aggregate. */
+  private async pollOnce(generation: number): Promise<boolean> {
+    if (!this.current(generation)) return false
+    const previous = this.inFlight
+    if (previous) {
+      const backlog = await previous.promise
+      if (!this.current(generation)) return false
+      return previous.generation === generation ? backlog : this.pollOnce(generation)
+    }
+    const pending = { generation, promise: this.readSessions(generation) }
+    this.inFlight = pending
+    try { return await pending.promise } finally {
+      if (this.inFlight === pending) this.inFlight = undefined
+    }
+  }
+
+  private eligible(session: NativeActivitySession): boolean {
+    return !!activityId(session) && (session.agentKind === 'codex' || session.agentKind === 'claude')
+      && (!['completed', 'stopped', 'failed'].includes(session.status) || !!session.unattended?.enabled)
+  }
+
+  private async readSessions(generation: number): Promise<boolean> {
+    const current = (): boolean => this.current(generation)
+    const sessions = this.sessions().filter((session) => this.eligible(session))
+    let backlog = false
     const activeKeys = new Set(sessions.map((session) => this.key(session)))
     for (const key of this.files.keys()) if (!activeKeys.has(key)) this.files.delete(key)
     for (const key of this.missingUntil.keys()) if (!activeKeys.has(key)) this.missingUntil.delete(key)
     for (const session of sessions) {
+      if (!current()) return false
       const key = this.key(session)
       const nativeId = activityId(session)!
       const kind = session.agentKind as 'codex' | 'claude'
@@ -365,7 +416,9 @@ export class NativeSessionActivityMonitor {
           if ((this.missingUntil.get(key) ?? 0) > Date.now()) continue
           const bound = session.activityTranscriptPath ? await validateNativeActivityBinding(kind,
             { nativeSessionId: nativeId, transcriptPath: session.activityTranscriptPath }, this.roots) : undefined
-          const path = bound?.transcriptPath ?? await this.findFile(kind, nativeId)
+          if (!current()) return false
+          const path = bound?.transcriptPath ?? await this.findFile(kind, nativeId, current)
+          if (!current()) return false
           if (!path) { this.missingUntil.set(key, Date.now() + 30_000); continue }
           cursor = { path, size: -1, mtime: -1, offset: 0, partial: { chunks: [], length: 0, discarding: false },
             questions: new Map(), settledQuestionIds: new Set() }
@@ -373,9 +426,10 @@ export class NativeSessionActivityMonitor {
           this.missingUntil.delete(key)
         }
         const stat = await fs.stat(cursor.path)
+        if (!current()) return false
         const identity = [stat.dev, stat.ino, stat.birthtimeMs].join(':')
         const replaced = cursor.identity !== undefined && cursor.identity !== identity
-        if (!replaced && stat.size === cursor.size && stat.mtimeMs === cursor.mtime && cursor.offset >= stat.size) continue
+        if (!cursor.pendingRead && !replaced && stat.size === cursor.size && stat.mtimeMs === cursor.mtime && cursor.offset >= stat.size) continue
         const previousQuestions = cursor.pendingRead?.previousQuestions ?? [...cursor.questions.keys()].sort().join('\n')
         const truncated = stat.size < cursor.size
         const rewritten = stat.size === cursor.size && stat.mtimeMs !== cursor.mtime
@@ -383,6 +437,7 @@ export class NativeSessionActivityMonitor {
           if (!await validateNativeActivityBinding(kind, { nativeSessionId: nativeId, transcriptPath: cursor.path }, this.roots)) {
             throw new Error('Native activity metadata changed')
           }
+          if (!current()) return false
           cursor.questions.clear()
           if (replaced || truncated) cursor.settledQuestionIds.clear()
           cursor.offset = 0
@@ -394,8 +449,9 @@ export class NativeSessionActivityMonitor {
         // Bound work per session/tick. Carry partial records and the aggregate
         // forward; publish only once caught up so already-answered calls in a
         // restored transcript never appear briefly as actionable questions.
-        const end = Math.min(stat.size, cursor.offset + 8 * 1024 * 1024)
-        for await (const line of nativeLines(cursor, end)) {
+        const start = cursor.offset
+        const end = Math.min(stat.size, start + 1024 * 1024)
+        for await (const line of nativeLines(cursor, end, current)) {
           let value: unknown
           try { value = JSON.parse(line) } catch { continue }
           const native = nativeRecord(value, nativeId)
@@ -413,9 +469,21 @@ export class NativeSessionActivityMonitor {
             && event.timestamp >= (session.activityUpdatedAt ?? 0)
             && (!read.latest || event.timestamp >= read.latest.timestamp)) read.latest = event
         }
+        if (!current()) return false
+        // The controller may have stopped/rebound the session during file I/O.
+        // A stale generation must neither publish nor keep a catchup loop alive.
+        if (!this.sessions().some(candidate => this.eligible(candidate) && this.key(candidate) === key)) {
+          this.files.delete(key)
+          continue
+        }
         cursor.size = stat.size
         cursor.mtime = stat.mtimeMs
-        if (cursor.offset < stat.size) continue
+        if (cursor.offset < stat.size) {
+          // A short/empty read can race truncation or stale filesystem metadata.
+          // Retry on the idle interval if there was no progress, avoiding a spin.
+          backlog ||= cursor.offset > start
+          continue
+        }
         cursor.pendingRead = undefined
         const { latest, userMessage, assistantMessage, questionTimestamp } = read
         const questions = [...cursor.questions.values()].map((call) => ({ ...call.question }))
@@ -441,11 +509,13 @@ export class NativeSessionActivityMonitor {
           emit({ activity: 'running', timestamp: questionTimestamp || stat.mtimeMs })
         }
       } catch {
+        if (!current()) return false
         // Missing/rotated/unreadable transcripts must not interrupt the Agent.
         this.files.delete(key)
         this.missingUntil.set(key, Date.now() + 30_000)
       }
     }
+    return backlog
   }
 
   private key(session: NativeActivitySession): string {
@@ -453,13 +523,14 @@ export class NativeSessionActivityMonitor {
       session.activityGeneration ?? 0, session.activitySince ?? 0].join(':')
   }
 
-  private async findFile(kind: 'codex' | 'claude', id: string): Promise<string | undefined> {
+  private async findFile(kind: 'codex' | 'claude', id: string, current: () => boolean): Promise<string | undefined> {
     if (!/^[a-zA-Z0-9-]{8,128}$/.test(id)) return undefined
     const directories = [this.roots[kind]]
-    while (directories.length) {
+    while (directories.length && current()) {
       const directory = directories.pop()!
       let entries
       try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { continue }
+      if (!current()) return undefined
       for (const entry of entries) {
         if (entry.isDirectory() && entry.name !== 'subagents') directories.push(join(directory, entry.name))
         else if (entry.isFile() && (kind === 'claude' ? entry.name === id + '.jsonl'

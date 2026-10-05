@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { NativeSessionActivityMonitor, parseNativeActivity, type NativeActivityEvent } from '../../electron/native-session-activity'
+import { NativeSessionActivityMonitor, parseNativeActivity, type NativeActivityEvent, type NativeActivitySession } from '../../electron/native-session-activity'
 import { sessionDisplayStatus, parseSessionDisplayStatus } from '../../src/shared/session-state'
 import type { SessionSummary } from '../../src/shared/manager-api'
 
@@ -25,13 +25,13 @@ function codexResult(timestamp: number, id: string, output: unknown = { answers:
 }
 
 async function questionMonitor(kind: 'codex' | 'claude', rows: unknown[], check: (fixture: {
-  monitor: NativeSessionActivityMonitor; events: NativeActivityEvent[]; path: string; session: SessionSummary
+  monitor: NativeSessionActivityMonitor; events: NativeActivityEvent[]; path: string; session: NativeActivitySession
   append: (...rows: unknown[]) => Promise<void>
 }) => Promise<void>) {
   const root = await mkdtemp(join(tmpdir(), 'atm-question-'))
   const path = join(root, kind === 'codex' ? 'rollout-questions-native-one.jsonl' : 'native-one.jsonl')
   const session = { sessionId: 'manager-one', nativeSessionId: 'native-one', agentKind: kind,
-    status: 'running', activitySince: 200 } as SessionSummary
+    status: 'running', activitySince: 200 } as NativeActivitySession
   const events: NativeActivityEvent[] = []
   const monitor = new NativeSessionActivityMonitor(() => [session], (_session, event) => {
     events.push(event)
@@ -46,7 +46,231 @@ async function questionMonitor(kind: 'codex' | 'claude', rows: unknown[], check:
   }
 }
 
+/** Drive only scheduled monitor ticks; filesystem I/O stays real and synthetic. */
+async function pollingClock(check: (clock: {
+  delay: () => number | undefined
+  tick: (monitor: NativeSessionActivityMonitor) => Promise<void>
+}) => Promise<void>) {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const timeout = vi.spyOn(globalThis, 'setTimeout')
+  try {
+    await check({
+      delay: () => {
+        expect(vi.getTimerCount()).toBe(1)
+        return timeout.mock.calls.at(-1)?.[1]
+      },
+      tick: async monitor => {
+        expect(vi.getTimerCount()).toBe(1)
+        const callback = timeout.mock.calls.at(-1)![0] as () => void
+        vi.clearAllTimers()
+        callback()
+        await monitor.poll()
+      },
+    })
+  } finally { timeout.mockRestore(); vi.useRealTimers() }
+}
+
 describe('native task activity', () => {
+  it('yields between catchup slices, publishes one complete snapshot, then resumes idle polling', async () => {
+    await questionMonitor('codex', [
+      { timestamp: 250, type: 'event_msg', payload: { type: 'user_message', message: 'Synthetic prompt' } },
+      codexQuestion(300, 'already-answered'), { padding: 'x'.repeat(3 * 1024 * 1024) },
+      codexResult(400, 'already-answered'), codexQuestion(500, 'current-question'),
+      { timestamp: 600, type: 'event_msg', payload: { type: 'task_complete', last_agent_message: 'Synthetic answer' } },
+    ], async ({ monitor, events }) => {
+      await pollingClock(async clock => {
+        monitor.start()
+        await monitor.poll()
+        expect(events).toHaveLength(0)
+        let catchupTicks = 0
+        while (!events.length && catchupTicks < 8) {
+          expect(clock.delay()).toBe(0)
+          await clock.tick(monitor)
+          catchupTicks += 1
+        }
+        expect(catchupTicks).toBeGreaterThan(0)
+        expect(events).toEqual([{
+          activity: 'completed', timestamp: 600,
+          userMessage: { text: 'Synthetic prompt', timestamp: 250 },
+          assistantMessage: { text: 'Synthetic answer', timestamp: 600 },
+          pendingUserQuestions: [{ id: 'current-question', toolName: 'request_user_input', timestamp: 500 }],
+        }])
+        expect(clock.delay()).toBe(2000)
+        await clock.tick(monitor)
+        expect(events).toHaveLength(1)
+        expect(clock.delay()).toBe(2000)
+        monitor.stop()
+        expect(vi.getTimerCount()).toBe(0)
+      })
+    })
+  })
+
+  it('coalesces concurrent polls and repeated starts into one reader and one timer', async () => {
+    await questionMonitor('codex', [codexQuestion(300, 'one-question')], async ({ monitor, events, path }) => {
+      const stat = await fs.stat(path)
+      let release!: () => void
+      let entered!: () => void
+      const blocked = new Promise<void>(resolve => { release = resolve })
+      const waiting = new Promise<void>(resolve => { entered = resolve })
+      const spy = vi.spyOn(fs, 'stat').mockImplementationOnce(async () => { entered(); await blocked; return stat })
+      try {
+        await pollingClock(async clock => {
+          monitor.start()
+          monitor.start()
+          const polls = [monitor.poll(), monitor.poll()]
+          await waiting
+          expect(spy).toHaveBeenCalledTimes(1)
+          release()
+          await Promise.all(polls)
+          expect(events).toHaveLength(1)
+          expect(clock.delay()).toBe(2000)
+          monitor.start()
+          expect(clock.delay()).toBe(2000)
+          expect(spy).toHaveBeenCalledTimes(1)
+          monitor.stop()
+        })
+      } finally { release(); spy.mockRestore() }
+    })
+  })
+
+  it.each([false, true])('cancels an in-flight tick without stale callbacks or timers; restart=%s', async restart => {
+    await questionMonitor('codex', [codexQuestion(300, 'already-answered'),
+      { padding: 'x'.repeat(2 * 1024 * 1024) }, codexResult(400, 'already-answered'),
+      codexQuestion(500, 'current-question')], async ({ monitor, events, path }) => {
+      await pollingClock(async clock => {
+        monitor.start()
+        await monitor.poll()
+        expect(events).toHaveLength(0)
+        expect(clock.delay()).toBe(0)
+        const stat = await fs.stat(path)
+        let release!: () => void
+        let entered!: () => void
+        const blocked = new Promise<void>(resolve => { release = resolve })
+        const waiting = new Promise<void>(resolve => { entered = resolve })
+        const spy = vi.spyOn(fs, 'stat').mockImplementationOnce(async () => { entered(); await blocked; return stat })
+        try {
+          const oldPoll = clock.tick(monitor)
+          await waiting
+          monitor.stop()
+          if (restart) monitor.start()
+          const nextPoll = monitor.poll()
+          // A restarted reader must wait for the cancelled reader to finish.
+          expect(spy).toHaveBeenCalledTimes(1)
+          release()
+          await Promise.all([oldPoll, nextPoll])
+          expect(events).toHaveLength(0)
+          if (!restart) {
+            expect(vi.getTimerCount()).toBe(0)
+            monitor.start()
+            await monitor.poll()
+          }
+          for (let index = 0; !events.length && index < 6; index += 1) {
+            expect(clock.delay()).toBe(0)
+            await clock.tick(monitor)
+          }
+          expect(events).toHaveLength(1)
+          expect(events[0]?.pendingUserQuestions?.map(question => question.id)).toEqual(['current-question'])
+          expect(clock.delay()).toBe(2000)
+          monitor.stop()
+          expect(vi.getTimerCount()).toBe(0)
+        } finally { release(); spy.mockRestore() }
+      })
+    })
+  })
+
+  it.each(['generation', 'binding', 'stopped'] as const)('discards an obsolete session snapshot after an in-flight %s change', async change => {
+    await questionMonitor('codex', [codexQuestion(300, 'old-question')], async ({ monitor, events, path, session, append }) => {
+      const stat = await fs.stat(path)
+      let release!: () => void
+      let entered!: () => void
+      const blocked = new Promise<void>(resolve => { release = resolve })
+      const waiting = new Promise<void>(resolve => { entered = resolve })
+      const spy = vi.spyOn(fs, 'stat').mockImplementationOnce(async () => { entered(); await blocked; return stat })
+      try {
+        const pending = monitor.poll()
+        await waiting
+        if (change === 'generation') session.activityGeneration = 1
+        else if (change === 'binding') session.activityBindingVersion = 1
+        else session.status = 'stopped'
+        release()
+        await pending
+        expect(events).toHaveLength(0)
+        session.status = 'running'
+        session.activitySince = 400
+        await append(codexQuestion(500, 'new-question'))
+        await monitor.poll()
+        expect(events).toHaveLength(1)
+        expect(events[0]?.pendingUserQuestions?.map(question => question.id)).toEqual(['new-question'])
+      } finally { release(); spy.mockRestore() }
+    })
+  })
+
+  it.each([false, true])('retains the complete unpublished aggregate when stopped while closing a fully read file; multiple slices=%s', async multipleSlices => {
+    await questionMonitor('codex', [codexQuestion(300, 'already-answered'),
+      ...(multipleSlices ? [{ padding: 'x'.repeat(1024 * 1024) }] : []), codexResult(400, 'already-answered'),
+      codexQuestion(500, 'current-question')], async ({ monitor, events }) => {
+      const open = fs.open.bind(fs)
+      let opened = 0
+      const finalOpen = multipleSlices ? 3 : 2
+      let release!: () => void
+      let entered!: () => void
+      const blocked = new Promise<void>(resolve => { release = resolve })
+      const waiting = new Promise<void>(resolve => { entered = resolve })
+      const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const file = await open(...args)
+        // After metadata validation, each slice opens the file once. Block the
+        // final close after the cursor reaches EOF but before publication.
+        if (++opened === finalOpen) {
+          const close = file.close.bind(file)
+          vi.spyOn(file, 'close').mockImplementationOnce(async () => { entered(); await blocked; await close() })
+        }
+        return file
+      })
+      try {
+        await pollingClock(async clock => {
+          monitor.start()
+          if (multipleSlices) {
+            await monitor.poll()
+            expect(events).toHaveLength(0)
+            expect(clock.delay()).toBe(0)
+          }
+          const oldPoll = multipleSlices ? clock.tick(monitor) : monitor.poll()
+          await waiting
+          monitor.stop()
+          monitor.start()
+          const restartedPoll = monitor.poll()
+          expect(events).toHaveLength(0)
+          expect(opened).toBe(finalOpen)
+          release()
+          await Promise.all([oldPoll, restartedPoll])
+          expect(events).toHaveLength(1)
+          expect(events[0]?.pendingUserQuestions?.map(question => question.id)).toEqual(['current-question'])
+          expect(clock.delay()).toBe(2000)
+          monitor.stop()
+          expect(vi.getTimerCount()).toBe(0)
+        })
+      } finally { release(); spy.mockRestore() }
+    })
+  })
+
+  it('waits for the idle interval after an empty read instead of spinning on stale file size', async () => {
+    await questionMonitor('codex', [], async ({ monitor, events, path }) => {
+      const stat = await fs.stat(path)
+      const spy = vi.spyOn(fs, 'stat').mockResolvedValue({ ...stat, size: stat.size + 1024 } as typeof stat)
+      try {
+        await pollingClock(async clock => {
+          monitor.start()
+          await monitor.poll()
+          expect(clock.delay()).toBe(0)
+          await clock.tick(monitor)
+          expect(events).toHaveLength(0)
+          expect(clock.delay()).toBe(2000)
+          monitor.stop()
+        })
+      } finally { spy.mockRestore() }
+    })
+  })
+
   it.each(['initial', 'append'] as const)('finds a new question before more than 512 KiB of later output: %s scan', async when => {
     const rows = [codexQuestion(300, 'hidden-call'), { timestamp: 400, type: 'event_msg',
       payload: { type: 'token_count', padding: 'x'.repeat(600_000) } }]
@@ -77,7 +301,7 @@ describe('native task activity', () => {
       { padding: 'x'.repeat(9 * 1024 * 1024) }, codexResult(400, 'already-answered'),
       codexQuestion(500, 'current-question')], async ({ monitor, events }) => {
       await monitor.poll(); expect(events).toHaveLength(0)
-      await monitor.poll()
+      for (let index = 0; !events.length && index < 12; index += 1) await monitor.poll()
       expect(events).toHaveLength(1)
       expect(events[0]?.pendingUserQuestions?.map(question => question.id)).toEqual(['current-question'])
       await monitor.poll(); expect(events).toHaveLength(1)
