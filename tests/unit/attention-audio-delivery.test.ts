@@ -5,7 +5,7 @@ describe('attention audio delivery', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
   const fixture = () => {
-    const port = { send: vi.fn(), fallback: vi.fn() }
+    const port = { send: vi.fn(), fallback: vi.fn(), onDelivery: vi.fn() }
     return { port, delivery: new AttentionAudioDelivery(port) }
   }
   it('uses fallback before the renderer subscribes and after a renderer crash', () => {
@@ -25,6 +25,7 @@ describe('attention audio delivery', () => {
     vi.advanceTimersByTime(3000)
     delivery.acknowledge(id, false)
     expect(port.fallback).not.toHaveBeenCalled()
+    expect(port.onDelivery.mock.calls).toEqual([['renderer_completed']])
   })
   it('falls back once for missing or failed receipts, ignoring invalid receipt data', () => {
     const { port, delivery } = fixture()
@@ -37,6 +38,13 @@ describe('attention audio delivery', () => {
     delivery.acknowledge(port.send.mock.calls[1]![0], false)
     vi.advanceTimersByTime(2000)
     expect(port.fallback).toHaveBeenCalledTimes(2)
+    expect(port.onDelivery.mock.calls).toEqual([['native_fallback'], ['native_fallback']])
+  })
+  it('ignores diagnostic failures without losing fallback delivery', () => {
+    const { port, delivery } = fixture()
+    port.onDelivery.mockImplementation(() => { throw new Error('Audit unavailable') })
+    expect(() => delivery.play()).not.toThrow()
+    expect(port.fallback).toHaveBeenCalledOnce()
   })
   it('handles a closed send channel and releases timers on shutdown', () => {
     const { port, delivery } = fixture()

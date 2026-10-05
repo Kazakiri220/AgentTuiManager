@@ -56,8 +56,8 @@ describe('LLM security reviewer policy', () => {
     expect(conclusion).toMatchObject({ verdict: 'allow', requiresHumanApproval: false, model: 'review-model', reviewedAt: 123 })
   })
 
-  it.each(['manual', 'uncertain'])('retains a legacy %s verdict for the controller to reject', verdict => {
-    expect(parseReviewConclusion({ ...allowed, verdict }, 'model').requiresHumanApproval).toBe(true)
+  it.each(['manual', 'uncertain'])('normalizes a legacy %s verdict into a final denial', verdict => {
+    expect(parseReviewConclusion({ ...allowed, verdict }, 'model')).toMatchObject({ verdict: 'deny', requiresHumanApproval: false })
   })
 
   it('keeps a denial as a machine decision without requesting human approval', () => {
@@ -81,7 +81,8 @@ describe('LLM security reviewer policy', () => {
     expect(payload).toMatchObject({ cwd: '/workspace/build', localRiskReason: '本地递归删除提示', toolInput: { cwd: '/workspace/build' } })
     expect(payload.toolInput).not.toHaveProperty('env')
     expect(payload).not.toHaveProperty('hardBlockedReason')
-    expect(config?.signal).toBe(signal)
+    expect(config?.signal).toBeInstanceOf(AbortSignal)
+    expect(signal.aborted).toBe(false)
     expect(result.requiresHumanApproval).toBe(false)
   })
 

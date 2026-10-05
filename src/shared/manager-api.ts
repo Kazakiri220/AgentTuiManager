@@ -134,6 +134,35 @@ export interface DingTalkSettingsSummary {
 
 export type LlmReviewLevel = 'low' | 'medium' | 'high'
 export type LlmReviewerBackend = 'api' | 'codex-cli' | 'claude-cli'
+export type LlmApiProtocol = 'openai-chat' | 'openai-responses' | 'anthropic-messages'
+export interface LlmReviewerInput {
+  id: string
+  name: string
+  enabled: boolean
+  backend: LlmReviewerBackend
+  protocol?: LlmApiProtocol
+  anthropicAuth?: 'api-key' | 'bearer'
+  baseUrl?: string
+  apiKey?: string
+  clearApiKey?: boolean
+  model?: string
+  cliExecutable?: string
+  cliModel?: string
+}
+export interface LlmReviewerSummary extends Omit<LlmReviewerInput, 'apiKey' | 'clearApiKey'> { hasApiKey: boolean }
+export interface LlmReviewerImportInput { agentKind: 'codex' | 'claude'; providerId: string }
+export interface LlmReviewAttempt {
+  reviewerId: string
+  reviewerName: string
+  backend: LlmReviewerBackend
+  status: 'failed' | 'completed'
+  failure?: 'configuration' | 'authentication' | 'rate-limit' | 'http' | 'timeout' | 'network' | 'invalid-response' | 'unavailable'
+}
+export interface LlmReviewRouting {
+  reviewerId?: string
+  reviewerName?: string
+  attempts?: LlmReviewAttempt[]
+}
 export type ApprovalMode = 'manual' | 'agent-review' | 'rules-auto' | 'unattended'
 export type LlmReviewVerdict = 'allow' | 'manual' | 'deny' | 'uncertain'
 export type LlmReviewStatus = 'pending' | 'completed' | 'failed'
@@ -148,6 +177,10 @@ export interface LlmRuleAuditState {
 }
 
 export interface LlmReviewSettingsInput {
+  reviewers?: LlmReviewerInput[]
+  overallTimeoutSeconds?: number
+  protocol?: LlmApiProtocol
+  anthropicAuth?: 'api-key' | 'bearer'
   backend?: LlmReviewerBackend
   cliExecutable?: string
   cliModel?: string
@@ -169,7 +202,7 @@ export interface LlmReviewSettingsInput {
   clearProxyPassword?: boolean
 }
 
-export interface LlmReviewConclusion {
+export interface LlmReviewConclusion extends LlmReviewRouting {
   verdict: LlmReviewVerdict
   riskScore: number
   summary: string
@@ -188,7 +221,7 @@ export interface LlmRuleAuditFinding {
   recommendation: string
 }
 
-export interface LlmRuleAuditResult {
+export interface LlmRuleAuditResult extends LlmReviewRouting {
   reviewedAt: number
   model: string
   ruleCount: number
@@ -197,6 +230,10 @@ export interface LlmRuleAuditResult {
 }
 
 export interface LlmReviewSettingsSummary {
+  reviewers?: LlmReviewerSummary[]
+  overallTimeoutSeconds?: number
+  protocol?: LlmApiProtocol
+  anthropicAuth?: 'api-key' | 'bearer'
   backend?: LlmReviewerBackend
   cliExecutable?: string
   cliModel?: string
@@ -230,6 +267,13 @@ export interface CCSwitchProviderSummary {
 }
 export type ApprovalRisk = 'read' | 'write' | 'delete' | 'unknown'
 export type ApprovalSource = 'terminal' | 'claude-hook' | 'codex-hook'
+/** Safe input diagnostics: never include command text, paths or arbitrary messages. */
+export interface ApprovalInputIssue {
+  code: 'declared-truncation' | 'command-too-long' | 'invalid-command' | 'invalid-command-arguments' | 'invalid-path' | 'path-too-long' | 'too-many-paths' | 'invalid-input'
+  field: 'command' | 'cmd' | 'script' | 'file_path' | 'notebook_path' | 'path' | 'file_paths' | 'paths' | 'toolInput' | 'filePath' | 'targetPaths'
+  actualLength?: number
+  limit?: number
+}
 export type DangerRuleScope = 'safe-rule' | 'bulk-approval' | 'full-auto'
 
 export interface DangerRuleSummary {
@@ -266,6 +310,7 @@ export interface ApprovalRequest {
   command?: string
   inputSummary?: string
   inputTruncated?: boolean
+  inputIssue?: ApprovalInputIssue
   reason: string
   agentReason?: string
   filePath?: string
@@ -294,6 +339,7 @@ export interface BulkApprovalResult {
 }
 
 export interface NativeSessionSummary {
+  managedSessionId?: string
   id: string
   title: string
   managerDisplayName?: string
@@ -535,11 +581,14 @@ export const IPC_CHANNELS = {
   testDangerCommand: 'agent-manager:test-danger-command',
   getLlmReviewSettings: 'agent-manager:get-llm-review-settings',
   listLlmReviewModels: 'agent-manager:list-llm-review-models',
+  testLlmReviewer: 'agent-manager:test-llm-reviewer',
+  importLlmReviewer: 'agent-manager:import-llm-reviewer',
   updateLlmReviewSettings: 'agent-manager:update-llm-review-settings',
   reviewApprovalRules: 'agent-manager:review-approval-rules',
   chooseWorkspace: 'agent-manager:choose-workspace',
   chooseExecutable: 'agent-manager:choose-executable',
   discoverSessions: 'agent-manager:discover-sessions',
+  discoverRecentCodexSessions: 'agent-manager:discover-recent-codex-sessions',
   detectAgentEnvironment: 'agent-manager:detect-agent-environment',
   installNodeAndNpm: 'agent-manager:install-node-and-npm',
   installAgent: 'agent-manager:install-agent',
@@ -606,12 +655,15 @@ export interface AgentManagerApi {
   removeDangerRule(ruleId: string): Promise<void>
   testDangerCommand(command: string): Promise<DangerRuleTestResult>
   getLlmReviewSettings(): Promise<LlmReviewSettingsSummary>
-  listLlmReviewModels(settings: LlmReviewSettingsInput): Promise<string[]>
+  listLlmReviewModels(settings: LlmReviewSettingsInput, reviewerId?: string): Promise<string[]>
+  testLlmReviewer(settings: LlmReviewSettingsInput, reviewerId?: string): Promise<{ model: string }>
+  importLlmReviewer(input: LlmReviewerImportInput): Promise<LlmReviewSettingsSummary>
   updateLlmReviewSettings(settings: LlmReviewSettingsInput): Promise<LlmReviewSettingsSummary>
   reviewApprovalRules(): Promise<LlmRuleAuditState>
   chooseWorkspace(): Promise<string | undefined>
   chooseExecutable?(agentKind: AgentKind): Promise<string | undefined>
   discoverSessions(agentKind: AgentKind, workspace: string): Promise<NativeSessionSummary[]>
+  discoverRecentCodexSessions(): Promise<NativeSessionSummary[]>
   detectAgentEnvironment?(agentKind: AgentKind, executable: string): Promise<AgentEnvironmentSummary>
   installNodeAndNpm?(): Promise<void>
   installAgent?(agentKind: AgentKind, registry?: NpmRegistryChoice, operation?: 'install' | 'update'): Promise<void>

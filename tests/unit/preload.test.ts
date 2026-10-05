@@ -39,7 +39,7 @@ describe('preload agentManager contract', () => {
   it('exposes only the narrow manager API including native session discovery', async () => {
     await import('../../electron/preload')
     const api = electron.exposeInMainWorld.mock.calls.at(-1)?.[1] as Record<string, (...args: unknown[]) => unknown>
-    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'createContinuation', 'detachSession', 'detectAgentEnvironment', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listLlmReviewModels', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'onAttentionSound', 'openDeepSeekWeb', 'openExternalWeb', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'saveUnattendedSettings', 'setActiveSession', 'setApprovalMode', 'setDangerRuleEnabled', 'setFullAutoMode', 'setUnattendedMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testAttentionSound', 'testDangerCommand', 'tryRecoveryOnce', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
+    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'createContinuation', 'detachSession', 'detectAgentEnvironment', 'discoverRecentCodexSessions', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'importLlmReviewer', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listLlmReviewModels', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'onAttentionSound', 'openDeepSeekWeb', 'openExternalWeb', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'saveUnattendedSettings', 'setActiveSession', 'setApprovalMode', 'setDangerRuleEnabled', 'setFullAutoMode', 'setUnattendedMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testAttentionSound', 'testDangerCommand', 'testLlmReviewer', 'tryRecoveryOnce', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
     expect(api.platform).toBe(process.platform)
     await api.setActiveSession?.(null)
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.setActiveSession, null)
@@ -74,6 +74,14 @@ describe('preload agentManager contract', () => {
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.testDangerCommand, 'rm -rf fixtures')
     await api.getLlmReviewSettings?.()
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.getLlmReviewSettings)
+    await api.discoverRecentCodexSessions?.()
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.discoverRecentCodexSessions)
+    await api.listLlmReviewModels?.({ enabled: false }, 'reviewer-b')
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.listLlmReviewModels, { enabled: false }, 'reviewer-b')
+    await api.testLlmReviewer?.({ enabled: false }, 'reviewer-b')
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.testLlmReviewer, { enabled: false }, 'reviewer-b')
+    await api.importLlmReviewer?.({ agentKind: 'codex', providerId: 'fixture-provider' })
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.importLlmReviewer, { agentKind: 'codex', providerId: 'fixture-provider' })
     await api.reviewApprovalRules?.()
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.reviewApprovalRules)
   })

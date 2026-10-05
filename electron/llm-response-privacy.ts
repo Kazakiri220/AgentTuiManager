@@ -21,6 +21,13 @@ function credentialVariants(settings: ReviewCredentials): string[] {
   return [...variants]
 }
 
+/** Sanitizes nonsecret labels too: a remote provider can put a credential in its model/name. */
+export function redactLlmCredentialText(value: string, settings: ReviewCredentials): string {
+  let result = value
+  for (const secret of credentialVariants(settings).sort((a, b) => b.length - a.length)) result = result.split(secret).join('[受保护凭据]')
+  return result
+}
+
 /** Call after JSON.parse, before publishing any API review/audit fields. */
 export function assertLlmResponseHasNoCredentials(value: unknown, settings: ReviewCredentials): void {
   const secrets = credentialVariants(settings)

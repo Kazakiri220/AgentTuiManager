@@ -8,6 +8,7 @@ import { unlink } from 'node:fs/promises'
 import { describe, expect, it } from 'vitest'
 
 import { assessApprovalRequest } from '../../electron/approval-policy'
+import { MAX_APPROVAL_COMMAND_LENGTH, normalizeApprovalInputIssue } from '../../src/shared/approval-input'
 
 type Hook = 'codex' | 'claude'
 type Response = 'deny-reason' | 'wrong-id' | 'disconnect' | 'oversized' | 'output-before-allow' | 'fragmented-allow'
@@ -102,9 +103,9 @@ describe.each(['codex', 'claude'] as const)('%s hook input and response integrit
 
   it.each([
     ['invalid argv', ['pwsh', '-Command', null, 'Get-Location']],
-    ['oversized command', 'x'.repeat(16_385)],
+    ['oversized command', 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH + 1)],
     ['NUL command', 'echo \0bad'],
-    ['oversized argv', ['python', '-c', 'x'.repeat(16_384)]],
+    ['oversized argv', ['python', '-c', 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH)]],
   ])('marks %s incomplete while preserving the original input', async (_name, command) => {
     const { received } = await exchange(hook, { command })
     expect(received.command).toBeUndefined()
@@ -114,7 +115,32 @@ describe.each(['codex', 'claude'] as const)('%s hook input and response integrit
       command: received.command as string | undefined,
       risk: 'unknown', workspace: 'C:\\work', toolName: 'PowerShell',
       toolInput: received.toolInput, inputTruncated: received.inputTruncated as boolean,
+      inputIssue: normalizeApprovalInputIssue(received.inputIssue),
     }).status).toBe('incomplete')
+  })
+
+  it.each([17077, MAX_APPROVAL_COMMAND_LENGTH])('preserves an intact %i-character JSON write while bounding only its display summary', async length => {
+    const prefix = "Set-Content -LiteralPath '.\\research.json' -Value '{\"content\":\""
+    const suffix = "\"}' -Encoding utf8"
+    const command = prefix + 'x'.repeat(length - prefix.length - suffix.length) + suffix
+    const { received, stderr } = await exchange(hook, { command })
+    expect(received.command).toBe(command)
+    expect(received.toolInput).toEqual({ command })
+    expect(received.toolInputSummary).toBe(command.slice(0, 16384))
+    expect(received.inputTruncated).toBeUndefined()
+    expect(received.inputIssue).toBeUndefined()
+    expect(stderr).not.toContain('research.json')
+    expect(assessApprovalRequest({ command: received.command as string, risk: 'write', workspace: 'C:\\work', toolInput: received.toolInput }).status).toBe('ordinary')
+  })
+
+  it('distinguishes oversize complete input from upstream declared truncation without logging content', async () => {
+    const command = 'fixture-private-value' + 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH)
+    const oversized = await exchange(hook, { command })
+    expect(oversized.received.inputIssue).toEqual({ code: 'command-too-long', field: 'command', actualLength: command.length, limit: MAX_APPROVAL_COMMAND_LENGTH })
+    expect(oversized.stderr).not.toContain('fixture-private-value')
+    const declared = await exchange(hook, { command: 'echo ok', command_truncated: true })
+    expect(declared.received.inputIssue).toEqual({ code: 'declared-truncation', field: 'command' })
+    expect(declared.received.inputTruncated).toBe(true)
   })
 
   it('preserves valid multiline argv for assessment without flattening quoted code', async () => {

@@ -7,6 +7,7 @@ import { isAbsolute, join, resolve } from 'node:path'
 import * as pty from 'node-pty'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
+import { approvalInputIssueFields } from '../src/shared/approval-input'
 import { environmentForAgent } from './agent-environment'
 import { codexTerminalCompatibilityArgs } from './codex-terminal-compat'
 import { ensureMacPtySpawnHelper } from './macos-pty-helper'
@@ -311,6 +312,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         ...(command.targetPaths ? { targetPaths: command.targetPaths } : {}),
         ...(command.toolInputSummary ? { toolInputSummary: command.toolInputSummary } : {}),
         ...(command.inputTruncated ? { inputTruncated: true } : {}),
+        ...approvalInputIssueFields(command.inputIssue),
         ...(command.reason ? { reason: command.reason } : {}),
         ...(command.toolUseId ? { toolUseId: command.toolUseId } : {}),
         ...(command.agentId ? { agentId: command.agentId } : {}),

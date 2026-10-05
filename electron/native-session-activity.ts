@@ -1,9 +1,75 @@
 import { promises as fs } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { extname, isAbsolute, join, relative } from 'node:path'
 
 import type { AgentKind, SessionSummary } from '../src/shared/manager-api'
 import type { SessionActivity } from '../src/shared/session-state'
+
+export interface NativeActivityBinding { nativeSessionId: string; transcriptPath: string }
+/** Internal monitoring target; resume/recovery identity stays in nativeSessionId. */
+export interface NativeActivitySession extends SessionSummary {
+  activityGeneration?: number
+  activityNativeSessionId?: string
+  activityTranscriptPath?: string
+  activityBindingVersion?: number
+}
+export interface NativeActivityBindingPort {
+  validate(kind: 'codex' | 'claude', binding: NativeActivityBinding): Promise<NativeActivityBinding | undefined>
+}
+export interface NativeActivityRoots { codex: string; claude: string }
+function defaultRoots(): NativeActivityRoots {
+  return {
+    codex: join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'sessions'),
+    claude: join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects'),
+  }
+}
+
+/** The Hook is authenticated by the Host, but its path still needs confinement
+ * and parent-session metadata validation before any activity records are read. */
+export async function validateNativeActivityBinding(kind: 'codex' | 'claude', binding: NativeActivityBinding,
+  roots: NativeActivityRoots = defaultRoots()): Promise<NativeActivityBinding | undefined> {
+  if (!/^[a-zA-Z0-9-]{8,128}$/.test(binding.nativeSessionId)
+    || typeof binding.transcriptPath !== 'string' || binding.transcriptPath.length > 4096
+    || binding.transcriptPath.includes('\0') || !isAbsolute(binding.transcriptPath)
+    || extname(binding.transcriptPath).toLowerCase() !== '.jsonl') return undefined
+  try {
+    const root = await fs.realpath(roots[kind])
+    const path = await fs.realpath(binding.transcriptPath)
+    const inside = relative(root, path)
+    if (!inside || isAbsolute(inside) || inside.split(/[\\/]/).some(part => part === '..' || part.toLowerCase() === 'subagents')
+      || extname(path).toLowerCase() !== '.jsonl') return undefined
+    const file = await fs.open(path, 'r')
+    try {
+      if (!(await file.stat()).isFile()) return undefined
+      const buffer = Buffer.alloc(64 * 1024)
+      const { bytesRead } = await file.read(buffer, 0, buffer.length, 0)
+      const text = buffer.subarray(0, bytesRead).toString('utf8')
+      const lines = text.slice(0, text.lastIndexOf('\n') + 1).split('\n').slice(0, 32)
+      for (const line of lines) {
+        let record: Record<string, unknown> | undefined
+        try { record = object(JSON.parse(line)) } catch { continue }
+        if (!record) continue
+        if (kind === 'codex') {
+          if (record.type !== 'session_meta') continue
+          const meta = object(record.payload)
+          const source = object(meta?.source)
+          if (meta?.id !== binding.nativeSessionId || meta.parent_thread_id || meta.source === 'subagent'
+            || source && Object.prototype.hasOwnProperty.call(source, 'subagent')) return undefined
+          return { nativeSessionId: binding.nativeSessionId, transcriptPath: path }
+        }
+        if (typeof record.sessionId === 'string') {
+          if (record.sessionId !== binding.nativeSessionId || record.isSidechain === true || record.agentId) return undefined
+          return { nativeSessionId: binding.nativeSessionId, transcriptPath: path }
+        }
+      }
+      return undefined
+    } finally { await file.close() }
+  } catch { return undefined }
+}
+
+function activityId(session: NativeActivitySession): string | undefined {
+  return session.activityNativeSessionId ?? session.nativeSessionId
+}
 
 export interface NativeUserQuestion {
   id: string
@@ -210,12 +276,48 @@ export function parseNativeActivity(kind: AgentKind, value: unknown, sessionId: 
 }
 
 interface FileCursor {
-  path: string; size: number; mtime: number; questions: Map<string, PendingQuestion>
-  /** Keep resolved IDs for this run even after their answers leave the tail. */
+  path: string; size: number; mtime: number; identity?: string; offset: number; questions: Map<string, PendingQuestion>
+  partial: { chunks: Buffer[]; length: number; discarding: boolean }
+  pendingRead?: {
+    previousQuestions: string; latest?: NativeActivityEvent; questionTimestamp: number
+    userMessage?: NativeActivityEvent['userMessage']; assistantMessage?: NativeActivityEvent['assistantMessage']
+  }
+  /** Keep resolved IDs for this run even when a call is replayed later. */
   settledQuestionIds: Set<string>
 }
 
-/** Read-only, bounded tail polling. Never sends input or changes approval/recovery. */
+/** Complete JSONL records with bounded memory. Keep a partial final line for the
+ * next poll, and never skip newly appended records because later output is large. */
+async function* nativeLines(cursor: FileCursor, end: number): AsyncIterable<string> {
+  const file = await fs.open(cursor.path, 'r')
+  const buffer = Buffer.allocUnsafe(64 * 1024)
+  const partial = cursor.partial
+  const append = (part: Buffer): void => {
+    if (partial.discarding || !part.length) return
+    if (partial.length + part.length > 2 * 1024 * 1024) {
+      partial.chunks = []; partial.length = 0; partial.discarding = true
+      return
+    }
+    partial.chunks.push(Buffer.from(part)); partial.length += part.length
+  }
+  try {
+    while (cursor.offset < end) {
+      const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, end - cursor.offset), cursor.offset)
+      if (!bytesRead) return
+      let segment = 0
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (buffer[index] !== 0x0a) continue
+        append(buffer.subarray(segment, index))
+        if (!partial.discarding) yield Buffer.concat(partial.chunks, partial.length).toString('utf8')
+        partial.chunks = []; partial.length = 0; partial.discarding = false; segment = index + 1
+      }
+      append(buffer.subarray(segment, bytesRead))
+      cursor.offset += bytesRead
+    }
+  } finally { await file.close() }
+}
+
+/** Read-only incremental polling. Never sends input or changes approval/recovery. */
 export class NativeSessionActivityMonitor {
   private readonly files = new Map<string, FileCursor>()
   private readonly missingUntil = new Map<string, number>()
@@ -223,12 +325,9 @@ export class NativeSessionActivityMonitor {
   private stopped = false
 
   constructor(
-    private readonly sessions: () => SessionSummary[],
-    private readonly onActivity: (session: SessionSummary, event: NativeActivityEvent) => void,
-    private readonly roots = {
-      codex: join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'sessions'),
-      claude: join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'projects'),
-    },
+    private readonly sessions: () => NativeActivitySession[],
+    private readonly onActivity: (session: NativeActivitySession, event: NativeActivityEvent) => void,
+    private readonly roots: NativeActivityRoots = defaultRoots(),
   ) {}
 
   start(): void {
@@ -250,7 +349,7 @@ export class NativeSessionActivityMonitor {
   }
 
   async poll(): Promise<void> {
-    const sessions = this.sessions().filter((session) => session.nativeSessionId
+    const sessions = this.sessions().filter((session) => activityId(session)
       && (session.agentKind === 'codex' || session.agentKind === 'claude')
       && (!['completed', 'stopped', 'failed'].includes(session.status) || session.unattended?.enabled))
     const activeKeys = new Set(sessions.map((session) => this.key(session)))
@@ -258,57 +357,67 @@ export class NativeSessionActivityMonitor {
     for (const key of this.missingUntil.keys()) if (!activeKeys.has(key)) this.missingUntil.delete(key)
     for (const session of sessions) {
       const key = this.key(session)
+      const nativeId = activityId(session)!
+      const kind = session.agentKind as 'codex' | 'claude'
       try {
         let cursor = this.files.get(key)
         if (!cursor) {
           if ((this.missingUntil.get(key) ?? 0) > Date.now()) continue
-          const path = await this.findFile(session.agentKind as 'codex' | 'claude', session.nativeSessionId!)
+          const bound = session.activityTranscriptPath ? await validateNativeActivityBinding(kind,
+            { nativeSessionId: nativeId, transcriptPath: session.activityTranscriptPath }, this.roots) : undefined
+          const path = bound?.transcriptPath ?? await this.findFile(kind, nativeId)
           if (!path) { this.missingUntil.set(key, Date.now() + 30_000); continue }
-          cursor = { path, size: -1, mtime: -1, questions: new Map(), settledQuestionIds: new Set() }
+          cursor = { path, size: -1, mtime: -1, offset: 0, partial: { chunks: [], length: 0, discarding: false },
+            questions: new Map(), settledQuestionIds: new Set() }
           this.files.set(key, cursor)
           this.missingUntil.delete(key)
         }
         const stat = await fs.stat(cursor.path)
-        if (stat.size === cursor.size && stat.mtimeMs === cursor.mtime) continue
-        const previousQuestions = [...cursor.questions.keys()].sort().join('\n')
-        if (stat.size < cursor.size) {
+        const identity = [stat.dev, stat.ino, stat.birthtimeMs].join(':')
+        const replaced = cursor.identity !== undefined && cursor.identity !== identity
+        if (!replaced && stat.size === cursor.size && stat.mtimeMs === cursor.mtime && cursor.offset >= stat.size) continue
+        const previousQuestions = cursor.pendingRead?.previousQuestions ?? [...cursor.questions.keys()].sort().join('\n')
+        const truncated = stat.size < cursor.size
+        const rewritten = stat.size === cursor.size && stat.mtimeMs !== cursor.mtime
+        if (replaced || truncated || rewritten) {
+          if (!await validateNativeActivityBinding(kind, { nativeSessionId: nativeId, transcriptPath: cursor.path }, this.roots)) {
+            throw new Error('Native activity metadata changed')
+          }
           cursor.questions.clear()
-          cursor.settledQuestionIds.clear()
+          if (replaced || truncated) cursor.settledQuestionIds.clear()
+          cursor.offset = 0
+          cursor.partial = { chunks: [], length: 0, discarding: false }
+          cursor.pendingRead = undefined
         }
-        const file = await fs.open(cursor.path, 'r')
-        let text: string
-        try {
-          const offset = Math.max(0, stat.size - 512 * 1024)
-          const buffer = Buffer.alloc(stat.size - offset)
-          const { bytesRead } = await file.read(buffer, 0, buffer.length, offset)
-          text = buffer.subarray(0, bytesRead).toString('utf8')
-          if (offset > 0) text = text.slice(text.indexOf('\n') + 1)
-        } finally { await file.close() }
-        let latest: NativeActivityEvent | undefined
-        let userMessage: NativeActivityEvent['userMessage']
-        let assistantMessage: NativeActivityEvent['assistantMessage']
-        let questionTimestamp = 0
-        // Ignore the last partial JSONL record; revisit it after the next append.
-        for (const line of text.split('\n').slice(0, -1)) {
+        cursor.identity = identity
+        const read = cursor.pendingRead ??= { previousQuestions, questionTimestamp: 0 }
+        // Bound work per session/tick. Carry partial records and the aggregate
+        // forward; publish only once caught up so already-answered calls in a
+        // restored transcript never appear briefly as actionable questions.
+        const end = Math.min(stat.size, cursor.offset + 8 * 1024 * 1024)
+        for await (const line of nativeLines(cursor, end)) {
           let value: unknown
           try { value = JSON.parse(line) } catch { continue }
-          const native = nativeRecord(value, session.nativeSessionId!)
+          const native = nativeRecord(value, nativeId)
           if (native && native.timestamp >= (session.activitySince ?? 0)) {
             const previousSize = cursor.questions.size
             updateQuestions(session.agentKind, native.record, native.timestamp, cursor.questions, cursor.settledQuestionIds)
-            if (previousSize !== cursor.questions.size) questionTimestamp = Math.max(questionTimestamp, native.timestamp)
+            if (previousSize !== cursor.questions.size) read.questionTimestamp = Math.max(read.questionTimestamp, native.timestamp)
           }
-          const event = parseNativeActivity(session.agentKind, value, session.nativeSessionId!)
+          const event = parseNativeActivity(session.agentKind, value, nativeId)
           if (event?.userMessage && event.timestamp >= (session.activitySince ?? 0)
-            && (!userMessage || event.timestamp >= userMessage.timestamp)) userMessage = event.userMessage
+            && (!read.userMessage || event.timestamp >= read.userMessage.timestamp)) read.userMessage = event.userMessage
           if (event?.assistantMessage && event.timestamp >= (session.activitySince ?? 0)
-            && (!assistantMessage || event.timestamp >= assistantMessage.timestamp)) assistantMessage = event.assistantMessage
+            && (!read.assistantMessage || event.timestamp >= read.assistantMessage.timestamp)) read.assistantMessage = event.assistantMessage
           if (event && event.timestamp >= (session.activitySince ?? 0)
             && event.timestamp >= (session.activityUpdatedAt ?? 0)
-            && (!latest || event.timestamp >= latest.timestamp)) latest = event
+            && (!read.latest || event.timestamp >= read.latest.timestamp)) read.latest = event
         }
         cursor.size = stat.size
         cursor.mtime = stat.mtimeMs
+        if (cursor.offset < stat.size) continue
+        cursor.pendingRead = undefined
+        const { latest, userMessage, assistantMessage, questionTimestamp } = read
         const questions = [...cursor.questions.values()].map((call) => ({ ...call.question }))
           .sort((left, right) => left.timestamp - right.timestamp || left.id.localeCompare(right.id))
         const questionsChanged = previousQuestions !== [...cursor.questions.keys()].sort().join('\n')
@@ -339,23 +448,28 @@ export class NativeSessionActivityMonitor {
     }
   }
 
-  private key(session: SessionSummary): string {
-    return [session.sessionId, session.nativeSessionId, session.activitySince ?? 0].join(':')
+  private key(session: NativeActivitySession): string {
+    return [session.sessionId, activityId(session), session.activityTranscriptPath ?? '', session.activityBindingVersion ?? 0,
+      session.activityGeneration ?? 0, session.activitySince ?? 0].join(':')
   }
 
   private async findFile(kind: 'codex' | 'claude', id: string): Promise<string | undefined> {
     if (!/^[a-zA-Z0-9-]{8,128}$/.test(id)) return undefined
     const directories = [this.roots[kind]]
-    let visited = 0
-    while (directories.length && visited < 20_000) {
+    while (directories.length) {
       const directory = directories.pop()!
       let entries
       try { entries = await fs.readdir(directory, { withFileTypes: true }) } catch { continue }
       for (const entry of entries) {
-        if (++visited > 20_000) break
         if (entry.isDirectory() && entry.name !== 'subagents') directories.push(join(directory, entry.name))
         else if (entry.isFile() && (kind === 'claude' ? entry.name === id + '.jsonl'
-          : entry.name.startsWith('rollout-') && entry.name.endsWith('-' + id + '.jsonl'))) return join(directory, entry.name)
+          : entry.name.startsWith('rollout-') && entry.name.endsWith('.jsonl') && entry.name.includes(id))) {
+          // Some CLI resumes append another UUID to the filename. The actual
+          // session identity is authoritative only in its parent metadata.
+          const binding = await validateNativeActivityBinding(kind,
+            { nativeSessionId: id, transcriptPath: join(directory, entry.name) }, this.roots)
+          if (binding) return binding.transcriptPath
+        }
       }
     }
     return undefined

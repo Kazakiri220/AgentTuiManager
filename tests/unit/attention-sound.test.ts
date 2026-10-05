@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { AttentionSound } from '../../electron/attention-sound'
+import { isAttentionSessionActive } from '../../electron/attention-focus'
 import { TerminalQuestionSignal } from '../../electron/terminal-question-signal'
 import type { ApprovalMode, ApprovalRequest, SessionSummary } from '../../src/shared/manager-api'
 
@@ -9,10 +10,14 @@ function fixture(mode: ApprovalMode = 'manual') {
     activity: 'running', approvalMode: mode, recoveryAttempts: 0, userStopRequested: false,
   }]))
   const requests: ApprovalRequest[] = []
-  const focus = { active: 'one' as string | undefined, foreground: true }
+  const focus = { active: 'one' as string | undefined, foreground: true, visible: true, minimized: false, destroyed: false }
   const play = vi.fn()
+  const onDecision = vi.fn()
   const sounds = new AttentionSound({ session: id => sessions.get(id), approvals: id => requests.filter(item => item.sessionId === id),
-    isActive: id => focus.foreground && focus.active === id, play })
+    isActive: id => isAttentionSessionActive(id, focus.active, {
+      isFocused: () => focus.foreground, isVisible: () => focus.visible,
+      isMinimized: () => focus.minimized, isDestroyed: () => focus.destroyed,
+    }), play, onDecision })
   sounds.seed([...sessions.values()])
   const approval = (id = 'two', requestId = 'request-1') => {
     const request: ApprovalRequest = { sessionId: id, requestId, displayName: id, workspace: 'C:/project', agentKind: 'codex',
@@ -21,13 +26,84 @@ function fixture(mode: ApprovalMode = 'manual') {
     sounds.sessionChanged(id)
     return request
   }
-  return { sounds, sessions, requests, focus, play, approval }
+  return { sounds, sessions, requests, focus, play, approval, onDecision }
 }
 beforeEach(() => { vi.useFakeTimers(); vi.setSystemTime(100000) })
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 const settle = () => vi.advanceTimersByTimeAsync(1600)
 
 describe('inactive Agent attention sounds', () => {
+  it.each(['approval', 'native-question', 'terminal-question', 'completion'] as const)(
+    'only suppresses %s when the owning Agent is selected and the window is foreground', async kind => {
+      for (const selected of [false, true]) for (const foreground of [false, true])
+      for (const visible of [false, true]) for (const minimized of [false, true]) {
+        const f = fixture()
+        Object.assign(f.focus, { active: selected ? 'two' : 'one', foreground, visible, minimized })
+        if (kind === 'approval') f.approval()
+        else if (kind === 'native-question') f.sounds.observeQuestions('two', [{ id: 'question', timestamp: Date.now() }])
+        else if (kind === 'terminal-question') f.sounds.terminalQuestion('two', 'menu', () => true)
+        else {
+          f.sessions.get('two')!.activity = 'completed'
+          f.sessions.get('two')!.activityUpdatedAt = Date.now()
+          f.sounds.sessionChanged('two')
+        }
+        await settle()
+        expect(f.play).toHaveBeenCalledTimes(selected && foreground && visible && !minimized ? 0 : 1)
+        f.sounds.dispose()
+      }
+    },
+  )
+  it('treats missing, destroyed and inaccessible windows as not being viewed', () => {
+    expect(isAttentionSessionActive('one', 'one', undefined)).toBe(false)
+    const window = { isDestroyed: () => true, isVisible: () => true, isMinimized: () => false, isFocused: () => true }
+    expect(isAttentionSessionActive('one', 'one', window)).toBe(false)
+    window.isDestroyed = () => { throw new Error('Window closed') }
+    expect(isAttentionSessionActive('one', 'one', window)).toBe(false)
+  })
+  it('reports safe decisions once without including question or approval content', async () => {
+    const f = fixture()
+    f.approval('one', 'private-request-id')
+    f.sounds.sessionChanged('one')
+    f.sounds.observeQuestions('two', [{ id: 'private-question-id', timestamp: Date.now() }])
+    f.sounds.observeQuestions('two', [{ id: 'private-question-id', timestamp: Date.now() }])
+    await settle()
+    f.approval('two', 'cancelled'); f.requests.length = 0
+    await settle()
+    expect(f.onDecision.mock.calls.map(([decision]) => decision)).toEqual([
+      { sessionId: 'one', kind: 'approval', outcome: 'suppressed-active' },
+      { sessionId: 'two', kind: 'question', outcome: 'queued' },
+      { sessionId: 'two', kind: 'question', outcome: 'played' },
+      { sessionId: 'two', kind: 'approval', outcome: 'queued' },
+      { sessionId: 'two', kind: 'approval', outcome: 'invalidated' },
+    ])
+    f.onDecision.mockImplementation(() => { throw new Error('diagnostics unavailable') })
+    f.approval('two', 'another'); await settle()
+    expect(f.play).toHaveBeenCalledTimes(2)
+  })
+  it('notifies an unanswered question from a restored live run even if it predates window startup', async () => {
+    const f = fixture()
+    f.sessions.get('two')!.activitySince = Date.now() - 60_000
+    f.sounds.sessionChanged('two')
+    f.sounds.observeQuestions('two', [{ id: 'still-waiting', timestamp: Date.now() - 30_000 }])
+    await settle(); expect(f.play).toHaveBeenCalledOnce()
+    f.sounds.observeQuestions('two', [{ id: 'previous-run', timestamp: Date.now() - 120_000 }])
+    await settle(); expect(f.play).toHaveBeenCalledOnce()
+  })
+  it.each([false, true])('requeues a split redraw only if its earlier ticket was never heard (played: %s)', async played => {
+    const f = fixture(); const signal = new TerminalQuestionSignal()
+    const menu = 'Question 1/1\r\nWhich target?\r\n1. Local\r\nEnter to select'
+    const observe = (text: string): void => {
+      const token = signal.observe(text)
+      if (token) f.sounds.terminalQuestion('two', token, () => signal.current === token)
+    }
+    observe(menu)
+    if (played) await settle()
+    observe('\x1b[2J')
+    await settle()
+    observe(menu)
+    await settle()
+    expect(f.play).toHaveBeenCalledOnce()
+  })
   it('sounds for another Agent while Manager is focused, but not the active Agent', async () => {
     const f = fixture()
     f.approval('one', 'active'); await settle(); expect(f.play).not.toHaveBeenCalled()
@@ -169,6 +245,21 @@ describe('inactive Agent attention sounds', () => {
     f.sounds.terminalQuestion('two', 'menu-a', () => true)
     f.sounds.observeQuestions('two', [question]); await settle()
     expect(f.play).toHaveBeenCalledOnce()
+  })
+
+  it('sounds for a distinct next menu even while native capture keeps returning the previous question', async () => {
+    const f = fixture()
+    const first = { id: 'native-a', timestamp: Date.now() }
+    f.sounds.terminalQuestion('two', 'menu-a', () => true)
+    f.sounds.observeQuestions('two', [first]); await settle()
+    expect(f.play).toHaveBeenCalledOnce()
+    const second = { id: 'native-b', timestamp: Date.now() }
+    f.sounds.terminalQuestion('two', 'menu-b', () => true)
+    f.sounds.observeQuestions('two', [first]); await settle()
+    f.sounds.observeQuestions('two', [first]); await settle()
+    expect(f.play).toHaveBeenCalledTimes(2)
+    f.sounds.observeQuestions('two', [second]); await settle()
+    expect(f.play).toHaveBeenCalledTimes(2)
   })
 
   it('still acknowledges a next-round menu actually viewed before its native call arrives', async () => {

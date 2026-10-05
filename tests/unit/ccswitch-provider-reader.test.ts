@@ -18,6 +18,18 @@ function row(overrides: Partial<CCSwitchProviderRow> = {}): CCSwitchProviderRow 
 }
 
 describe('CCSwitch provider parsing', () => {
+  it.each(['https://user:fictional-inline-key@gateway.example/v1', 'https://gateway.example/v1?api_key=fictional-inline-key', 'https://gateway.example/v1#fictional-inline-key'])('rejects credential-bearing service URLs before publishing summaries', baseUrl => {
+    const provider = parseCCSwitchProvider(row({ settingsConfig: JSON.stringify({ env: { ANTHROPIC_AUTH_TOKEN: 'fictional-api-key', ANTHROPIC_BASE_URL: baseUrl } }), appType: 'claude' }))
+    expect(provider.baseUrl).toBeUndefined()
+    expect(provider.issue).toContain('Base URL')
+    expect(JSON.stringify(provider)).not.toContain('fictional-inline-key')
+  })
+  it('detects the selected wire protocol and hides credentials echoed in labels', () => {
+    const provider = parseCCSwitchProvider(row({ name: 'gateway-fictional-key', settingsConfig: JSON.stringify({ auth: { OPENAI_API_KEY: 'fictional-key' }, config: "model_provider='custom'\nmodel='fictional-key'\n[model_providers.custom]\nbase_url='https://gateway.example/v1'\nwire_api='chat'" }) }))
+    expect(provider.protocol).toBe('openai-chat')
+    expect(provider.model).toBeUndefined()
+    expect(provider.name).not.toContain('fictional-key')
+  })
   it('parses Codex auth and the selected TOML provider without assuming its id', () => {
     const provider = parseCCSwitchProvider(row({
       settingsConfig: JSON.stringify({
@@ -106,6 +118,9 @@ describe('CC Switch custom data directory', () => {
     expect(JSON.stringify(summaries)).not.toContain('correct-key')
     expect(await reader.import('codex','provider-25')).toMatchObject({apiKey:'correct-key',source:'ccswitch'})
     expect(await reader.list('claude')).toHaveLength(1)
+    expect(await reader.importForReview('claude', 'claude-1')).toMatchObject({ enabled: false, backend: 'api', protocol: 'anthropic-messages', anthropicAuth: 'bearer', apiKey: 'correct-key' })
+    expect(await reader.importForReview('codex', 'provider-25')).toMatchObject({ protocol: 'openai-responses', apiKey: 'correct-key' })
+    await expect(reader.importForReview('codex', "provider-25' OR 1=1 --")).rejects.toThrow('不完整')
     await writeFile(f.appPaths,JSON.stringify({app_config_dir_override:null}))
     expect(await reader.list('codex')).toHaveLength(1)
     expect(await reader.import('codex','provider-0')).toMatchObject({apiKey:'stale-key'})

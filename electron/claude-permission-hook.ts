@@ -1,8 +1,11 @@
 import { createHash, randomUUID } from 'node:crypto'
 import net from 'node:net'
 import { boundedHookText as boundedText, permissionHookFields } from './permission-hook-input'
+import type { ApprovalInputIssue } from '../src/shared/manager-api'
 
 interface HookInput {
+  session_id?: unknown
+  transcript_path?: unknown
   tool_name?: unknown
   tool_input?: unknown
   tool_use_id?: unknown
@@ -20,6 +23,7 @@ interface PermissionDetails {
   toolInputSummary?: string
   reason?: string
   inputTruncated?: boolean
+  inputIssue?: ApprovalInputIssue
 }
 
 function readInput(): Promise<string> {
@@ -107,6 +111,8 @@ async function main(): Promise<void> {
       type: 'permission-hook', token, requestId, hookSource: 'claude', toolName: input.tool_name,
       toolInput: input.tool_input,
       rawPayload: input,
+      ...(boundedText(input.session_id, 256) ? { nativeSessionId: boundedText(input.session_id, 256) } : {}),
+      ...(boundedText(input.transcript_path, 4_096) ? { transcriptPath: boundedText(input.transcript_path, 4_096) } : {}),
       ...(boundedText(input.tool_use_id, 256) ? { toolUseId: boundedText(input.tool_use_id, 256) } : {}),
       ...(boundedText(input.agent_id, 256) ? { agentId: boundedText(input.agent_id, 256) } : {}),
       ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),

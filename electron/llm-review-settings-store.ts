@@ -8,11 +8,19 @@ import type {
   LlmReviewSettingsInput,
   LlmReviewSettingsSummary,
   LlmRuleAuditResult,
+  LlmReviewerInput,
+  LlmReviewerSummary,
+  LlmApiProtocol,
 } from '../src/shared/manager-api'
 import type { SecureConfigurationCodec } from './agent-configuration-store'
 import { resolveLlmApiEndpoint } from './llm-model-catalog'
+import { redactLlmCredentialText } from './llm-response-privacy'
 
 export interface StoredLlmReviewSettings {
+  reviewers?: StoredLlmReviewer[]
+  overallTimeoutSeconds?: number
+  protocol?: LlmApiProtocol
+  anthropicAuth?: 'api-key' | 'bearer'
   enabled: boolean
   backend?: LlmReviewerBackend
   cliExecutable?: string
@@ -31,6 +39,45 @@ export interface StoredLlmReviewSettings {
   proxyUsername?: string
   proxyPassword?: string
   lastRuleAudit?: LlmRuleAuditResult
+}
+
+export interface StoredLlmReviewer extends Omit<LlmReviewerInput, 'clearApiKey'> {}
+export function validLlmProtocol(value: unknown): value is LlmApiProtocol {
+  return value === 'openai-chat' || value === 'openai-responses' || value === 'anthropic-messages'
+}
+
+function reviewerSummary(value: StoredLlmReviewer): LlmReviewerSummary {
+  const { apiKey: _apiKey, ...rest } = value
+  return { ...rest, hasApiKey: Boolean(value.apiKey) }
+}
+
+function legacyReviewer(settings: StoredLlmReviewSettings): StoredLlmReviewer {
+  return { id: 'legacy-reviewer', name: '默认审核器', enabled: true, backend: settings.backend ?? 'api',
+    protocol: settings.protocol ?? 'openai-chat', anthropicAuth: settings.anthropicAuth, baseUrl: settings.baseUrl, apiKey: settings.apiKey,
+    model: settings.model, cliExecutable: settings.cliExecutable, cliModel: settings.cliModel }
+}
+
+function resolveReviewer(input: LlmReviewerInput, previous?: StoredLlmReviewer): StoredLlmReviewer {
+  if (!input || typeof input !== 'object' || typeof input.id !== 'string' || !/^[a-zA-Z0-9_-]{1,100}$/.test(input.id)) throw new Error('审核器 ID 无效')
+  const name = optionalCliText(input.name, '审核器名称', 100)
+  if (!name || typeof input.enabled !== 'boolean' || !validBackend(input.backend)) throw new Error('审核器名称、启用状态或后端无效')
+  const protocol = input.protocol ?? 'openai-chat'
+  if (!validLlmProtocol(protocol)) throw new Error('审核 API 协议无效')
+  if (input.anthropicAuth !== undefined && input.anthropicAuth !== 'api-key' && input.anthropicAuth !== 'bearer') throw new Error('Anthropic 身份验证方式无效')
+  const baseUrl = optionalCliText(input.baseUrl, 'Base URL', 4096)
+  if (baseUrl) resolveLlmApiEndpoint(baseUrl, 'models')
+  const newKey = optionalCliText(input.apiKey, 'API Key', 16384)
+  if (baseUrl && !newKey && !input.clearApiKey && previous?.apiKey) {
+    let sameOrigin = false
+    try { sameOrigin = new URL(baseUrl).origin === new URL(previous.baseUrl ?? '').origin } catch { /* Reject unbound keys. */ }
+    if (!sameOrigin) throw new Error('服务地址已更换，请重新输入 API Key，避免将原密钥发送到其他服务')
+  }
+  return { id: input.id, name, enabled: input.enabled, backend: input.backend, protocol, anthropicAuth: input.anthropicAuth,
+    ...(baseUrl ? { baseUrl } : {}),
+    apiKey: input.clearApiKey ? undefined : newKey || previous?.apiKey,
+    model: optionalCliText(input.model, 'Model', 200),
+    cliExecutable: optionalCliText(input.cliExecutable, 'CLI 路径', 4096),
+    cliModel: optionalCliText(input.cliModel, 'CLI Model', 200) }
 }
 
 interface EncryptedEnvelope { version: 1; ciphertext: string }
@@ -76,7 +123,7 @@ function validRuleAudit(value: unknown): value is LlmRuleAuditResult {
 }
 
 function copyAudit(value: LlmRuleAuditResult | undefined): LlmRuleAuditResult | undefined {
-  return value ? { ...value, findings: value.findings.map((finding) => ({ ...finding })) } : undefined
+  return value ? { ...value, findings: value.findings.map((finding) => ({ ...finding })), ...(value.attempts ? { attempts: value.attempts.map(attempt => ({ ...attempt })) } : {}) } : undefined
 }
 
 function safeStoredBaseUrl(value: unknown): string | undefined {
@@ -92,7 +139,11 @@ function safeStoredBaseUrl(value: unknown): string | undefined {
 
 function summary(value: StoredLlmReviewSettings): LlmReviewSettingsSummary {
   const baseUrl = safeStoredBaseUrl(value.baseUrl)
-  return {
+  const result: LlmReviewSettingsSummary = {
+    reviewers: value.reviewers?.map(reviewerSummary) ?? [],
+    overallTimeoutSeconds: value.overallTimeoutSeconds ?? 120,
+    protocol: value.protocol ?? 'openai-chat',
+    anthropicAuth: value.anthropicAuth,
     enabled: value.enabled,
     backend: value.backend ?? 'api',
     ...(value.cliExecutable ? { cliExecutable: value.cliExecutable } : {}),
@@ -115,6 +166,18 @@ function summary(value: StoredLlmReviewSettings): LlmReviewSettingsSummary {
       ? { status: 'completed', completedAt: value.lastRuleAudit.reviewedAt }
       : { status: 'idle' },
   }
+  // Historical summaries and provider labels may themselves contain echoed credentials.
+  const redact = (item: unknown): unknown => {
+    if (typeof item === 'string') {
+      let text = redactLlmCredentialText(item, value)
+      for (const entry of value.reviewers ?? []) text = redactLlmCredentialText(text, { apiKey: entry.apiKey })
+      return text
+    }
+    if (Array.isArray(item)) return item.map(redact)
+    if (item && typeof item === 'object') return Object.fromEntries(Object.entries(item).map(([key, child]) => [key, redact(child)]))
+    return item
+  }
+  return redact(result) as LlmReviewSettingsSummary
 }
 
 export class LlmReviewSettingsStore {
@@ -153,6 +216,21 @@ export class LlmReviewSettingsStore {
             ...(typeof parsed.proxyPassword === 'string' ? { proxyPassword: parsed.proxyPassword } : {}),
             ...(validRuleAudit(parsed.lastRuleAudit) ? { lastRuleAudit: parsed.lastRuleAudit } : {}),
           }
+          settings.protocol = validLlmProtocol(parsed.protocol) ? parsed.protocol : 'openai-chat'
+          settings.anthropicAuth = parsed.anthropicAuth === 'bearer' ? 'bearer' : 'api-key'
+          settings.overallTimeoutSeconds = Number.isInteger(parsed.overallTimeoutSeconds) && Number(parsed.overallTimeoutSeconds) >= 5 && Number(parsed.overallTimeoutSeconds) <= 600 ? parsed.overallTimeoutSeconds : 120
+          if (Array.isArray(parsed.reviewers)) {
+            // Invalid individual entries cannot erase other encrypted credentials.
+            const ids = new Set<string>()
+            settings.reviewers = parsed.reviewers.slice(0, 30).flatMap(entry => {
+              try {
+                if (ids.has(entry.id)) return []
+                const clean = resolveReviewer({ ...entry, baseUrl: safeStoredBaseUrl(entry.baseUrl) })
+                ids.add(clean.id)
+                return [clean]
+              } catch { return [] }
+            })
+          } else settings.reviewers = [legacyReviewer(settings)]
         }
       }
     } catch {
@@ -164,18 +242,18 @@ export class LlmReviewSettingsStore {
   getSummary(): LlmReviewSettingsSummary { return summary(this.settings) }
 
   getRuntimeSettings(): StoredLlmReviewSettings {
-    return { ...this.settings, ...(this.settings.lastRuleAudit ? { lastRuleAudit: copyAudit(this.settings.lastRuleAudit) } : {}) }
+    return { ...this.settings, reviewers: this.settings.reviewers?.map(entry => ({ ...entry })), ...(this.settings.lastRuleAudit ? { lastRuleAudit: copyAudit(this.settings.lastRuleAudit) } : {}) }
   }
 
   /** Resolve a form draft in the main process without saving or exposing secrets. */
-  preview(input: LlmReviewSettingsInput): StoredLlmReviewSettings {
+  preview(input: LlmReviewSettingsInput, reviewerId?: string): StoredLlmReviewSettings {
     const baseUrl = input.baseUrl?.trim()
     if (baseUrl) resolveLlmApiEndpoint(baseUrl, 'models')
     const newKey = input.apiKey?.trim()
     const proxyHost = input.proxyHost || '127.0.0.1'
     const proxyPort = input.proxyPort ?? 7897
     const proxyUsername = input.proxyUsername || undefined
-    if (baseUrl && !input.clearApiKey && !newKey && this.settings.apiKey) {
+    if (!input.reviewers && baseUrl && !input.clearApiKey && !newKey && this.settings.apiKey) {
       let sameOrigin = false
       try { sameOrigin = new URL(baseUrl).origin === new URL(this.settings.baseUrl ?? '').origin } catch { /* Unbound key needs explicit input. */ }
       if (!sameOrigin) throw new Error('服务地址已更换，请重新输入 API Key，避免将原密钥发送到其他服务')
@@ -185,13 +263,29 @@ export class LlmReviewSettingsStore {
       && (proxyHost !== this.settings.proxyHost || proxyPort !== this.settings.proxyPort || proxyUsername !== this.settings.proxyUsername)) {
       throw new Error('代理地址或用户名已更换，请重新输入代理密码')
     }
-    return {
+    const resolved: StoredLlmReviewSettings = {
       ...this.getRuntimeSettings(), ...input, baseUrl,
       model: input.model?.trim(),
       apiKey: input.clearApiKey ? undefined : newKey || this.settings.apiKey,
       proxyHost, proxyPort, proxyUsername,
       proxyPassword: input.clearProxyPassword ? undefined : input.proxyPassword || this.settings.proxyPassword,
     }
+    if (input.reviewers !== undefined) {
+      if (!Array.isArray(input.reviewers) || input.reviewers.length > 30) throw new Error('审核器池最多 30 项')
+      const ids = new Set<string>()
+      resolved.reviewers = input.reviewers.map(entry => {
+        const next = resolveReviewer(entry, this.settings.reviewers?.find(saved => saved.id === entry.id))
+        if (ids.has(next.id)) throw new Error('审核器 ID 不能重复')
+        ids.add(next.id)
+        return next
+      })
+      const selected = reviewerId ? resolved.reviewers.find(entry => entry.id === reviewerId) : resolved.reviewers[0]
+      if (reviewerId && !selected) throw new Error('找不到所选审核器')
+      if (selected) Object.assign(resolved, { backend: selected.backend, protocol: selected.protocol, anthropicAuth: selected.anthropicAuth, baseUrl: selected.baseUrl,
+        apiKey: selected.apiKey, model: selected.model, cliExecutable: selected.cliExecutable, cliModel: selected.cliModel })
+      else Object.assign(resolved, { backend: 'api', baseUrl: undefined, apiKey: undefined, model: undefined })
+    } else resolved.reviewers = [{ ...legacyReviewer(resolved), id: this.settings.reviewers?.[0]?.id ?? 'legacy-reviewer', name: this.settings.reviewers?.[0]?.name ?? '默认审核器' }]
+    return resolved
   }
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
@@ -213,11 +307,18 @@ export class LlmReviewSettingsStore {
     const cliModel = optionalCliText(input.cliModel, 'CLI Model', 200)
     if (!Number.isInteger(input.retryCount) || input.retryCount < 0 || input.retryCount > 10) throw new Error('失败重试次数应为 0 到 10')
     if (!Number.isInteger(input.timeoutSeconds) || input.timeoutSeconds < 5 || input.timeoutSeconds > 600) throw new Error('单次请求超时应为 5 到 600 秒')
+    if (input.overallTimeoutSeconds !== undefined && (!Number.isInteger(input.overallTimeoutSeconds) || input.overallTimeoutSeconds < 5 || input.overallTimeoutSeconds > 600)) throw new Error('整体审核时限应为 5 到 600 秒')
+    if (input.protocol !== undefined && !validLlmProtocol(input.protocol)) throw new Error('审核 API 协议无效')
     if (!Number.isInteger(input.scheduledRuleAuditHours) || input.scheduledRuleAuditHours < 1 || input.scheduledRuleAuditHours > 720) throw new Error('定时审查周期应为 1 到 720 小时')
     const resolved = this.preview(input)
     const { apiKey, proxyPassword } = resolved
-    if (backend === 'api' && (input.enabled || input.scheduledRuleAuditEnabled) && (!input.baseUrl?.trim() || !apiKey?.trim() || !input.model?.trim())) {
+    if (!input.reviewers && backend === 'api' && (input.enabled || input.scheduledRuleAuditEnabled) && (!input.baseUrl?.trim() || !apiKey?.trim() || !input.model?.trim())) {
       throw new Error('启用 LLM 审查前，请填写 Base URL、API Key 和 Model')
+    }
+    if (input.reviewers && (input.enabled || input.scheduledRuleAuditEnabled)) {
+      const enabled = resolved.reviewers!.filter(entry => entry.enabled)
+      if (!enabled.length) throw new Error('请至少启用一个审核器')
+      if (enabled.some(entry => entry.backend === 'api' && (!entry.baseUrl || !entry.apiKey || !entry.model))) throw new Error('启用 API 审核器需要 Base URL、API Key 和 Model')
     }
     if (input.baseUrl) {
       let parsed: URL
@@ -228,6 +329,10 @@ export class LlmReviewSettingsStore {
       throw new Error('HTTP 代理主机或端口无效')
     }
     const next: StoredLlmReviewSettings = {
+      reviewers: resolved.reviewers,
+      overallTimeoutSeconds: input.overallTimeoutSeconds ?? this.settings.overallTimeoutSeconds ?? 120,
+      protocol: resolved.protocol ?? 'openai-chat',
+      anthropicAuth: resolved.anthropicAuth,
       enabled: input.enabled,
       backend,
       ...(cliExecutable ? { cliExecutable } : {}),
@@ -247,6 +352,7 @@ export class LlmReviewSettingsStore {
       ...(proxyPassword ? { proxyPassword } : {}),
       ...(this.settings.lastRuleAudit ? { lastRuleAudit: this.settings.lastRuleAudit } : {}),
     }
+    if (input.reviewers) Object.assign(next, { backend: resolved.backend, cliExecutable: resolved.cliExecutable, cliModel: resolved.cliModel })
     await this.persist(next)
     this.settings = next
     return this.getSummary()
@@ -257,6 +363,19 @@ export class LlmReviewSettingsStore {
       const next = { ...this.settings, lastRuleAudit: copyAudit(result) }
       await this.persist(next)
       this.settings = next
+    })
+  }
+
+  /** Main-process-only import. Credentials are committed encrypted before any summary leaves. */
+  async importReviewer(input: Omit<LlmReviewerInput, 'id'>): Promise<LlmReviewSettingsSummary> {
+    return this.enqueue(async () => {
+      if (!this.codec.isEncryptionAvailable()) throw new Error('当前系统无法使用安全存储，审核器未导入')
+      if ((this.settings.reviewers?.length ?? 0) >= 30) throw new Error('审核器池最多 30 项')
+      const entry = resolveReviewer({ ...input, id: randomUUID() })
+      const next = { ...this.settings, reviewers: [...(this.settings.reviewers ?? []), entry] }
+      await this.persist(next)
+      this.settings = next
+      return this.getSummary()
     })
   }
 

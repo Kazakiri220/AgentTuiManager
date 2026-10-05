@@ -22,7 +22,7 @@ app.on('browser-window-created', (_event, win) => {
         if(typeof api.listLlmReviewModels!=='function')throw Error('Missing model catalog IPC');
         if(typeof api.testAttentionSound!=='function')throw Error('Missing audio test IPC');
         let tones=0; let testContext;
-        window.AudioContext=function(){return testContext={state:'running',currentTime:0,destination:{},createOscillator(){return {frequency:{value:0},connect(){},disconnect(){},start(){tones++},stop(){}}},createGain(){return {gain:{setValueAtTime(){},linearRampToValueAtTime(){},exponentialRampToValueAtTime(){}},connect(){},disconnect(){}}}}};
+        window.AudioContext=function(){return testContext={state:'running',currentTime:0,destination:{},createOscillator(){return {frequency:{value:0},connect(){},disconnect(){},start(){tones++},stop(){setTimeout(()=>this.onended?.(),20)}}},createGain(){return {gain:{setValueAtTime(){},linearRampToValueAtTime(){},exponentialRampToValueAtTime(){}},connect(){},disconnect(){}}}}};
         await new Promise(resolve=>setTimeout(resolve,250));
         await api.testAttentionSound();
         await new Promise(resolve=>setTimeout(resolve,100));
@@ -31,6 +31,9 @@ app.on('browser-window-created', (_event, win) => {
         window.AudioContext=function(){throw Error('Mock output device unavailable')};
         await api.testAttentionSound();
         await new Promise(resolve=>setTimeout(resolve,100));
+        const audioAudit=await api.listAuditEntries();
+        if(!audioAudit.some(entry=>entry.action==='attention_audio_renderer_completed'))throw Error('Missing completed playback receipt');
+        if(!audioAudit.some(entry=>entry.action==='attention_audio_native_fallback'))throw Error('Missing fallback diagnostic');
         await api.setActiveSession(null);
         await api.setActiveSession('missing-session');
         const invalidActive=await api.setActiveSession({id:'bad'}).then(()=>false,()=>true);
@@ -39,7 +42,7 @@ app.on('browser-window-created', (_event, win) => {
         if(sessions.length)throw Error('Smoke environment is not isolated');
         const settings=await api.getLlmReviewSettings();
         if(settings.enabled)throw Error('Unexpected reviewer configured');
-        await api.updateLlmReviewSettings({...settings,enabled:false,backend:'codex-cli'});
+        await api.updateLlmReviewSettings({...settings,reviewers:undefined,enabled:false,backend:'codex-cli'});
         const updated=await api.getLlmReviewSettings();
         if(updated.backend!=='codex-cli')throw Error('Reviewer settings did not roundtrip');
         const invalid=await api.setApprovalMode('missing-session','invalid-mode').then(()=>false,()=>true);

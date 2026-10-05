@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { ApprovalPolicyEngine } from '../../electron/approval-policy'
+import { permissionHookFields } from '../../electron/permission-hook-input'
+import { MAX_APPROVAL_COMMAND_LENGTH } from '../../src/shared/approval-input'
+import * as approvalRouting from '../../electron/approval-routing'
+import { LlmReviewerPoolError } from '../../electron/llm-security-reviewer'
 import { SessionController, type LlmApprovalReviewPort, type SessionHostManagerPort } from '../../electron/session-controller'
 import type { HostHandle, HostRecord } from '../../electron/session-host-manager'
 import type { ApprovalMode, LlmReviewConclusion } from '../../src/shared/manager-api'
@@ -73,7 +77,7 @@ function fixture(kind: 'codex' | 'claude' = 'codex') {
     getSettings: vi.fn(() => ({ enabled: true, level: 'high' as const })),
     reviewApproval: vi.fn<LlmApprovalReviewPort['reviewApproval']>(async () => conclusion('allow')),
   }
-  const activity = { approved: vi.fn(), blocked: vi.fn(), rejected: vi.fn(), reviewStarted: vi.fn(), reviewed: vi.fn(), reviewFailed: vi.fn() }
+  const activity = { pending: vi.fn(), approved: vi.fn(), blocked: vi.fn(), rejected: vi.fn(), reviewStarted: vi.fn(), reviewed: vi.fn(), reviewFailed: vi.fn() }
   const controller = new SessionController(manager, undefined, undefined, policy, undefined, activity, undefined, undefined, undefined, reviewer)
   const start = (recoverable = false) => controller.startSession({ displayName: 'approval fixture', agentKind: kind, workspace, executable: kind, args: [], cols: 100, rows: 30, nativeSessionId: 'fixture-native-session',
     ...(recoverable ? { recovery: { executable: kind, args: ['resume', 'fixture-native-session'] } } : {}),
@@ -94,7 +98,7 @@ async function drain(): Promise<void> { await vi.advanceTimersByTimeAsync(0) }
 
 describe('controller approval modes acceptance', () => {
   beforeEach(() => vi.useFakeTimers())
-  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
+  afterEach(() => { vi.restoreAllMocks(); vi.clearAllTimers(); vi.useRealTimers() })
 
   const cases = (['codex', 'claude'] as const).flatMap(kind =>
     (['manual', 'agent-review', 'rules-auto', 'unattended'] as const).flatMap(mode =>
@@ -113,6 +117,7 @@ describe('controller approval modes acceptance', () => {
     expect(f.reviewer.reviewApproval).toHaveBeenCalledTimes(mode === 'agent-review' && risk === 'high-risk' ? 1 : 0)
     expect(f.controller.listPendingApprovals()).toHaveLength(expectedAction ? 0 : 1)
     expect(f.controller.listSessions()[0]?.approvalMode).toBe(mode)
+    expect(f.activity.pending).toHaveBeenCalledTimes(mode === 'manual' ? 1 : 0)
   })
 
   it('manual mode ignores both built-in and saved allow rules', async () => {
@@ -147,8 +152,9 @@ describe('controller approval modes acceptance', () => {
     expect(f.controller.listPendingApprovals()).toEqual([])
   })
 
-  it.each(['allow', 'deny', 'manual', 'uncertain'] as const)('applies a high-risk reviewer %s verdict exactly once', async verdict => {
-    const f = fixture()
+  it.each((['codex', 'claude'] as const).flatMap(kind =>
+    (['allow', 'deny', 'manual', 'uncertain'] as const).map(verdict => ({ kind, verdict }))))('applies a $kind high-risk reviewer $verdict verdict exactly once', async ({ kind, verdict }) => {
+    const f = fixture(kind)
     const session = await f.start()
     f.reviewer.reviewApproval.mockResolvedValue(conclusion(verdict))
     await f.setMode(session.sessionId, 'agent-review')
@@ -161,6 +167,12 @@ describe('controller approval modes acceptance', () => {
     expect(signal).toBeInstanceOf(AbortSignal)
     expect(f.handle.permissionResponses).toEqual([{ requestId: 'verdict', action: verdict === 'allow' ? 'allow' : 'deny' }])
     expect(f.controller.listPendingApprovals()).toEqual([])
+    const expectedVerdict = verdict === 'allow' ? 'allow' : 'deny'
+    expect(f.activity.reviewed).toHaveBeenCalledWith(
+      expect.objectContaining({ llmReview: expect.objectContaining({ verdict: expectedVerdict, requiresHumanApproval: false }) }),
+      expect.objectContaining({ verdict: expectedVerdict, requiresHumanApproval: false }),
+    )
+    expect(f.activity.pending).not.toHaveBeenCalled()
     if (verdict !== 'allow') expect(f.handle.permissionReasons[0]).toContain('实质更安全的新请求')
   })
 
@@ -175,6 +187,160 @@ describe('controller approval modes acceptance', () => {
     expect(f.handle.permissionReasons[0]).toContain('审核不可用不代表该命令已被判定危险')
     expect(f.controller.listPendingApprovals()).toEqual([])
     expect(f.activity.reviewFailed).toHaveBeenCalledOnce()
+    expect(f.activity.reviewFailed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReviewStatus: 'failed', llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false, riskScore: 0 }),
+    }), expect.stringContaining('fixture timeout'))
+    expect(f.handle.permissionReasons[0]).toContain('检查审核服务连接、模型和协议配置')
+    expect(f.activity.pending).not.toHaveBeenCalled()
+  })
+
+  it('normalizes an allow-with-human-condition to denial before storing or auditing it', async () => {
+    const f = fixture()
+    const legacy = { ...conclusion('allow'), requiresHumanApproval: true, reviewerId: 'legacy-reviewer', reviewerName: 'Legacy fixture' }
+    f.reviewer.reviewApproval.mockResolvedValue(legacy)
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('conditional-allow')
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'conditional-allow', action: 'deny' }])
+    expect(f.activity.reviewed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false }),
+    }), expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false, reviewerId: 'legacy-reviewer', reviewerName: 'Legacy fixture' }))
+    expect(legacy.requiresHumanApproval).toBe(true)
+    expect(f.activity.pending).not.toHaveBeenCalled()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('preserves safe failover attempts on the final service-unavailable denial', async () => {
+    const f = fixture()
+    const attempts = [
+      { reviewerId: 'reviewer-a', reviewerName: 'A', backend: 'api' as const, status: 'failed' as const, failure: 'timeout' as const },
+      { reviewerId: 'reviewer-b', reviewerName: 'B', backend: 'api' as const, status: 'failed' as const, failure: 'network' as const },
+    ]
+    f.reviewer.reviewApproval.mockRejectedValue(new LlmReviewerPoolError('all-failed', attempts))
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('all-reviewers-failed'); await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'all-reviewers-failed', action: 'deny' }])
+    expect(f.activity.reviewFailed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false, attempts }),
+    }), expect.stringContaining('全部 2 个审核服务均失败'))
+    expect(f.activity.pending).not.toHaveBeenCalled()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('rejects synchronous reviewer failures without leaving a pending request', async () => {
+    const f = fixture()
+    f.reviewer.reviewApproval.mockImplementation(() => { throw new Error('fixture synchronous service failure') })
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('sync-failure')
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'sync-failure', action: 'deny' }])
+    expect(f.activity.reviewFailed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false }),
+    }), expect.stringContaining('fixture synchronous service failure'))
+    expect(f.controller.listPendingApprovals()).toEqual([])
+    expect(f.activity.pending).not.toHaveBeenCalled()
+  })
+
+  it('rejects a result if its reviewer became disabled while it was running', async () => {
+    const f = fixture()
+    const pending = deferred<LlmReviewConclusion>()
+    f.reviewer.reviewApproval.mockReturnValue(pending.promise)
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('disabled-in-flight')
+    await drain()
+    f.reviewer.getSettings.mockReturnValue({ enabled: false, level: 'high' })
+    pending.resolve(conclusion('allow'))
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'disabled-in-flight', action: 'deny' }])
+    expect(f.activity.reviewed).not.toHaveBeenCalled()
+    expect(f.activity.reviewFailed).toHaveBeenCalledOnce()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('records denial when the final local assessment finds incomplete arguments after an allow', async () => {
+    const f = fixture()
+    vi.spyOn(f.policy, 'decide').mockReturnValue({ action: 'manual', risk: 'delete', reason: 'fixture risk' })
+    vi.spyOn(f.policy, 'assessApprovalRequest')
+      .mockReturnValueOnce({ status: 'high-risk', reason: 'fixture review required', reasonCode: 'fixture', matchedRules: [] })
+      .mockReturnValueOnce({ status: 'incomplete', reason: 'fixture missing full parameters', reasonCode: 'fixture-incomplete', matchedRules: [] })
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('incomplete-on-recheck')
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'incomplete-on-recheck', action: 'deny' }])
+    expect(f.activity.reviewed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false }),
+    }), expect.objectContaining({ verdict: 'deny', summary: 'fixture missing full parameters' }))
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it.each(['unexpected-route', 'assessment-error'] as const)('rejects automatic %s without invoking a human fallback', async scenario => {
+    const f = fixture()
+    if (scenario === 'unexpected-route') vi.spyOn(approvalRouting, 'routeApproval').mockReturnValueOnce('manual')
+    else {
+      vi.spyOn(f.policy, 'decide').mockReturnValue({ action: 'manual', risk: 'unknown', reason: 'fixture preliminary assessment' })
+      vi.spyOn(f.policy, 'assessApprovalRequest').mockImplementationOnce(() => { throw new Error('fixture rules unavailable') })
+    }
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'rules-auto')
+    f.emitApproval('unexpected', ordinaryCommand)
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'unexpected', action: 'deny' }])
+    expect(f.handle.permissionReasons[0]).toContain('不转人工')
+    expect(f.activity.pending).not.toHaveBeenCalled()
+    expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('keeps ordinary bulk approval from overriding an automatic review', async () => {
+    const f = fixture()
+    const pending = deferred<LlmReviewConclusion>()
+    f.reviewer.reviewApproval.mockReturnValue(pending.promise)
+    vi.spyOn(f.policy, 'assessApprovalRequest').mockReturnValue({ status: 'high-risk', reason: 'fixture rule', reasonCode: 'fixture', matchedRules: [] })
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('review-in-progress', ordinaryCommand)
+    await drain()
+    expect(await f.controller.approveAllPending()).toEqual({ approved: 0, failed: 0, skipped: 1, skippedRequestIds: ['review-in-progress'] })
+    expect(f.handle.permissionResponses).toEqual([])
+    pending.resolve(conclusion('deny'))
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'review-in-progress', action: 'deny' }])
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it.each(['allow', 'deny', 'manual', 'uncertain', 'error', 'disabled'] as const)('terminal agent review reaches one binary action for %s', async verdict => {
+    const f = fixture()
+    f.handle.permissionHook = undefined
+    if (verdict === 'error') f.reviewer.reviewApproval.mockRejectedValue(new Error('fixture terminal reviewer unavailable'))
+    else if (verdict === 'disabled') f.reviewer.getSettings.mockReturnValue({ enabled: false, level: 'high' })
+    else f.reviewer.reviewApproval.mockResolvedValue(conclusion(verdict))
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.handle.emit({ type: 'output', data: 'Would you like to run the following command?\r\n$ ' + highRiskCommand + '\r\n1. Yes, proceed\r\n2. No' })
+    await drain()
+    expect(f.handle.writes).toEqual([verdict === 'allow' ? '\r' : '\x1b'])
+    expect(f.handle.permissionResponses).toEqual([])
+    expect(f.controller.listPendingApprovals()).toEqual([])
+    expect(f.activity.pending).not.toHaveBeenCalled()
+  })
+
+  it.each(['ordinary', 'high-risk', 'incomplete'] as const)('terminal rules auto handles %s without waiting for a user', async risk => {
+    const f = fixture()
+    f.handle.permissionHook = undefined
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'rules-auto')
+    const command = risk === 'ordinary' ? ordinaryCommand : risk === 'incomplete' ? 'tool:Shell' : highRiskCommand
+    f.handle.emit({ type: 'output', data: 'Would you like to run the following command?\r\n$ ' + command + '\r\n1. Yes, proceed\r\n2. No' })
+    await drain()
+    expect(f.handle.writes).toEqual([risk === 'ordinary' ? '\r' : '\x1b'])
+    expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+    expect(f.activity.pending).not.toHaveBeenCalled()
   })
 
   it.each(['agent-review', 'rules-auto'] as const)('%s rejects truncated requests without consulting the reviewer', async mode => {
@@ -186,6 +352,38 @@ describe('controller approval modes acceptance', () => {
     expect(f.handle.permissionResponses).toEqual([{ requestId: 'truncated', action: 'deny' }])
     expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
     expect(f.controller.listPendingApprovals()).toHaveLength(0)
+    expect(f.activity.pending).not.toHaveBeenCalled()
+  })
+
+  it.each((['codex', 'claude'] as const).flatMap(kind => (['agent-review', 'rules-auto'] as const).map(mode => ({ kind, mode }))))('$kind $mode approves intact JSON writes beyond the former hook cap without AI review', async ({ kind, mode }) => {
+    const f = fixture(kind)
+    const session = await f.start()
+    await f.setMode(session.sessionId, mode)
+    const command = "Set-Content -LiteralPath '.\\cache.json' -Value '" + JSON.stringify({ data: 'a'.repeat(17000) }) + "'"
+    f.emitApproval('large-json', command, { ...permissionHookFields({ command }), operation: 'write' })
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'large-json', action: 'allow' }])
+    expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
+    expect(f.activity.approved.mock.calls[0]?.[0].command).toBe(command)
+  })
+
+  it.each(['codex', 'claude'] as const)('%s preserves safe input diagnostics and returns a precise oversize refusal', async kind => {
+    const f = fixture(kind)
+    const session = await f.start()
+    const command = 'echo ' + 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH)
+    const fields = permissionHookFields({ command })
+    f.emitApproval('large-input', 'tool:PowerShell', {
+      ...fields, toolInput: { command }, inputIssue: { ...fields.inputIssue!, message: 'fixture-private-value' } as NonNullable<typeof fields.inputIssue>,
+    })
+    await drain()
+    expect(f.controller.listPendingApprovals()[0]?.inputIssue).toEqual(fields.inputIssue)
+    await f.setMode(session.sessionId, 'agent-review')
+    await drain()
+    expect(f.handle.permissionResponses).toEqual([{ requestId: 'large-input', action: 'deny' }])
+    expect(f.handle.permissionReasons[0]).toContain(String(command.length))
+    expect(f.handle.permissionReasons[0]).toContain(String(MAX_APPROVAL_COMMAND_LENGTH))
+    expect(f.handle.permissionReasons[0]).not.toMatch(/截断|fixture-private-value/)
+    expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
   })
 
   it.each(['codex', 'claude'] as const)('%s rejects without human handoff when the reviewer is disabled', async kind => {
@@ -199,6 +397,10 @@ describe('controller approval modes acceptance', () => {
     expect(f.handle.permissionReasons[0]).toContain('不转人工')
     expect(f.reviewer.reviewApproval).not.toHaveBeenCalled()
     expect(f.controller.listPendingApprovals()).toEqual([])
+    expect(f.activity.reviewFailed).toHaveBeenCalledWith(expect.objectContaining({
+      llmReview: expect.objectContaining({ verdict: 'deny', requiresHumanApproval: false }),
+    }), expect.stringContaining('不是命令危险性的结论'))
+    expect(f.activity.pending).not.toHaveBeenCalled()
   })
 
   it('stops safely if a rejection cannot reach its exact hook, without leaving a human approval queued', async () => {
@@ -234,6 +436,32 @@ describe('controller approval modes acceptance', () => {
     expect(f.activity.blocked).not.toHaveBeenCalled()
   })
 
+  it.each((['codex', 'claude'] as const).flatMap(kind =>
+    (['allow', 'deny'] as const).map(verdict => ({ kind, verdict }))))('a late successful $kind $verdict receipt cannot consume a replacement request', async ({ kind, verdict }) => {
+    const f = fixture(kind)
+    const delivery = deferred<boolean>()
+    Object.assign(f.handle, { respondToPermissionChecked: vi.fn(() => delivery.promise) })
+    f.reviewer.reviewApproval.mockResolvedValue(conclusion(verdict))
+    const session = await f.start(true)
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('reused-request-id'); await drain()
+    await f.controller.stopSession(session.sessionId)
+    const replacement = new ApprovalHandle('replacement-host')
+    replacement.permissionHook = kind
+    vi.mocked(f.manager.start).mockResolvedValueOnce(replacement)
+    await f.controller.restartSession(session.sessionId)
+    await f.setMode(session.sessionId, 'manual')
+    replacement.emit({ type: 'permission-request', hookSource: kind, requestId: 'reused-request-id', toolName: 'PowerShell',
+      command: highRiskCommand, operation: 'delete', cwd: workspace, toolInput: { command: highRiskCommand, cwd: workspace } })
+    await drain()
+    delivery.resolve(true); await drain()
+    expect(f.controller.listPendingApprovals()).toEqual([expect.objectContaining({ requestId: 'reused-request-id' })])
+    expect(replacement.permissionResponses).toEqual([])
+    expect(replacement.stop).not.toHaveBeenCalled()
+    expect(f.activity.approved).not.toHaveBeenCalled()
+    expect(f.activity.rejected).not.toHaveBeenCalled()
+  })
+
   it.each(['user-stop', 'manual-mode'] as const)('a late rejected delivery preserves an explicit %s', async action => {
     const f = fixture()
     const delivery = deferred<boolean>()
@@ -247,6 +475,37 @@ describe('controller approval modes acceptance', () => {
     expect(f.handle.stop).toHaveBeenCalledTimes(action === 'user-stop' ? 1 : 0)
     expect(f.controller.listSessions()[0]?.status).toBe(action === 'user-stop' ? 'stopped' : 'needs_approval')
     expect(f.activity.blocked).not.toHaveBeenCalled()
+  })
+
+  it('re-routes an undelivered old rejection under a newly selected automatic mode', async () => {
+    const f = fixture()
+    const delivery = deferred<boolean>()
+    const checked = vi.fn().mockReturnValueOnce(delivery.promise).mockResolvedValue(true)
+    Object.assign(f.handle, { respondToPermissionChecked: checked })
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'rules-auto')
+    f.emitApproval('switched-delivery'); await drain()
+    await f.setMode(session.sessionId, 'agent-review')
+    delivery.resolve(false); await drain()
+    expect(checked.mock.calls.map((call) => call[1])).toEqual(['deny', 'allow'])
+    expect(f.reviewer.reviewApproval).toHaveBeenCalledOnce()
+    expect(f.handle.stop).not.toHaveBeenCalled()
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it('does not let an old terminal denial check stop a newly selected mode', async () => {
+    const f = fixture()
+    f.handle.permissionHook = undefined
+    const prompt = 'Would you like to run the following command?\r\n$ ' + highRiskCommand + '\r\n1. Yes, proceed\r\n2. No'
+    vi.spyOn(f.handle, 'replay').mockResolvedValue(prompt)
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'rules-auto')
+    f.handle.emit({ type: 'output', data: prompt }); await drain()
+    await f.setMode(session.sessionId, 'agent-review')
+    await vi.advanceTimersByTimeAsync(1100)
+    expect(f.handle.stop).not.toHaveBeenCalled()
+    expect(f.activity.blocked).not.toHaveBeenCalled()
+    expect(f.controller.listSessions()[0]?.approvalMode).toBe('agent-review')
   })
 
   it.each(['user-stop', 'restart'] as const)('a delayed automatic stop receipt cannot overwrite a later %s', async action => {
@@ -315,6 +574,26 @@ describe('controller approval modes acceptance', () => {
     expect(checked).toHaveBeenCalledWith('child-alias', 'deny', expect.stringContaining('实质更安全的新请求'))
     expect(f.handle.permissionResponses).toEqual([])
     expect(f.handle.stop).toHaveBeenCalledTimes(aliasDelivered ? 0 : 1)
+    expect(f.controller.listPendingApprovals()).toEqual([])
+  })
+
+  it.each([true, false])('checks a Claude automatic allow and its in-flight alias (alias delivered: %s)', async aliasDelivered => {
+    const f = fixture('claude')
+    const primary = deferred<boolean>()
+    const checked = vi.fn((id: string) => id === 'primary-allow' ? primary.promise : Promise.resolve(aliasDelivered))
+    Object.assign(f.handle, { respondToPermissionChecked: checked })
+    const session = await f.start()
+    await f.setMode(session.sessionId, 'agent-review')
+    f.emitApproval('primary-allow', highRiskCommand, { toolUseId: 'shared-tool' }); await drain()
+    f.emitApproval('child-allow-alias', highRiskCommand, { toolUseId: 'shared-tool', agentId: 'child-agent' }); await drain()
+    expect(checked).toHaveBeenCalledOnce()
+    expect(f.activity.approved).not.toHaveBeenCalled()
+    primary.resolve(true); await drain()
+    expect(checked.mock.calls.map(([id]) => id)).toEqual(['primary-allow', 'child-allow-alias'])
+    expect(checked).toHaveBeenCalledWith('child-allow-alias', 'allow', undefined)
+    expect(f.handle.permissionResponses).toEqual([])
+    expect(f.handle.stop).toHaveBeenCalledTimes(aliasDelivered ? 0 : 1)
+    expect(f.activity.approved).toHaveBeenCalledTimes(aliasDelivered ? 1 : 0)
     expect(f.controller.listPendingApprovals()).toEqual([])
   })
 

@@ -16,7 +16,7 @@ const ERROR_MESSAGES: Record<CatalogErrorCode, string> = {
   http: 'LLM API 请求失败：服务返回错误状态',
   timeout: 'LLM API 请求超时，请稍后重试',
   network: 'LLM API 请求失败：无法连接模型服务',
-  'invalid-response': '获取模型列表失败：服务返回的模型列表格式无效',
+  'invalid-response': 'LLM API 请求失败：服务返回的响应格式无效，请检查协议和模型设置',
 }
 
 /** Contains only an allowlisted code/message, never an upstream error or request. */
@@ -28,7 +28,7 @@ export class LlmModelCatalogError extends Error {
 }
 
 /** Bare origins use /v1; custom prefixes and explicit endpoints stay consistent. */
-export function resolveLlmApiEndpoint(baseUrl: string, resource: 'models' | 'chat/completions'): string {
+export function resolveLlmApiEndpoint(baseUrl: string, resource: 'models' | 'chat/completions' | 'responses' | 'messages'): string {
   try {
     if (typeof baseUrl !== 'string' || !baseUrl.trim() || baseUrl.length > 4_096 || UNSAFE_TEXT.test(baseUrl)) {
       throw new Error()
@@ -40,7 +40,7 @@ export function resolveLlmApiEndpoint(baseUrl: string, resource: 'models' | 'cha
     // URL.search/hash omit an empty delimiter; disallow those as well.
     if (baseUrl.includes('?') || baseUrl.includes('#')) throw new Error()
     const path = url.pathname.replace(/\/+$/u, '')
-    const prefix = path ? path.replace(/\/(?:chat\/completions|models)$/iu, '') : '/v1'
+    const prefix = path ? path.replace(/\/(?:chat\/completions|models|responses|messages)$/iu, '') : '/v1'
     url.pathname = `${prefix}/${resource}`
     return url.toString()
   } catch {
@@ -48,7 +48,7 @@ export function resolveLlmApiEndpoint(baseUrl: string, resource: 'models' | 'cha
   }
 }
 
-function configuredProxy(settings: StoredLlmReviewSettings) {
+export function configuredProxy(settings: StoredLlmReviewSettings) {
   if (!settings.proxyEnabled) return false as const
   const host = settings.proxyHost?.trim()
   if (!host || /[\s/@?#\\]/u.test(host) || UNSAFE_TEXT.test(host)
@@ -68,9 +68,17 @@ function configuredProxy(settings: StoredLlmReviewSettings) {
   }
 }
 
+export function llmApiHeaders(settings: StoredLlmReviewSettings): Record<string, string> {
+  const apiKey = settings.apiKey?.trim()
+  if (!apiKey || apiKey.length > 16384 || UNSAFE_TEXT.test(settings.apiKey!)) throw new LlmModelCatalogError('configuration')
+  return settings.protocol === 'anthropic-messages'
+    ? { ...(settings.anthropicAuth === 'bearer' ? { Authorization: `Bearer ${apiKey}` } : { 'x-api-key': apiKey }), 'anthropic-version': '2023-06-01', Accept: 'application/json' }
+    : { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }
+}
+
 function protectedValues(settings: StoredLlmReviewSettings): string[] {
   const values = new Set<string>()
-  for (const value of [settings.apiKey, settings.proxyPassword]) {
+  for (const value of [settings.apiKey, settings.proxyPassword, ...(settings.reviewers?.map(entry => entry.apiKey) ?? [])]) {
     if (typeof value !== 'string' || !value) continue
     for (const variant of [value, value.trim()]) {
       if (!variant) continue
@@ -129,7 +137,7 @@ export async function listLlmReviewModels(settings: StoredLlmReviewSettings): Pr
     const secrets = protectedValues(settings)
     const timeoutSeconds = Number.isFinite(settings.timeoutSeconds) ? Math.max(1, Math.min(60, settings.timeoutSeconds)) : 30
     const response = await axios.get<unknown>(endpoint, {
-      headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
+      headers: llmApiHeaders(settings),
       proxy,
       timeout: timeoutSeconds * 1_000,
       maxContentLength: MAX_RESPONSE_BYTES,

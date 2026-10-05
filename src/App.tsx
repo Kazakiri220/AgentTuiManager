@@ -1,6 +1,11 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import CCSwitchProviderList from './CCSwitchProviderList'
+import FavoriteWorkspaces from './FavoriteWorkspaces'
+import CollapsiblePanel from './CollapsiblePanel'
+import { isBoolean, usePreference } from './ui-preferences'
+import './upgrade-ui.css'
 import { playAttentionAudio } from './attention-audio'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
@@ -76,46 +81,6 @@ function writeOverviewPreferences(preferences: OverviewPreferences): void {
 }
 
 
-function providerHost(baseUrl?: string): string {
-  if (!baseUrl) return '未配置地址'
-  try { return new URL(baseUrl).host } catch { return baseUrl }
-}
-
-function CCSwitchProviderList({
-  providers, selectedId, loading, error, disabled, onSelect, onRefresh,
-}: {
-  providers: CCSwitchProviderSummary[]
-  selectedId: string
-  loading: boolean
-  error: string
-  disabled: boolean
-  onSelect: (provider: CCSwitchProviderSummary) => void
-  onRefresh: () => void
-}): JSX.Element {
-  return <div className='ccswitch-provider-section'>
-    <div className='launcher-section-title'><h2>选择 Provider</h2><button type='button' className='button-secondary mini-button' disabled={disabled || loading} onClick={onRefresh}>{loading ? '读取中…' : '刷新'}</button></div>
-    {error && <p className='launcher-state error'>读取失败：{error}</p>}
-    {!error && !loading && providers.length === 0 && <p className='launcher-state'>没有找到匹配的 Provider</p>}
-    {!error && !loading && providers.length > 0 && <p className='ccswitch-provider-count'>{providers[0]?.agentKind === 'codex' ? 'Codex' : 'Claude Code'} · 共 {providers.length} 个配置，{providers.filter(provider => !provider.issue).length} 个可导入。滚动查看完整列表。</p>}
-    <div className='ccswitch-provider-list' aria-label='CC Switch 配置列表'>
-      {providers.map((provider) => <button
-        type='button'
-        key={provider.id}
-        className={`ccswitch-provider-item${selectedId === provider.id ? ' active' : ''}${provider.issue ? ' invalid' : ''}`}
-        disabled={disabled || Boolean(provider.issue)}
-        aria-pressed={selectedId === provider.id}
-        title={provider.issue ? `${provider.name}：${provider.issue}` : provider.name}
-        onClick={() => onSelect(provider)}
-      >
-        <span className='ccswitch-provider-main'><strong>{provider.name}</strong>{provider.isCurrent && <em>当前</em>}<small>{providerHost(provider.baseUrl)}</small></span>
-        <span className='ccswitch-provider-meta'><span>{provider.model || '继承模型'}</span><span>{provider.hasApiKey ? '已配置密钥' : '缺少密钥'}</span></span>
-        {provider.issue && <small className='ccswitch-provider-issue'>{provider.issue}</small>}
-      </button>)}
-    </div>
-    <div className='launcher-config-security'><strong>只读导入</strong><span>Manager 只读取所选 Provider 的快照并加密保存；不会修改 CCSwitch 或 Agent 的原始配置。</span></div>
-  </div>
-}
-
 interface ExternalImportIntent {
   transactionId: string
   workspace?: string
@@ -144,7 +109,7 @@ interface AgentInstallView {
   messages: Array<{ text: string; level: 'info' | 'warning' | 'error' }>
 }
 
-function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boolean; initialImport?: ExternalImportIntent; onClose: () => void; onCreated: (workspace: string) => void }): JSX.Element {
+function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boolean; initialImport?: ExternalImportIntent; onClose: () => void; onCreated: (workspace: string, sessionId?: string) => void }): JSX.Element {
   const [agentKind, setAgentKind] = useState<AgentKind>('codex')
   const [displayName, setDisplayName] = useState('新 Agent')
   const [workspace, setWorkspace] = useState('')
@@ -199,9 +164,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
   const [busy, setBusy] = useState(false)
   const [launcherTab, setLauncherTab] = useState<'new' | 'history' | 'external' | 'config'>('new')
   const [historyQuery, setHistoryQuery] = useState('')
+  const [historyScope, setHistoryScope] = useState<'global' | 'workspace'>('global')
   const [closeArmed, setCloseArmed] = useState(false)
   const closeTimer = useRef<ReturnType<typeof setTimeout>>()
   const discoveryVersion = useRef(0)
+  const discoveryContext = useRef('')
 
   useEffect(() => window.agentManager.subscribe((event) => {
     if (event.type !== 'agent-install-progress') return
@@ -256,19 +223,25 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     if (closeTimer.current) { clearTimeout(closeTimer.current); closeTimer.current = undefined }
   }
 
-  const loadNativeSessions = async (kind: AgentKind, selectedWorkspace: string): Promise<void> => {
+  const loadNativeSessions = async (kind: AgentKind, selectedWorkspace: string, global = false, preserveSelection = false): Promise<void> => {
     const version = ++discoveryVersion.current
-    setNativeSessionId('')
-    setNativeSessions([])
+    const context = `${kind}\0${global ? 'global' : selectedWorkspace}`
+    const selected = preserveSelection && discoveryContext.current === context ? nativeSessionId : ''
+    if (!selected) { setNativeSessionId(''); setNativeSessions([]) }
     setDiscoveryError('')
     if (kind === 'pi' || kind === 'generic' || kind === 'deepseek') {
       setDiscoveryState('unsupported')
       return
     }
+    if (!global && !selectedWorkspace) { setDiscoveryState('idle'); return }
     setDiscoveryState('loading')
     try {
-      const discovered = await window.agentManager.discoverSessions(kind, selectedWorkspace)
+      const discovered = global && kind === 'codex'
+        ? await window.agentManager.discoverRecentCodexSessions()
+        : await window.agentManager.discoverSessions(kind, selectedWorkspace)
       if (version !== discoveryVersion.current) return
+      discoveryContext.current = context
+      if (selected && !discovered.some(item => item.id === selected)) setNativeSessionId('')
       setNativeSessions(discovered)
       setDiscoveryState('ready')
     } catch (reason) {
@@ -276,6 +249,22 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       setDiscoveryError(reason instanceof Error ? reason.message : String(reason))
       setDiscoveryState('error')
     }
+  }
+
+  useEffect(() => {
+    if (open && launcherTab === 'history') void loadNativeSessions(agentKind, workspace, agentKind === 'codex' && historyScope === 'global', true)
+  }, [open, launcherTab, agentKind, historyScope])
+
+  const selectWorkspace = (selected: string): void => {
+    setWorkspace(selected); setError('')
+    // Relocating a selected history preserves the native ID. New sessions reset selection.
+    if (launcherTab !== 'history') void loadNativeSessions(agentKind, selected)
+    else if (historyScope === 'workspace' || agentKind !== 'codex') void loadNativeSessions(agentKind, selected)
+  }
+  const selectHistory = (id: string): void => {
+    setNativeSessionId(id)
+    const item = nativeSessions.find(candidate => candidate.id === id)
+    if (item) { setWorkspace(item.workspace); setDisplayName(item.managerDisplayName ?? item.title.slice(0, 120)); setError('') }
   }
 
   const loadCCSwitchProviders = async (kind = agentKind): Promise<void> => {
@@ -311,7 +300,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     setAgentKind(kind)
     setExecutable(defaultExecutable(kind))
     setArgs(kind === 'deepseek' ? DEEPSEEK_WEB_ARGS.join('\n') : '')
-    if (workspace) void loadNativeSessions(kind, workspace)
+    if (launcherTab !== 'history') { if (workspace) void loadNativeSessions(kind, workspace); else { setNativeSessions([]); setNativeSessionId(''); setDiscoveryState('idle') } }
     if (configSource === 'ccswitch') void loadCCSwitchProviders(kind)
   }
 
@@ -435,17 +424,20 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     setError('')
     try {
       const selected = await window.agentManager.chooseWorkspace()
-      if (selected) {
-        setWorkspace(selected)
-        await loadNativeSessions(agentKind, selected)
-      }
+      if (selected) selectWorkspace(selected)
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason))
     }
   }
 
   const submit = async (event: FormEvent): Promise<void> => {
-    event.preventDefault(); setBusy(true); setError('')
+    event.preventDefault(); if (busy) return; setBusy(true); setError('')
+    if (nativeSessionId) {
+      try {
+        const existing = (await window.agentManager.listSessions()).find(item => item.agentKind === agentKind && item.nativeSessionId === nativeSessionId && !['stopped', 'failed', 'exited', 'completed'].includes(item.status))
+        if (existing) { onCreated(existing.workspace, existing.sessionId); return }
+      } catch { setError('无法确认会话运行状态，请刷新后重试'); setBusy(false); return }
+    }
     if (agentKind !== 'generic' && typeof window.agentManager.detectAgentEnvironment === 'function') {
       try {
         const currentEnvironment = await window.agentManager.detectAgentEnvironment(agentKind, executable.trim())
@@ -505,7 +497,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     }
     if (resumeArgs) request.recovery = { executable, args: resumeArgs }
     else if (agentKind === 'deepseek') request.recovery = { executable, args: parsedArgs }
-    try { const created = await window.agentManager.startSession(request); onCreated(created.workspace) }
+    try { const created = await window.agentManager.startSession(request); onCreated(created.workspace, created.sessionId) }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
 
@@ -530,6 +522,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     const query = historyQuery.trim().toLocaleLowerCase('zh-CN')
     return !query || nativeSession.title.toLocaleLowerCase('zh-CN').includes(query)
       || nativeSession.id.toLocaleLowerCase('en-US').includes(query)
+      || nativeSession.workspace.toLocaleLowerCase('zh-CN').includes(query)
       || Boolean(nativeSession.subtitle?.toLocaleLowerCase('zh-CN').includes(query))
   })
   const agentOptions: Array<{ kind: AgentKind; logo: string; title: string; subtitle: string; disabled?: boolean }> = [
@@ -554,9 +547,10 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       <header className='launcher-head'><h1>添加 Agent</h1><button type='button' className='icon-button' onClick={onClose} aria-label='关闭'>×</button></header>
       <div className='launcher-workspace-row'><label htmlFor='workspace'>工作区</label><div className='workspace-picker'><input id='workspace' className='launcher-field' required={agentKind !== 'deepseek'} disabled={agentKind === 'deepseek'} readOnly placeholder='请选择工作区' value={agentKind === 'deepseek' ? '在 Harness Web 内选择' : workspace} /><button type='button' className='button-secondary' disabled={busy || agentKind === 'deepseek'} onClick={() => { void chooseWorkspace() }}>选择文件夹</button></div></div>
       <div className='launcher-content'>
-        <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => setLauncherTab('new')}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
+        <FavoriteWorkspaces workspace={workspace} disabled={busy || agentKind === 'deepseek'} onSelect={selectWorkspace} />
+        <nav className='launcher-tabs' aria-label='会话方式'><button type='button' className={`launcher-tab${launcherTab === 'new' ? ' active' : ''}`} onClick={() => { setLauncherTab('new'); setNativeSessionId('') }}>新会话</button><button type='button' className={`launcher-tab${launcherTab === 'history' ? ' active' : ''}`} onClick={() => setLauncherTab('history')}>恢复历史</button><button type='button' className={`launcher-tab${launcherTab === 'config' ? ' active' : ''}`} onClick={() => setLauncherTab('config')}>独立配置</button></nav>
         <label className='sr-only' htmlFor='agent-kind'>Agent 类型</label><select className='sr-only' id='agent-kind' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select>
-        <label className='sr-only' htmlFor='native-session'>历史会话</label><select className='sr-only' id='native-session' value={nativeSessionId} disabled={!workspace || discoveryState === 'loading' || discoveryState === 'unsupported'} onChange={(event) => setNativeSessionId(event.target.value)}><option value=''>新建会话</option>{nativeSessions.map((item) => <option key={item.id} value={item.id}>{item.title} · {new Date(item.updatedAt).toLocaleString()}</option>)}</select>
+        <label className='sr-only' htmlFor='native-session'>历史会话</label><select className='sr-only' id='native-session' value={nativeSessionId} disabled={discoveryState === 'loading' || discoveryState === 'unsupported'} onChange={(event) => selectHistory(event.target.value)}><option value=''>新建会话</option>{nativeSessions.map((item) => <option key={item.id} value={item.id}>{item.title} · {new Date(item.updatedAt).toLocaleString()}</option>)}</select>
         {launcherTab === 'new' && <section className='launcher-panel'><div className='launcher-section-title'><h2>选择 Agent</h2><span>选择本机 CLI</span></div><div className='launcher-agent-options'>{agentOptions.map((option) => <button type='button' key={option.kind} disabled={option.disabled} className={`launcher-agent-option${agentKind === option.kind ? ' active' : ''}`} onClick={() => changeKind(option.kind)}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{option.subtitle}</span></span></button>)}</div>
            {agentKind === 'deepseek' && <div className='launcher-agent-capability-note' role='note'><strong>DeepSeek Harness 官方当前没有交互式 TUI</strong><span>Manager 会启动并托管官方 Web 界面，负责配置、停止、重启和重连。工作区、工具审批、自动批准及会话操作仍在 Harness Web 内完成，暂不进入 Manager 处理中心或全自动模式。</span></div>}
            {discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}
@@ -583,8 +577,8 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
            </div>}
           <div className='launcher-form-grid'><label htmlFor='session-name'>显示名称</label><input id='session-name' className='launcher-field' required value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label htmlFor='approval-mode'>审批策略</label><select id='approval-mode' className='launcher-field' defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option><option value='manual'>全部手动确认</option><option value='builtin'>仅使用内置安全规则</option></select></div><div className='launcher-command-preview'>{executable || '<custom-command>'}<small>cwd: {workspace || '请选择工作区'}</small></div>
            <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<div className='workspace-picker'><input required value={executable} onChange={(event) => setExecutable(event.target.value)} /><button type='button' className='button-secondary' onClick={() => { void chooseExecutable() }}>选择文件</button></div></label><small>如果 CLI 没有加入 PATH，可选择完整的可执行文件路径；修改后会自动重新检测。</small><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></details></section>}
-        {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题或会话 ID' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>该工作区的历史会话</h2><span>按最近活动排序</span></div>
-          {discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span>{item.subtitle || item.id}</span><small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
+        {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题、工作区或会话 ID' aria-label='搜索历史会话' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>{agentKind === 'codex' && historyScope === 'global' ? '最近 50 个会话 · 全部工作区' : '该工作区的历史会话'}</h2><button type='button' disabled={discoveryState === 'loading'} onClick={() => { void loadNativeSessions(agentKind, workspace, agentKind === 'codex' && historyScope === 'global') }}>刷新历史</button></div>{agentKind === 'codex' && <label className='history-scope'>历史范围<select aria-label='历史范围' value={historyScope} onChange={event => setHistoryScope(event.target.value as 'global' | 'workspace')}><option value='global'>全部工作区 · 最近 50 个</option><option value='workspace'>当前工作区</option></select></label>}
+          {discoveryState === 'idle' && <p className='launcher-state'>请选择工作区以读取历史会话</p>}{discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>没有找到可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => selectHistory(nativeSessionId === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span title={item.workspace}>{item.workspace}</span>{item.managedSessionId && <em>已在 Manager 中运行</em>}<small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
         {launcherTab === 'external' && <section className='launcher-panel'><div className='launcher-external-note'>{initialImport?.issue ?? '先在外部终端正常退出当前 Agent，再从下方选择原生会话。Manager 会通过 Agent 自带的 resume 接管；不会复制终端画面或改变原生会话数据。'}</div><div className='launcher-section-title'><h2>可迁入的原生会话</h2><span>{discoveryState === 'ready' ? filteredSessions.length + ' 个' : '请先选择工作区'}</span></div>
           {discoveryState === 'loading' && <p className='launcher-state'>正在检测原生会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>当前 Agent 暂不支持原生会话迁入</p>}{discoveryState === 'error' && <p className='launcher-state error'>检测失败：{discoveryError}</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>该工作区没有可迁入的原生会话</p>}
           <div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item external-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => setNativeSessionId((current) => current === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span>{item.subtitle || item.workspace}</span><small>{item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div>
@@ -621,7 +615,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
       </div>
       {closeArmed && <p className='launcher-dismiss-hint'>再点击一次空白处关闭，已填写内容会保留</p>}
       {error && <p className='launcher-error'>{error}</p>}
-      <footer className='launcher-foot'><span>{nativeSessionId ? launcherTab === 'external' ? '将通过原生 resume 迁入所选会话' : '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '选择一个已正常退出的原生会话' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{(launcherTab !== 'external' || nativeSessionId) && <button type='submit' className='button-primary' disabled={busy || environmentBusy || (agentKind !== 'deepseek' && !workspace) || (launcherTab === 'external' && !nativeSessionId) || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : launcherTab === 'external' ? '迁入 Manager' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
+      <footer className='launcher-foot'><span>{nativeSessionId ? launcherTab === 'external' ? '将通过原生 resume 迁入所选会话' : '将在新终端中恢复已选择的历史会话' : launcherTab === 'external' ? '选择一个已正常退出的原生会话' : launcherTab === 'config' ? configEnabled ? '独立配置只应用于这个 Agent' : '当前继续继承本机配置' : `将启动新的 ${agentOptions.find((option) => option.kind === agentKind)?.title ?? 'Agent'} 会话`}</span><button type='button' className='button-secondary' onClick={onClose}>取消</button>{(launcherTab !== 'external' || nativeSessionId) && <button type='submit' className='button-primary' disabled={busy || environmentBusy || (agentKind !== 'deepseek' && !workspace) || (launcherTab === 'external' && !nativeSessionId) || (configEnabled && configSource === 'ccswitch' && !ccSwitchProviderId)}>{busy ? '请稍后…' : launcherTab === 'external' ? '迁入 Manager' : nativeSessions.find(item => item.id === nativeSessionId)?.managedSessionId ? '切换到 Agent' : nativeSessionId ? '恢复会话' : '启动 Agent'}</button>}</footer>
     </form>
   </div>
 }
@@ -824,6 +818,8 @@ export default function App(): JSX.Element {
   const [view, setView] = useState<'overview' | 'attention' | 'audit' | 'tokens'>('overview')
   const [overviewMode, setOverviewMode] = useState<'wall' | 'list'>(initialOverviewPreferences.current.overviewMode)
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
+  const [statisticsOpen, setStatisticsOpen] = usePreference('agent-tui-manager:statistics-open:v1', true, isBoolean)
+  const [settingsOpen, setSettingsOpen] = usePreference('agent-tui-manager:settings-open:v1', true, isBoolean)
   const [listActiveId, setListActiveId] = useState<string>()
   const [wallActiveId, setWallActiveId] = useState<string>()
   const [statusFilter, setStatusFilter] = useState<SessionDisplayStatus[]>(initialOverviewPreferences.current.statusFilter ?? [])
@@ -1013,9 +1009,10 @@ export default function App(): JSX.Element {
     void window.agentManager.setActiveSession?.(activeSoundSessionId ?? null)?.catch(() => undefined)
   }, [activeSoundSessionId])
   const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
-  const pendingCount = useMemo(() => approvals.filter((request) => currentWorkspace && workspaceKey(request.workspace) === workspaceKey(currentWorkspace)).length
-    + visibleSessions.filter((session) => session.status === 'needs_attention').length, [approvals, currentWorkspace, visibleSessions])
-  const totalPendingCount = useMemo(() => approvals.length + sessions.filter((session) => session.status === 'needs_attention').length, [approvals, sessions])
+  const manualApprovals = useMemo(() => approvals.filter(request => { const owner = sessions.find(session => session.sessionId === request.sessionId); return !owner || approvalModeOf(owner) === 'manual' }), [approvals, sessions])
+  const pendingCount = useMemo(() => manualApprovals.filter((request) => currentWorkspace && workspaceKey(request.workspace) === workspaceKey(currentWorkspace)).length
+    + visibleSessions.filter((session) => session.status === 'needs_attention').length, [manualApprovals, currentWorkspace, visibleSessions])
+  const totalPendingCount = useMemo(() => manualApprovals.length + sessions.filter((session) => session.status === 'needs_attention').length, [manualApprovals, sessions])
   const overviewPendingCount = groupByWorkspace ? pendingCount : totalPendingCount
   const attentionSessions = useMemo(() => sessions.filter((session) => session.status === 'needs_attention'), [sessions])
   const activeWorkspaceName = currentWorkspace?.split(/[\\/]/).filter(Boolean).at(-1) ?? '尚未选择工作区'
@@ -1091,12 +1088,12 @@ export default function App(): JSX.Element {
             <header><div><strong>待处理通知</strong><span>{totalPendingCount} 项</span></div></header>
             <div className='notification-list'>
               {totalPendingCount === 0 && <p className='notification-empty'>当前没有待处理项</p>}
-              {approvals.slice(0, 5).map((request) => <div className={'notification-item risk-' + request.risk} key={request.requestId}>
+              {manualApprovals.slice(0, 5).map((request) => <div className={'notification-item risk-' + request.risk} key={request.requestId}>
                 <i />
                 <div><strong>{request.displayName}</strong><span>{request.toolName ?? request.agentKind.toUpperCase()} · {request.inputSummary ?? request.command ?? '参数待确认'}</span><small title={request.workspace}>{request.workspace}</small></div>
                 <div className='notification-actions'><button className='button-secondary button-compact' type='button' disabled={notificationBusyId === request.requestId} onClick={() => { void rejectNotification(request) }}>拒绝</button><button className='button-approve' type='button' disabled={notificationBusyId === request.requestId} onClick={() => { void approveNotification(request) }}>{notificationBusyId === request.requestId ? '请稍后…' : '批准'}</button></div>
               </div>)}
-              {attentionSessions.slice(0, Math.max(0, 5 - approvals.length)).map((session) => <div className='notification-item recovery' key={session.sessionId}>
+              {attentionSessions.slice(0, Math.max(0, 5 - manualApprovals.length)).map((session) => <div className='notification-item recovery' key={session.sessionId}>
                 <i />
                 <div><strong>{session.displayName}</strong><span>{session.lastError ?? '检测到异常退出'}</span><small title={session.workspace}>{session.workspace}</small></div>
               </div>)}
@@ -1110,24 +1107,29 @@ export default function App(): JSX.Element {
         <button className='button-primary' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
       </header>}
       <div className={`workspace-layout${selected ? ' workspace-layout-detail' : ''}`}>
-        <nav className='sidebar'>
+        <CollapsiblePanel name='导航' storageId='navigation' badge={totalPendingCount}><nav className='sidebar' aria-label='主导航'>
           {groupByWorkspace && <><p className='nav-label'>工作区</p>{workspaceGroups.map((group) => <button className={`nav-item${currentWorkspace && workspaceKey(group.workspace) === workspaceKey(currentWorkspace) ? ' active' : ''}`} type='button' key={workspaceKey(group.workspace)} onClick={() => setActiveWorkspace(group.workspace)}><span>▣</span><span title={group.workspace}>{group.workspace.split(/[\\/]/).filter(Boolean).at(-1)}</span><i className='nav-count neutral'>{group.sessions.length}</i></button>)}</>}
           <p className={`nav-label${groupByWorkspace ? ' nav-section' : ''}`}>视图</p>
-          <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
-          <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
+          <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' aria-label='Agent 总览' title='Agent 总览' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
+          <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' aria-label='处理中心' title='处理中心' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
+          <button type='button' className='nav-item nav-group-toggle' aria-label='统计' aria-expanded={statisticsOpen} onClick={() => setStatisticsOpen(!statisticsOpen)}><span>◷</span><span>统计</span><i>{statisticsOpen ? '⌃' : '⌄'}</i></button>
+          <div className='nav-group-items' hidden={!statisticsOpen}>
           <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button><button className={`nav-item${view === 'tokens' ? ' active' : ''}`} type='button' aria-label='Token 用量' onClick={() => setView('tokens')}><span>∑</span><span>Token 用量</span></button>
+          </div><button type='button' className='nav-item nav-group-toggle' aria-label='设置' aria-expanded={settingsOpen} onClick={() => setSettingsOpen(!settingsOpen)}><span>⚙</span><span>设置</span><i>{settingsOpen ? '⌃' : '⌄'}</i></button>
+          <div className='nav-group-items' hidden={!settingsOpen}>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>审核器设置</span></button>
-        </nav>
+          <button className='nav-item' type='button' aria-label='审核器设置' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>审核器设置</span></button>
+          </div>
+        </nav></CollapsiblePanel>
         <section className='workspace-main'>
-          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
+          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}{view === 'overview' && groupByWorkspace && <span className='workspace-scope-label'>{activeWorkspaceName}</span>}</>}</div>
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
-              {overviewMode === 'list' && !selected && <aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId}
+              {overviewMode === 'list' && !selected && <CollapsiblePanel name='Agent 列表' storageId='agents' keepOpen={Boolean(listDraggingId)} badge={overviewPendingCount}><aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId}
                 draggable title='拖动调整顺序'
                 onDragStart={(event) => {
                   setListActiveId(activeListSessionId)
@@ -1145,7 +1147,7 @@ export default function App(): JSX.Element {
                   setListDraggingId(undefined)
                 }}
                 onDragEnd={() => setListDraggingId(undefined)}
-                onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside>}
+                onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside></CollapsiblePanel>}
               <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
@@ -1177,7 +1179,7 @@ export default function App(): JSX.Element {
           {view === 'audit' && <AuditPage sessions={sessions} onOpenLlmReviewResults={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('results'); setShowLlmReviewSettings(true) }} />}
         </section>
       </div>
-      {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace) => { setActiveWorkspace(workspace); setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
+      {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace, sessionId) => { setActiveWorkspace(workspace); if (sessionId) { setListActiveId(sessionId); setWallActiveId(sessionId); setSelectedId(sessionId); setView('overview') } setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
       {editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}
       {continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}
       {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}

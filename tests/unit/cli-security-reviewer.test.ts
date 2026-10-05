@@ -10,6 +10,8 @@ import {
 } from '../../electron/cli-security-reviewer'
 import { READONLY_CONTEXT_SERVER } from '../../electron/reviewer-readonly-context'
 import type { StoredLlmReviewSettings } from '../../electron/llm-review-settings-store'
+import { LlmSecurityReviewer } from '../../electron/llm-security-reviewer'
+import type { ApprovalRequest } from '../../src/shared/manager-api'
 
 const conclusion = { verdict: 'allow', riskScore: 8, summary: '安全', reasons: ['范围明确'], hazards: [], assumptions: [] }
 const codexOutput = [
@@ -143,6 +145,54 @@ command = "also-do-not-run"
     release.forEach(fn => fn())
     await expectation
     await expect(second).resolves.toBe(JSON.stringify(conclusion))
+  })
+
+  it('queues a third CLI pool review and executes it only after a real reviewer releases capacity', async () => {
+    const completions: Array<() => void> = []
+    const runner = vi.fn<ReviewerProcessRunner>(() => new Promise(resolve => completions.push(() => resolve(codexOutput))))
+    const reviewer = new LlmSecurityReviewer(new CliSecurityReviewer(runner))
+    const request: ApprovalRequest = { requestId: 'fixture', sessionId: 'fixture', displayName: 'fixture', agentKind: 'codex', workspace: directory,
+      source: 'codex-hook', risk: 'unknown', reason: 'fixture', createdAt: 1, canBulkApprove: false, command: 'echo fixture' }
+    const pool = { ...settings, overallTimeoutSeconds: 30, reviewers: [{ id: 'cli-fixture', name: 'CLI fixture', enabled: true, backend: 'codex-cli' as const, cliExecutable: process.execPath }] }
+    const first = reviewer.reviewApproval(request, pool)
+    const second = reviewer.reviewApproval(request, pool)
+    const third = reviewer.reviewApproval(request, pool)
+    await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(2))
+    completions[0]!()
+    // Filesystem setup can let either of the first two reach the transport first.
+    await Promise.race([first, second])
+    await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(3))
+    completions[1]!(); completions[2]!()
+    await expect(second).resolves.toMatchObject({ verdict: 'allow' })
+    await expect(first).resolves.toMatchObject({ verdict: 'allow' })
+    await expect(third).resolves.toMatchObject({ verdict: 'allow', attempts: [expect.objectContaining({ status: 'completed' })] })
+  })
+
+  it('cancels queued CLI work without execution and holds running capacity until shutdown completes', async () => {
+    const completions: Array<() => void> = []
+    const runner = vi.fn<ReviewerProcessRunner>(() => new Promise(resolve => completions.push(() => resolve(codexOutput))))
+    const reviewer = new LlmSecurityReviewer(new CliSecurityReviewer(runner))
+    const request: ApprovalRequest = { requestId: 'fixture', sessionId: 'fixture', displayName: 'fixture', agentKind: 'codex', workspace: directory,
+      source: 'codex-hook', risk: 'unknown', reason: 'fixture', createdAt: 1, canBulkApprove: false, command: 'echo fixture' }
+    const pool = { ...settings, overallTimeoutSeconds: 30, reviewers: [{ id: 'cli-fixture', name: 'CLI fixture', enabled: true, backend: 'codex-cli' as const, cliExecutable: process.execPath }] }
+    const cancelRunning = new AbortController()
+    const first = reviewer.reviewApproval(request, pool, undefined, cancelRunning.signal)
+    const firstRejected = expect(first).rejects.toThrow('取消')
+    const second = reviewer.reviewApproval(request, pool)
+    await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(2))
+    const cancelQueued = new AbortController()
+    const queued = reviewer.reviewApproval(request, pool, undefined, cancelQueued.signal)
+    cancelQueued.abort()
+    await expect(queued).rejects.toThrow('取消')
+    const third = reviewer.reviewApproval(request, pool)
+    cancelRunning.abort()
+    await firstRejected
+    expect(runner).toHaveBeenCalledTimes(2)
+    completions[0]!()
+    await vi.waitFor(() => expect(runner).toHaveBeenCalledTimes(3))
+    completions[1]!(); completions[2]!()
+    await Promise.all([second, third])
+    expect(runner).toHaveBeenCalledTimes(3)
   })
 
   it('rejects shell wrappers or relative executable paths instead of executing a shell', async () => {

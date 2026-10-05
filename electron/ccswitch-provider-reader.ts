@@ -6,7 +6,9 @@ import initSqlJs from 'sql.js'
 import type { Database, SqlJsStatic } from 'sql.js'
 import { parse as parseToml } from 'smol-toml'
 
-import type { AgentConfigInput, CCSwitchProviderSummary } from '../src/shared/manager-api'
+import type { AgentConfigInput, CCSwitchProviderSummary, LlmApiProtocol, LlmReviewerInput } from '../src/shared/manager-api'
+import { resolveLlmApiEndpoint } from './llm-model-catalog'
+import { redactLlmCredentialText } from './llm-response-privacy'
 
 type SupportedAgentKind = 'codex' | 'claude'
 
@@ -21,6 +23,8 @@ export interface CCSwitchProviderRow {
 
 interface ParsedProvider extends CCSwitchProviderSummary {
   apiKey?: string
+  protocol?: LlmApiProtocol
+  anthropicAuth?: 'api-key' | 'bearer'
 }
 
 let sqlPromise: Promise<SqlJsStatic> | undefined
@@ -45,18 +49,22 @@ function validBaseUrl(value: unknown): string | undefined {
   const candidate = nonEmpty(value)
   if (!candidate) return undefined
   try {
-    const parsed = new URL(candidate)
-    return ['http:', 'https:'].includes(parsed.protocol) ? candidate : undefined
+    resolveLlmApiEndpoint(candidate, 'models')
+    return candidate
   } catch {
     return undefined
   }
 }
 
 function parsedResult(row: CCSwitchProviderRow, baseUrl?: string, apiKey?: string, model?: string): ParsedProvider {
+  const variants = apiKey ? [apiKey, encodeURIComponent(apiKey), Buffer.from(apiKey).toString('base64')] : []
+  const safe = (value?: string) => value && !variants.some(secret => value.includes(secret)) ? value : undefined
+  baseUrl = safe(baseUrl)
+  model = safe(model)
   const missing = [!baseUrl ? 'Base URL' : '', !apiKey ? 'API Key' : ''].filter(Boolean)
   return {
     id: row.id,
-    name: row.name,
+    name: safe(row.name) ?? '受保护的 Provider 配置',
     agentKind: row.appType,
     ...(baseUrl ? { baseUrl } : {}),
     ...(model ? { model } : {}),
@@ -72,12 +80,12 @@ function parseClaude(row: CCSwitchProviderRow, settings: Record<string, unknown>
   if (row.id === 'claude-official' && !env.ANTHROPIC_AUTH_TOKEN && !env.ANTHROPIC_API_KEY) {
     return { ...parsedResult(row), issue: '使用 Claude Code 官方登录；请关闭独立配置并确认 CLI 当前登录账号' }
   }
-  return parsedResult(
+  return { ...parsedResult(
     row,
     validBaseUrl(env.ANTHROPIC_BASE_URL) ?? validBaseUrl(row.endpointUrl),
     nonEmpty(env.ANTHROPIC_AUTH_TOKEN) ?? nonEmpty(env.ANTHROPIC_API_KEY),
     nonEmpty(env.ANTHROPIC_MODEL),
-  )
+  ), protocol: 'anthropic-messages', anthropicAuth: nonEmpty(env.ANTHROPIC_AUTH_TOKEN) ? 'bearer' : 'api-key' }
 }
 
 function parseCodex(row: CCSwitchProviderRow, settings: Record<string, unknown>): ParsedProvider {
@@ -90,12 +98,12 @@ function parseCodex(row: CCSwitchProviderRow, settings: Record<string, unknown>)
   const providerId = nonEmpty(config.model_provider)
   const providers = object(config.model_providers) ?? {}
   const provider = providerId ? object(providers[providerId]) : undefined
-  return parsedResult(
+  return { ...parsedResult(
     row,
     validBaseUrl(provider?.base_url) ?? validBaseUrl(row.endpointUrl),
     nonEmpty(auth.OPENAI_API_KEY),
     nonEmpty(config.model),
-  )
+  ), protocol: provider?.wire_api === 'chat' ? 'openai-chat' : 'openai-responses' }
 }
 
 export function parseCCSwitchProvider(row: CCSwitchProviderRow): ParsedProvider {
@@ -115,18 +123,18 @@ export function parseCCSwitchProvider(row: CCSwitchProviderRow): ParsedProvider 
   }
 }
 
-function queryRows(database: Database, agentKind: SupportedAgentKind): CCSwitchProviderRow[] {
+function queryRows(database: Database, agentKind: SupportedAgentKind, providerId?: string): CCSwitchProviderRow[] {
   const statement = database.prepare(`
     SELECT p.id, p.app_type, p.name, p.settings_config, p.is_current,
       (SELECT e.url FROM provider_endpoints e
        WHERE e.provider_id = p.id AND e.app_type = p.app_type
        ORDER BY e.added_at DESC LIMIT 1) AS endpoint_url
     FROM providers p
-    WHERE p.app_type = ?
+    WHERE p.app_type = ? ${providerId === undefined ? '' : 'AND p.id = ?'}
     ORDER BY p.is_current DESC, p.sort_index ASC, p.created_at DESC
   `)
   try {
-    statement.bind([agentKind])
+    statement.bind(providerId === undefined ? [agentKind] : [agentKind, providerId])
     const rows: CCSwitchProviderRow[] = []
     while (statement.step()) {
       const value = statement.getAsObject()
@@ -173,11 +181,16 @@ export class CCSwitchProviderReader {
   constructor(private readonly databasePath?: string, private readonly appPathsFile = defaultAppPathsFile(), private readonly homeDirectory = homedir()) {}
 
   async list(agentKind: SupportedAgentKind): Promise<CCSwitchProviderSummary[]> {
-    return (await this.read(agentKind)).map(({ apiKey: _apiKey, ...summary }) => summary)
+    const providers = await this.read(agentKind)
+    const redact = (text: string): string => providers.reduce((result, provider) => redactLlmCredentialText(result, { apiKey: provider.apiKey }), text)
+    return providers.filter(provider => redact(provider.id) === provider.id)
+      .map(({ apiKey: _apiKey, protocol: _protocol, anthropicAuth: _anthropicAuth, ...summary }) => ({ ...summary,
+        name: redact(summary.name), ...(summary.baseUrl ? { baseUrl: redact(summary.baseUrl) } : {}),
+        ...(summary.model ? { model: redact(summary.model) } : {}) }))
   }
 
   async import(agentKind: SupportedAgentKind, providerId: string): Promise<AgentConfigInput> {
-    const provider = (await this.read(agentKind)).find((item) => item.id === providerId)
+    const provider = (await this.read(agentKind, providerId))[0]
     if (!provider) throw new Error('CCSwitch 中找不到这个 Provider，请刷新后重新选择')
     if (provider.issue || !provider.baseUrl || !provider.apiKey) {
       throw new Error(`${provider.name} 无法导入：${provider.issue ?? '配置不完整'}`)
@@ -194,7 +207,15 @@ export class CCSwitchProviderReader {
     }
   }
 
-  private async read(agentKind: SupportedAgentKind): Promise<ParsedProvider[]> {
+  /** Imports one selected connection; unrelated provider settings are never parsed. */
+  async importForReview(agentKind: SupportedAgentKind, providerId: string): Promise<Omit<LlmReviewerInput, 'id'>> {
+    const provider = (await this.read(agentKind, providerId))[0]
+    if (!provider || provider.issue || !provider.apiKey || !provider.baseUrl) throw new Error('所选 Provider 的 API 配置不完整，请检查后重试')
+    return { name: provider.name.slice(0, 100), enabled: false, backend: 'api', protocol: provider.protocol,
+      anthropicAuth: provider.anthropicAuth, baseUrl: provider.baseUrl, apiKey: provider.apiKey, model: provider.model }
+  }
+
+  private async read(agentKind: SupportedAgentKind, providerId?: string): Promise<ParsedProvider[]> {
     const databasePath = this.databasePath ?? await resolveCCSwitchDatabasePath(this.appPathsFile, this.homeDirectory)
     let bytes: Buffer
     try {
@@ -207,7 +228,7 @@ export class CCSwitchProviderReader {
     const SQL = await sql()
     const database = new SQL.Database(bytes)
     try {
-      return queryRows(database, agentKind).map(parseCCSwitchProvider)
+      return queryRows(database, agentKind, providerId).map(parseCCSwitchProvider)
     } catch (error) {
       throw new Error(`CCSwitch 数据库格式不兼容：${error instanceof Error ? error.message : String(error)}`)
     } finally {

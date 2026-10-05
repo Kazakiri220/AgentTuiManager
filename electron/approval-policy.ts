@@ -1,5 +1,7 @@
-import type { ApprovalRisk, DangerRuleScope, DangerRuleSummary, DangerRuleTestResult } from '../src/shared/manager-api'
-import { executableCode, parseApprovalCommand, type ParsedApprovalCommand } from './approval-command-parser'
+import type { ApprovalInputIssue, ApprovalRisk, DangerRuleScope, DangerRuleSummary, DangerRuleTestResult } from '../src/shared/manager-api'
+import { MAX_APPROVAL_COMMAND_LENGTH, normalizeApprovalInputIssue } from '../src/shared/approval-input'
+import { executableCode, parseApprovalCommand, type ParsedApprovalCommand, type ParsedCommandTokens } from './approval-command-parser'
+import { permissionHookFields } from './permission-hook-input'
 
 export type { ApprovalRisk }
 
@@ -35,6 +37,7 @@ export interface FullAutoApprovalInput {
   inputSummary?: string
   cwd?: string
   inputTruncated?: boolean
+  inputIssue?: ApprovalInputIssue
 }
 
 export interface LocalApprovalAssessment {
@@ -45,7 +48,7 @@ export interface LocalApprovalAssessment {
 }
 
 const LEARNING_THRESHOLD = 3
-const MAX_COMMAND_LENGTH = 16_384
+const MAX_SAVED_COMMAND_LENGTH = 16_384
 
 const BUILT_IN_RULES: Array<{ name: string; pattern: RegExp }> = [
   { name: 'read-only-tool', pattern: /^tool:(?:Read|Glob|Grep|WebFetch|WebSearch)$/i },
@@ -138,9 +141,49 @@ const BUILT_IN_DANGER_RULES: BuiltInDangerRule[] = [
   },
   {
     ...builtInDangerRule('inline-dynamic-execution', '内联代码动态执行', 'eval/exec 会执行运行时生成的代码。', 'python/node eval(...) or exec(...)', /$^/),
-    matchesCode: (parsed) => parsed.code.some(({ language, source }) => /\b(?:eval|exec)\s*\(/.test(executableCode(source, language))),
+    matchesCode: (parsed) => parsed.code.some(({ language, source }) => {
+      let code = executableCode(source, language)
+      if (language === 'javascript') {
+        // A literal RegExp's exec only matches text. Keep arguments and all other
+        // eval/exec calls visible so nested or subsequent side effects still match.
+        code = code.replace(/\/(?:\\.|\[(?:\\.|[^\]\\\r\n])*\]|[^/\\[\r\n])*\/[dgimsuvy]*\s*\.\s*exec\s*\(/g, match => ' '.repeat(match.length))
+      }
+      return /\b(?:eval|exec)\s*\(/.test(code)
+    }),
   },
 ]
+
+/** Exempt only a real non-mutating flag on this command, never words in a path,
+ * an excluded pattern, a quoted PowerShell argument or another subcommand. */
+function isNonMutatingPreview(ruleId: string, command: ParsedCommandTokens | undefined): boolean {
+  if (!command || command.piped) return false
+  const args = command.args
+  if (ruleId === 'git-destructive' && command.name === 'git' && args[0]?.value.toLowerCase() === 'clean') {
+    let dryRun = false
+    for (let index = 1; index < args.length; index++) {
+      const token = args[index]!
+      if (token.value === '--') break
+      if (token.dynamic) return false
+      if (token.value === '--no-dry-run') return false
+      if (token.value === '-e' || token.value === '--exclude') { index++; continue }
+      if (token.value === '--dry-run' || /^-[ndfxXqi]+$/.test(token.value) && token.value.includes('n')) dryRun = true
+    }
+    return dryRun
+  }
+  if (ruleId === 'robocopy-delete-mirror' && command.name === 'robocopy') {
+    // A job file may carry switches not visible in this request.
+    if (args.some(arg => /^\/JOB(?::|$)/i.test(arg.value) || arg.dynamic)) return false
+    return args.some(arg => /^\/L$/i.test(arg.value))
+  }
+  if ((ruleId === 'powershell-recursive-force-remove' || ruleId === 'delete-operation')
+    && /^(?:Remove-Item|Clear-Content)$/i.test(command.name)
+    && /^(?:(?:Microsoft\.PowerShell\.Management)\\)?(?:Remove-Item|Clear-Content)$/i.test(command.executable.raw)) {
+    if (args.some(arg => arg.value === '--%')) return false
+    const flags = args.filter(arg => !arg.quoted && /^-WhatIf(?::|$)/i.test(arg.raw))
+    return flags.length > 0 && flags.every(arg => /^-WhatIf(?::\$true)?$/i.test(arg.raw))
+  }
+  return false
+}
 
 function publicDangerRule(rule: BuiltInDangerRule): DangerRuleSummary {
   const { matcher: _matcher, matchesCode: _matchesCode, ...summary } = rule
@@ -171,7 +214,7 @@ function matchingDangerRules(
       && ((rule.id.startsWith('overwrite-') ? parsed.redirections
         : rule.id === 'critical-windows-files'
           ? [...parsed.redirections, ...parsed.commands.filter((part) => /^(?:Set-Content|Add-Content|Out-File|Copy-Item|Move-Item|Remove-Item|ri)\s/i.test(part))]
-          : parsed.commands).some((command) => rule.matcher.test(command))
+          : parsed.commands).some((command, index) => rule.matcher.test(command) && !isNonMutatingPreview(rule.id, parsed.commandTokens?.[index]))
         || rule.matchesCode?.(parsed)))
     .map(publicDangerRule)
   const lower = command.toLocaleLowerCase('en-US')
@@ -182,8 +225,8 @@ function matchingDangerRules(
   return [...builtIn, ...custom]
 }
 
-function normalizedCommand(command: string): string | undefined {
-  if (!command.trim() || command.length > MAX_COMMAND_LENGTH || command.includes('\0')) return undefined
+function normalizedCommand(command: string, maximum = MAX_APPROVAL_COMMAND_LENGTH): string | undefined {
+  if (!command.trim() || command.length > maximum || command.includes('\0')) return undefined
   const normalized = /[\r\n]/.test(command) ? command : command.trim().replace(/\s+/g, ' ')
   return normalized || undefined
 }
@@ -274,7 +317,7 @@ export class ApprovalPolicyEngine {
 
   noteManualApproval(rawCommand: string | undefined): ApprovalSuggestion | undefined {
     if (rawCommand === undefined) return undefined
-    const command = normalizedCommand(rawCommand)
+    const command = normalizedCommand(rawCommand, MAX_SAVED_COMMAND_LENGTH)
     if (!command || !this.isUserRuleAllowed(command)) return undefined
     const key = command.toLocaleLowerCase('en-US')
     const approvalCount = (this.manualCounts.get(key) ?? 0) + 1
@@ -283,7 +326,7 @@ export class ApprovalPolicyEngine {
   }
 
   addRule(rawCommand: string): void {
-    const command = normalizedCommand(rawCommand)
+    const command = normalizedCommand(rawCommand, MAX_SAVED_COMMAND_LENGTH)
     const dangerRule = command ? this.matchDangerRules(command, 'safe-rule')[0] : undefined
     if (!command || !this.isUserRuleAllowed(command)) {
       throw new Error(dangerRule
@@ -294,7 +337,7 @@ export class ApprovalPolicyEngine {
   }
 
   removeRule(rawCommand: string): void {
-    const command = normalizedCommand(rawCommand)
+    const command = normalizedCommand(rawCommand, MAX_SAVED_COMMAND_LENGTH)
     if (command) this.userRules.delete(command.toLocaleLowerCase('en-US'))
   }
 
@@ -339,7 +382,7 @@ export class ApprovalPolicyEngine {
   }
 
   testDangerCommand(rawCommand: string): DangerRuleTestResult {
-    const command = normalizedCommand(rawCommand)
+    const command = normalizedCommand(rawCommand, MAX_SAVED_COMMAND_LENGTH)
     if (!command) throw new Error('请输入完整命令，最多 16384 个字符')
     return { command, matches: this.matchDangerRules(command) }
   }
@@ -399,18 +442,40 @@ function validToolInput(value: unknown): boolean {
   return true
 }
 
+function inputIssueReason(issue: ApprovalInputIssue): string {
+  const count = issue.actualLength === undefined ? '' : String(issue.actualLength)
+  switch (issue.code) {
+    case 'declared-truncation': return '上游已声明审批输入被截断，需要重新提交完整请求'
+    case 'command-too-long': return `审批命令${count ? '完整长度为 ' + count + ' 个字符，' : ''}超过 ${issue.limit ?? MAX_APPROVAL_COMMAND_LENGTH} 个字符的本地处理上限；请缩短命令或将大块数据保存到文件后引用`
+    case 'invalid-command': return '审批命令为空、不是文本或包含无效字符，需要重新提交完整命令'
+    case 'invalid-command-arguments': return '命令参数数组为空、缺少可执行文件或包含无效参数，需要重新提交完整参数'
+    case 'invalid-path': return '审批目标路径为空、类型无效或包含无效字符，需要重新提交完整路径'
+    case 'path-too-long': return `审批目标路径${count ? '长度为 ' + count + ' 个字符，' : ''}超过 ${issue.limit ?? 4096} 个字符的本地处理上限`
+    case 'too-many-paths': return `审批目标路径${count ? '数量为 ' + count + '，' : ''}超过 ${issue.limit ?? 100} 项的本地处理上限，请拆分请求`
+    case 'invalid-input': return '工具参数包含无效字符或结构，需要重新提交完整请求'
+  }
+}
+
 function assessRequest(
   input: FullAutoApprovalInput,
   customRules: Iterable<CustomDangerRule>,
 ): LocalApprovalAssessment {
   const incomplete = (reasonCode: string, reason: string): LocalApprovalAssessment => ({ status: 'incomplete', reason, reasonCode, matchedRules: [] })
-  if (!validToolInput(input.toolInput) || [input.filePath, ...(input.targetPaths ?? [])].some((path) => path?.includes('\0'))) {
-    return incomplete('invalid-input', '工具参数包含无效字符或结构')
-  }
   const payload = input.toolInput && typeof input.toolInput === 'object' && !Array.isArray(input.toolInput)
     ? input.toolInput as Record<string, unknown>
     : undefined
-  if (input.inputTruncated || payload?.truncated === true || payload?.input_truncated === true || payload?.command_truncated === true) {
+  const declaredIssue = normalizeApprovalInputIssue(input.inputIssue)
+  if (input.inputIssue !== undefined && !declaredIssue) return incomplete('invalid-input', '审批输入诊断结构无效，需要重新提交完整请求')
+  const extractedIssue = permissionHookFields(payload).inputIssue
+  const directIssue = permissionHookFields({
+    ...(input.command !== undefined ? { command: input.command } : {}),
+    ...(input.filePath !== undefined ? { filePath: input.filePath } : {}),
+    ...(input.targetPaths !== undefined ? { targetPaths: input.targetPaths } : {}),
+  }).inputIssue
+  const inputIssue = declaredIssue ?? extractedIssue ?? directIssue
+  if (inputIssue) return incomplete(inputIssue.code, inputIssueReason(inputIssue))
+  if (!validToolInput(input.toolInput)) return incomplete('invalid-input', '工具参数包含无效字符或结构')
+  if (input.inputTruncated) {
     return incomplete('truncated-input', '审批参数已被截断，需要完整请求后再判断')
   }
   let command = input.command
@@ -429,8 +494,8 @@ function assessRequest(
   }
   if (command !== undefined) {
     if (typeof command !== 'string' || !command.trim() || command.includes('\0')) return incomplete('invalid-input', '审批命令为空或包含无效字符')
-    if (command.length > MAX_COMMAND_LENGTH || /(?:\[\s*(?:truncated|截断|内容已截断)\s*\]|<truncated>)\s*$/i.test(command)) {
-      return incomplete('truncated-input', '审批命令超出长度限制或已被截断，需要完整请求后再判断')
+    if (/(?:\[\s*(?:truncated|截断|内容已截断)\s*\]|<truncated>)\s*$/i.test(command)) {
+      return incomplete('truncated-input', '审批命令包含截断标记，需要完整请求后再判断')
     }
   }
   const toolName = input.toolName ?? (command ? /^tool:([A-Za-z][\w-]*)$/i.exec(command)?.[1] : undefined)

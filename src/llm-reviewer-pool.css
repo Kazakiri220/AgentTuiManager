@@ -1,0 +1,14 @@
+.reviewer-pool { grid-column: 1 / -1; border: 1px solid var(--line); border-radius: 8px; padding: 14px; }
+.reviewer-pool p { font-size: 11px; color: var(--muted); line-height: 1.6; margin: 8px 0; }
+.reviewer-pool-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.reviewer-pool-toolbar strong { flex: 1; }
+.reviewer-pool ol { list-style: none; padding: 0; margin: 10px 0; display: grid; gap: 5px; }
+.reviewer-pool li { display: flex; align-items: center; gap: 8px; padding: 6px; border: 1px solid transparent; border-radius: 7px; }
+.reviewer-pool li.selected { border-color: #397860; background: var(--green-soft); }
+.reviewer-pool li > button { border: 1px solid var(--line); border-radius: 5px; padding: 5px 8px; background: transparent; color: inherit; cursor: pointer; }
+.reviewer-pool li > .reviewer-pool-select { flex: 1; text-align: left; min-width: 0; overflow-wrap: anywhere; border: 0; }
+.reviewer-pool-select small { display: block; font-size: 11px; opacity: .7; }
+.reviewer-pool li button:disabled { opacity: .4; cursor: default; }
+.reviewer-pool-import { padding: 10px 0; }
+.reviewer-pool-test { grid-column: 1 / -1; }
+.reviewer-deadline-help { grid-column: 1 / -1; margin: 0; font-size: 11px; line-height: 1.6; color: var(--muted); }

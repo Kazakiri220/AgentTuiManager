@@ -3,7 +3,11 @@ export class AttentionAudioDelivery {
   private ready = false
   private sequence = 0
   private pending = new Map<string, ReturnType<typeof setTimeout>>()
-  constructor(private readonly port: { send(id: string): void; fallback(): void }) {}
+  constructor(private readonly port: {
+    send(id: string): void
+    fallback(): void
+    onDelivery?(outcome: 'renderer_completed' | 'native_fallback'): void
+  }) {}
 
   setReady(ready: boolean): void {
     this.ready = ready
@@ -11,7 +15,7 @@ export class AttentionAudioDelivery {
   }
 
   play(): void {
-    if (!this.ready) { this.port.fallback(); return }
+    if (!this.ready) { this.fallback(); return }
     const id = String(++this.sequence)
     this.pending.set(id, setTimeout(() => this.acknowledge(id, false), 2_000))
     try { this.port.send(id) } catch { this.acknowledge(id, false) }
@@ -23,7 +27,17 @@ export class AttentionAudioDelivery {
     if (!timer) return
     clearTimeout(timer)
     this.pending.delete(id)
-    if (!success) this.port.fallback()
+    if (!success) this.fallback()
+    else this.diagnostic('renderer_completed')
+  }
+
+  private fallback(): void {
+    this.port.fallback()
+    this.diagnostic('native_fallback')
+  }
+
+  private diagnostic(outcome: 'renderer_completed' | 'native_fallback'): void {
+    try { this.port.onDelivery?.(outcome) } catch { /* Diagnostics cannot interrupt reminders. */ }
   }
 
   dispose(): void {

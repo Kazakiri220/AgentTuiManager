@@ -1,12 +1,42 @@
 import { describe, expect, it } from 'vitest'
 
 import { ApprovalPolicyEngine, assessApprovalRequest, classifyApprovalRisk, type FullAutoApprovalInput } from '../../electron/approval-policy'
+import { MAX_APPROVAL_COMMAND_LENGTH } from '../../src/shared/approval-input'
+import { permissionHookFields } from '../../electron/permission-hook-input'
 
 function assess(command: string | undefined, extra: Partial<FullAutoApprovalInput> = {}) {
   return assessApprovalRequest({ command, risk: command ? classifyApprovalRisk(command) : 'unknown', workspace: 'C:\\work', ...extra })
 }
 
 describe('local approval assessment', () => {
+  it.each([
+    'git clean -n', 'git clean -ndx', 'git clean --dry-run -d', 'git -C "C:\\project files" clean -nfdx',
+    'robocopy "C:\\source files" "D:\\target files" /MIR /L', 'robocopy source target /PURGE /l',
+    "Remove-Item -LiteralPath 'C:\\project\\build' -Recurse -Force -WhatIf",
+    "Remove-Item -LiteralPath 'C:\\project\\build' -Recurse -Force -WhatIf:$true",
+    "Clear-Content -LiteralPath 'C:\\project\\fixture.txt' -WhatIf",
+    "node -e \"console.log(/version/.exec('version'))\"",
+    "node -e \"console.log(/[a/b]+/gi.exec('a/b'))\"",
+  ])('does not escalate a definite preview or literal RegExp match: %s', command => {
+    expect(assess(command)).toMatchObject({ status: 'ordinary', matchedRules: [] })
+  })
+
+  it.each([
+    'git clean -fdx', 'git clean -fd -- "folder -n"', 'git clean -fd -e "-n"', 'git clean -n --no-dry-run -fd',
+    'git clean -n; git reset --hard',
+    'robocopy "C:\\source /L" target /MIR', 'robocopy source target /MIR /L /JOB:unknown',
+    'robocopy source target /MIR /L; Remove-Item build -Recurse -Force',
+    "Remove-Item -LiteralPath 'C:\\project\\build' -Recurse -Force -WhatIf:$false",
+    "Remove-Item -LiteralPath 'C:\\project\\build' -Recurse -Force '-WhatIf'",
+    "Remove-Item -LiteralPath 'C:\\project\\build' -Recurse -Force -WhatIf:$preview",
+    "C:\\fixture\\Remove-Item.exe build -Recurse -Force -WhatIf",
+    'Remove-Item build -Recurse -Force -WhatIf; Remove-Item data -Recurse -Force',
+    "node -e \"const cp=require('node:child_process'); cp.exec('echo fixture')\"",
+    "node -e \"console.log(/version/.exec('version')); eval(source)\"",
+    "node -e \"console.log(/version/.exec(require('fs').rmSync('build', {recursive:true})))\"",
+  ])('keeps real mutations, dynamic flags and adjacent dangerous operations reviewable: %s', command => {
+    expect(assess(command).status).toBe('high-risk')
+  })
   it.each([
     ['rm -rf ./build', 'recursive-force-remove'],
     ['env APP_ENV=test rm -rf ./build', 'recursive-force-remove'],
@@ -113,15 +143,46 @@ describe('local approval assessment', () => {
     expect(assess('pwsh -EncodedCommand not-base64!').status).toBe('incomplete')
   })
 
-  it('accepts the full 16384-character limit and fails incomplete rather than allowing invalid requests', () => {
-    expect(assess('echo ' + 'x'.repeat(16_379)).status).toBe('ordinary')
-    for (const command of [undefined, '', ' ', 'echo \0bad', 'echo ' + 'x'.repeat(16_380), 'echo ok\n[truncated]', 'pwsh -Command "unfinished', 'Get-Content a |', 'if ($true) { Get-Location', "python - <<'PY'\nprint('ok')"]) {
+  it('accepts the full 128Ki-character limit and fails incomplete rather than allowing invalid requests', () => {
+    expect(assess('echo ' + 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH - 5)).status).toBe('ordinary')
+    for (const command of [undefined, '', ' ', 'echo \0bad', 'echo ' + 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH - 4), 'echo ok\n[truncated]', 'pwsh -Command "unfinished', 'Get-Content a |', 'if ($true) { Get-Location', "python - <<'PY'\nprint('ok')"]) {
       expect(assess(command).status).toBe('incomplete')
     }
     expect(assess('echo ok', { inputTruncated: true }).status).toBe('incomplete')
     expect(assess('tool:Read', { toolInput: { path: 'file\0.txt' } }).status).toBe('incomplete')
     expect(assess('tool:Shell', { toolName: 'Shell' }).status).toBe('incomplete')
     expect(assess(undefined, { toolName: 'Bash', inputSummary: 'echo...' }).status).toBe('incomplete')
+  })
+
+  it('assesses intact cached JSON writes beyond 16Ki and still finds dangerous tail commands', () => {
+    const payload = JSON.stringify({ results: [{ title: 'fixture', content: 'ordinary cached research '.repeat(900) }] }).replace(/'/g, "''")
+    const command = "Set-Content -LiteralPath '.\\research.json' -Value '" + payload + "' -Encoding utf8"
+    expect(command.length).toBeGreaterThan(16_384)
+    const hook = permissionHookFields({ command })
+    expect(hook.command).toBe(command)
+    expect(assess(command, { ...hook, toolInput: { command } })).toMatchObject({ status: 'ordinary' })
+    expect(assess(command + '; Remove-Item -LiteralPath .\\cache -Recurse -Force').status).toBe('high-risk')
+    const engine = new ApprovalPolicyEngine()
+    expect(engine.noteManualApproval('echo ' + 'x'.repeat(17000))).toBeUndefined()
+    expect(() => engine.addRule('echo ' + 'x'.repeat(17000))).toThrow()
+    expect(() => engine.testDangerCommand(command)).toThrow('16384')
+  })
+
+  it('reports precise safe diagnostics before the legacy truncation flag', () => {
+    const command = 'echo ' + 'x'.repeat(MAX_APPROVAL_COMMAND_LENGTH)
+    const hook = permissionHookFields({ command })
+    const result = assess(undefined, { ...hook, toolInput: { command } })
+    expect(result).toMatchObject({ status: 'incomplete', reasonCode: 'command-too-long' })
+    expect(result.reason).toContain(String(command.length))
+    expect(result.reason).toContain(String(MAX_APPROVAL_COMMAND_LENGTH))
+    expect(result.reason).not.toContain('截断')
+    expect(assess('echo ok', { toolInput: { command_truncated: true } }).reasonCode).toBe('declared-truncation')
+    expect(assess('echo ok', { inputTruncated: true }).reasonCode).toBe('truncated-input')
+    expect(assess('tool:Write', { toolInput: { path: null } }).reasonCode).toBe('invalid-path')
+    expect(assess('tool:Read', { filePath: 'x'.repeat(4097) }).reasonCode).toBe('path-too-long')
+    expect(assess('tool:Shell', { toolInput: { command: ['pwsh', null] } }).reasonCode).toBe('invalid-command-arguments')
+    const issue = { code: 'command-too-long', field: 'command', actualLength: 150000, limit: 131072, message: 'fixture-private-value' } as const
+    expect(assess('echo ok', { inputTruncated: true, inputIssue: issue }).reason).not.toContain('fixture-private-value')
   })
 
   it('assesses complete raw tool arguments instead of a missing shell display summary', () => {

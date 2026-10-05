@@ -8,16 +8,18 @@ import { approvalEnterCount, approvalEnterDelay, errorRecoveryPolicy, parseUnatt
 
 import type { HostHandle, HostMetadataUpdate, HostRecord, SessionHostManager, StartHostOptions } from './session-host-manager'
 import type { HostEvent, HostExitFact } from '../src/shared/protocol'
-import type { AgentConfigSummary, AgentKind, AgentProxySummary, ApprovalRequest, BulkApprovalResult, LlmReviewConclusion, LlmReviewLevel, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
+import type { AgentConfigSummary, AgentKind, AgentProxySummary, ApprovalRequest, BulkApprovalResult, LlmReviewConclusion, LlmReviewLevel, LlmReviewRouting, ManagerEvent, NativeSessionSummary, SessionSummary, StartSessionRequest } from '../src/shared/manager-api'
 import { reduceSession } from '../src/shared/session-state'
 import { createAgentAdapter, extractApprovalCommand, type AgentAdapter, type AgentObservation } from './agent-adapters'
-import type { NativeActivityEvent } from './native-session-activity'
+import type { NativeActivityBinding, NativeActivityBindingPort, NativeActivityEvent, NativeActivitySession } from './native-session-activity'
 import { assessApprovalRequest, canBulkApproveCommand, canFullAutoApprove, type ApprovalDecision, type FullAutoApprovalInput, type LocalApprovalAssessment } from './approval-policy'
+import { approvalInputIssueFields } from '../src/shared/approval-input'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
 import { terminalScrollbackArgs } from './start-request-policy'
 import type { StoredManagedSession } from './managed-session-catalog'
 import { approvalModeOf, isApprovalMode } from '../src/shared/approval-mode'
 import { routeApproval } from './approval-routing'
+import { LlmReviewerPoolError } from './llm-security-reviewer'
 import type { ApprovalMode } from '../src/shared/manager-api'
 
 export interface SessionHostManagerPort {
@@ -114,6 +116,8 @@ interface ManagedSession {
   request?: StartSessionRequest
   handle: HostHandle
   generation: number
+  nativeActivityBinding?: NativeActivityBinding & { generation: number; version: number }
+  nativeActivityBindingAttempt?: number
   recoveryToken: number
   stopRequestVersion?: number
   hostHealthFailures: number
@@ -181,7 +185,7 @@ interface ManagedSession {
   }
 }
 
-interface ApprovalDeliveryContext { generation: number; handle: HostHandle }
+interface ApprovalDeliveryContext { generation: number; handle: HostHandle; modeVersion: number | undefined }
 
 type Emit = (event: ManagerEvent) => void
 
@@ -210,7 +214,7 @@ const TERMINAL_AUTO_APPROVAL_REDRAW_GUARD_MS = 3_000
 const TERMINAL_AUTO_APPROVAL_CONFIRM_MS = 250
 
 type ApprovalReviewSubject = Pick<ApprovalRequest, 'risk'>
-  & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'filePath' | 'targetPaths' | 'dangerRuleId' | 'hookCwd' | 'workspace' | 'toolInput'>>
+  & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'inputIssue' | 'filePath' | 'targetPaths' | 'dangerRuleId' | 'hookCwd' | 'workspace' | 'toolInput'>>
 
 function sameApprovalReviewSubject(
   left: ApprovalReviewSubject,
@@ -221,12 +225,37 @@ function sameApprovalReviewSubject(
     && left.command === right.command
     && left.inputSummary === right.inputSummary
     && left.inputTruncated === right.inputTruncated
+    && JSON.stringify(left.inputIssue) === JSON.stringify(right.inputIssue)
     && left.filePath === right.filePath
     && left.hookCwd === right.hookCwd
     && left.workspace === right.workspace
     && JSON.stringify(left.toolInput) === JSON.stringify(right.toolInput)
     && left.dangerRuleId === right.dangerRuleId
     && JSON.stringify(left.targetPaths ?? []) === JSON.stringify(right.targetPaths ?? [])
+}
+
+/** Legacy adapters may still return human/uncertain conclusions. Normalize the
+ * final decision before publishing it to the queue, audit, or delivery code. */
+function automaticReviewConclusion(conclusion: LlmReviewConclusion): LlmReviewConclusion {
+  if (conclusion.verdict === 'deny' || (conclusion.verdict === 'allow' && conclusion.requiresHumanApproval === false)) {
+    return { ...conclusion, requiresHumanApproval: false }
+  }
+  return {
+    ...conclusion,
+    verdict: 'deny',
+    requiresHumanApproval: false,
+    summary: '审核未给出明确且无需人工确认的批准结论，本次已拒绝；这不表示已确认命令危险。请补全目标、完整参数与副作用说明，或改为只读预览后提交新请求。',
+  }
+}
+
+function unavailableReviewConclusion(reason: string): LlmReviewConclusion {
+  return {
+    verdict: 'deny', requiresHumanApproval: false,
+    // No risk estimate was produced. Failed-status consumers must show the
+    // availability reason rather than interpreting this placeholder as low risk.
+    riskScore: 0, summary: reason, reasons: [reason], hazards: [], assumptions: [],
+    model: 'unavailable', reviewedAt: Date.now(),
+  }
 }
 
 function isTerminalProtocolResponse(data: string): boolean {
@@ -312,27 +341,31 @@ export class SessionController {
     const mode = this.approvalMode(managed)
     // The supervisor owns unattended timing and continuation, not the rule engine.
     if (mode === 'manual' || mode === 'unattended') return
-    const assessment = this.assessRequest(request)
-    const route = routeApproval(mode, assessment)
-    if (assessment.status !== 'ordinary') request.reason = assessment.reason
-    request.dangerRuleId = assessment.matchedRules[0]?.id
-    request.dangerRuleName = assessment.matchedRules[0]?.name
-    if (route === 'review') {
-      this.scheduleLlmReview(managed, request, assessment)
+    let assessment: LocalApprovalAssessment
+    let route: ReturnType<typeof routeApproval>
+    try {
+      assessment = this.assessRequest(request)
+      route = routeApproval(mode, assessment)
+    } catch {
+      await this.rejectAutomaticRequest(managed, request, '本地规则评估未能完成，本次请求未获批准；这不是命令危险性的结论。请检查规则配置后重新提交完整请求')
       return
     }
-    if (route === 'manual') {
-      this.fullAutoActivity?.blocked(request, assessment.reason)
-      this.changed(managed.summary.sessionId)
+    request.reason = assessment.reason
+    request.dangerRuleId = assessment.matchedRules[0]?.id
+    request.dangerRuleName = assessment.matchedRules[0]?.name
+    if (route === 'review' && mode === 'agent-review') {
+      this.scheduleLlmReview(managed, request, assessment)
       return
     }
     const delivery = this.approvalDeliveryContext(managed)
     try {
-      if (route === 'reject') {
-        await this.rejectAutomaticRequest(managed, request, assessment.reason)
-      } else {
+      if (route === 'approve') {
         await this.approveRequest(request.requestId, false)
-        this.reportAutomaticApproval(managed, request)
+        if (this.sameApprovalDelivery(managed, delivery) && !managed.summary.userStopRequested) this.reportAutomaticApproval(managed, request)
+      } else {
+        await this.rejectAutomaticRequest(managed, request, route === 'reject'
+          ? assessment.reason
+          : '自动审批未得到有效的最终处理路径，本次请求已拒绝；请检查审批模式与规则配置后重新提交完整请求')
       }
     } catch {
       await this.stopAfterApprovalDeliveryFailure(managed, request, delivery)
@@ -340,7 +373,7 @@ export class SessionController {
   }
 
   private approvalDeliveryContext(managed: ManagedSession): ApprovalDeliveryContext {
-    return { generation: managed.generation, handle: managed.handle }
+    return { generation: managed.generation, handle: managed.handle, modeVersion: this.approvalModeVersions.get(managed.summary.sessionId) }
   }
 
   private sameApprovalDelivery(managed: ManagedSession, delivery: ApprovalDeliveryContext): boolean {
@@ -353,12 +386,20 @@ export class SessionController {
     if (!this.sameApprovalDelivery(managed, delivery) || managed.hostTransitioning
       || managed.summary.userStopRequested || isTerminalStatus(managed.summary.status)
       || this.approvalMode(managed) === 'manual') return
+    if (this.approvalModeVersions.get(managed.summary.sessionId) !== delivery.modeVersion) {
+      // The old decision must not stop a newly selected automatic mode. Its
+      // failed action has settled; re-route any surviving request in that mode.
+      const current = managed.approvalRequests.find(item => item.requestId === request.requestId)
+      if (current) await this.processApproval(managed, current)
+      return
+    }
     this.fullAutoActivity?.blocked(request, reason)
     const stopping = this.stopSession(managed.summary.sessionId)
     const stopRequestVersion = managed.stopRequestVersion
     await stopping
     // The old host's stop receipt can arrive after a user stop or restart.
     if (!this.sameApprovalDelivery(managed, delivery) || managed.stopRequestVersion !== stopRequestVersion
+      || this.approvalModeVersions.get(managed.summary.sessionId) !== delivery.modeVersion
       || managed.summary.status !== 'stopped' || this.approvalMode(managed) === 'manual') return
     managed.approvalRequests = []
     this.syncApprovalSummary(managed)
@@ -366,12 +407,15 @@ export class SessionController {
     this.changed(managed.summary.sessionId)
   }
 
-  private async rejectAutomaticRequest(managed: ManagedSession, request: ApprovalRequest, reason: string): Promise<void> {
+  private async rejectAutomaticRequest(managed: ManagedSession, request: ApprovalRequest, reason: string, reviewUnavailable = false): Promise<void> {
     const delivery = this.approvalDeliveryContext(managed)
     const message = '自动审批拒绝：' + reason.slice(0, 1400)
-      + '\n本模式不转人工。请依据上述原因补全参数、缩小影响范围或移除危险副作用，再提交实质更安全的新请求；不要原样重试，也不要换壳绕过审核。无法安全继续时结束该步骤并报告原因。'
+      + (reviewUnavailable
+        ? '\n本模式不转人工。请检查审核服务连接、模型和协议配置，恢复后重新提交完整请求；也可改为无需该操作的安全替代方案。服务仍不可用时结束该步骤并报告原因，不要反复重试或绕过审核。'
+        : '\n本模式不转人工。请依据上述原因补全参数、缩小影响范围或移除危险副作用，再提交实质更安全的新请求；不要原样重试，也不要换壳绕过审核。无法安全继续时结束该步骤并报告原因。')
     try {
       await this.rejectRequest(request.requestId, message)
+      if (!this.sameApprovalDelivery(managed, delivery) || managed.summary.userStopRequested) return
       if (request.source === 'terminal') this.scheduleTerminalRejectionCheck(managed, request, delivery)
       this.fullAutoActivity?.rejected?.(request, message)
     } catch {
@@ -507,6 +551,7 @@ export class SessionController {
     private readonly catalog?: ManagedSessionCatalogPort,
     private readonly llmReview?: LlmApprovalReviewPort,
     private readonly unattendedActivity?: (entry: UnattendedAudit) => void,
+    private readonly nativeActivityBinding?: NativeActivityBindingPort,
   ) {
     this.manager = manager
     this.emit = emit
@@ -517,6 +562,49 @@ export class SessionController {
 
   listSessions(): SessionSummary[] {
     return [...this.sessions.values()].map(({ summary }) => this.copySessionSummary(summary))
+  }
+
+  listNativeActivitySessions(): NativeActivitySession[] {
+    return [...this.sessions.values()].map(managed => {
+      const binding = managed.nativeActivityBinding?.generation === managed.generation ? managed.nativeActivityBinding : undefined
+      return { ...this.copySessionSummary(managed.summary), activityGeneration: managed.generation, ...(binding ? {
+        activityNativeSessionId: binding.nativeSessionId, activityTranscriptPath: binding.transcriptPath,
+        activityBindingVersion: binding.version,
+      } : {}) }
+    })
+  }
+
+  isNativeActivitySnapshotCurrent(snapshot: NativeActivitySession): boolean {
+    const managed = this.sessions.get(snapshot.sessionId)
+    if (!managed || managed.summary.nativeSessionId !== snapshot.nativeSessionId
+      || managed.summary.activitySince !== snapshot.activitySince
+      || snapshot.activityGeneration !== undefined && snapshot.activityGeneration !== managed.generation) return false
+    const binding = managed.nativeActivityBinding?.generation === managed.generation ? managed.nativeActivityBinding : undefined
+    return (binding?.version ?? 0) === (snapshot.activityBindingVersion ?? 0)
+      && binding?.nativeSessionId === snapshot.activityNativeSessionId
+      && binding?.transcriptPath === snapshot.activityTranscriptPath
+  }
+
+  private async bindHookNativeActivity(managed: ManagedSession, event: Extract<HostEvent, { type: 'permission-request' }>): Promise<void> {
+    const kind = managed.summary.agentKind
+    if (!this.nativeActivityBinding || (kind !== 'codex' && kind !== 'claude')
+      || event.hookSource !== kind || !event.nativeSessionId || !event.transcriptPath
+      || event.agentId && event.agentId !== event.nativeSessionId
+      || event.agentType && !['main', 'primary', 'root'].includes(event.agentType.toLowerCase())) return
+    const generation = managed.generation
+    const attempt = (managed.nativeActivityBindingAttempt ?? 0) + 1
+    managed.nativeActivityBindingAttempt = attempt
+    try {
+      const binding = await this.nativeActivityBinding.validate(kind,
+        { nativeSessionId: event.nativeSessionId, transcriptPath: event.transcriptPath })
+      if (!binding || this.sessions.get(managed.summary.sessionId) !== managed || managed.generation !== generation
+        || managed.nativeActivityBindingAttempt !== attempt || managed.summary.userStopRequested || isTerminalStatus(managed.summary.status)) return
+      const previous = managed.nativeActivityBinding
+      if (previous?.generation === generation && previous.nativeSessionId === binding.nativeSessionId
+        && previous.transcriptPath === binding.transcriptPath) return
+      managed.nativeActivityBinding = { ...binding, generation, version: (previous?.version ?? 0) + 1 }
+      this.changed(managed.summary.sessionId)
+    } catch { /* Invalid/unavailable metadata never changes activity or approval. */ }
   }
 
   listPendingApprovals(): ApprovalRequest[] {
@@ -554,11 +642,9 @@ export class SessionController {
     return this.required(sessionId).agentReady
   }
 
-  observeNativeActivity(snapshot: SessionSummary, event: NativeActivityEvent): void {
+  observeNativeActivity(snapshot: NativeActivitySession, event: NativeActivityEvent): void {
     const managed = this.sessions.get(snapshot.sessionId)
-    if (!managed
-      || managed.summary.nativeSessionId !== snapshot.nativeSessionId
-      || managed.summary.activitySince !== snapshot.activitySince
+    if (!managed || !this.isNativeActivitySnapshotCurrent(snapshot)
       || event.timestamp < (managed.summary.activitySince ?? 0)) return
     if (event.userMessage) {
       managed.continueKeywordAttempted.clear()
@@ -931,16 +1017,23 @@ export class SessionController {
 
   private performApproval(requestId: string, recordManualApproval: boolean, suppressHookContinue: boolean): Promise<void> {
     const { managed, request } = this.requiredApproval(requestId)
+    const delivery = this.approvalDeliveryContext(managed)
     if (request.source !== 'terminal') {
       this.cancelClaudeTerminalApproval(managed)
       managed.adapter.acknowledgeUserInput(true)
       if (request.source === 'claude-hook') {
         managed.claudeTerminalFallbackBlockedUntil = Date.now() + CLAUDE_TERMINAL_REDRAW_GUARD_MS
+        if (!recordManualApproval && managed.handle.respondToPermissionChecked) {
+          return this.respondToClaudeHookChecked(managed, request.requestId, 'allow').then(() => {
+            if (this.sameApprovalDelivery(managed, delivery)) this.completeApproval(managed, request, false)
+          })
+        }
         this.respondToClaudeHook(managed, request.requestId, 'allow')
       } else {
         const checked = managed.handle.respondToPermissionChecked?.(request.requestId, 'allow')
         if (checked) {
           return checked.then((delivered) => {
+            if (!this.sameApprovalDelivery(managed, delivery)) return
             if (!delivered && suppressHookContinue && !this.unattended.enabled(managed.summary.sessionId)) {
               throw new Error('无监管已关闭，已取消过期 Hook 的终端回退审批')
             }
@@ -1006,7 +1099,9 @@ export class SessionController {
   async approveAllPending(): Promise<BulkApprovalResult> {
     const result: BulkApprovalResult = { approved: 0, skipped: 0, failed: 0, skippedRequestIds: [] }
     for (const request of this.listPendingApprovals()) {
-      if (!(this.approvalPolicy?.canBulkApproveCommand?.(request.command) ?? canBulkApproveCommand(request.command))) {
+      const managed = this.sessions.get(request.sessionId)
+      if (!managed || this.approvalMode(managed) !== 'manual'
+        || !(this.approvalPolicy?.canBulkApproveCommand?.(request.command) ?? canBulkApproveCommand(request.command))) {
         result.skipped += 1
         result.skippedRequestIds.push(request.requestId)
         continue
@@ -1475,6 +1570,9 @@ export class SessionController {
         }
         this.scheduleNativeCapture(managed)
       } else if (event.type === 'permission-request') {
+        // Keep the live transcript binding separate from stable resume identity.
+        // Filesystem validation cannot delay or change the approval decision.
+        void this.bindHookNativeActivity(managed, event)
         managed.agentReady = true
         this.setActivity(managed, 'running')
         this.cancelClaudeTerminalApproval(managed)
@@ -1511,6 +1609,7 @@ export class SessionController {
           ...(event.targetPaths?.length ? { targetPaths: [...event.targetPaths] } : {}),
           ...(event.toolInputSummary ? { inputSummary: event.toolInputSummary } : {}),
           ...(event.inputTruncated ? { inputTruncated: true } : {}),
+          ...approvalInputIssueFields(event.inputIssue),
           ...(event.reason ? { agentReason: event.reason } : {}),
           ...(event.turnId ? { nativeTurnId: event.turnId } : {}),
           ...(event.cwd ? { hookCwd: event.cwd } : {}),
@@ -2301,6 +2400,7 @@ export class SessionController {
 
   private scheduleTerminalRejectionCheck(managed: ManagedSession, request: ApprovalRequest, delivery: ApprovalDeliveryContext): void {
     const current = (): boolean => this.sameApprovalDelivery(managed, delivery) && !managed.hostTransitioning
+      && this.approvalModeVersions.get(managed.summary.sessionId) === delivery.modeVersion
       && !managed.summary.userStopRequested && !isTerminalStatus(managed.summary.status) && this.approvalMode(managed) !== 'manual'
     const timer = setTimeout(() => {
       void (async () => {
@@ -2506,7 +2606,7 @@ export class SessionController {
     reason?: string,
   ): void | Promise<void> {
     if (action === 'deny' && managed.handle.respondToPermissionChecked) {
-      return this.rejectClaudeHookChecked(managed, requestId, reason)
+      return this.respondToClaudeHookChecked(managed, requestId, 'deny', reason)
     }
     const identities = managed.claudeHookIdentities
     const aliases = managed.claudeHookAliases
@@ -2535,7 +2635,7 @@ export class SessionController {
     aliases?.delete(requestId)
   }
 
-  private async rejectClaudeHookChecked(managed: ManagedSession, requestId: string, reason?: string): Promise<void> {
+  private async respondToClaudeHookChecked(managed: ManagedSession, requestId: string, action: 'allow' | 'deny', reason?: string): Promise<void> {
     const delivery = this.approvalDeliveryContext(managed)
     const primaryIdentity = managed.claudeHookIdentities?.get(requestId)
     const deliveredIds = new Set<string>()
@@ -2557,8 +2657,8 @@ export class SessionController {
       if (!remaining.length) break
       for (const id of remaining) {
         if (!this.sameApprovalDelivery(managed, delivery)) return
-        if (!await delivery.handle.respondToPermissionChecked!(id, 'deny', reason)) {
-          throw new Error('Claude 拒绝响应未送达，Hook 已失效')
+        if (!await delivery.handle.respondToPermissionChecked!(id, action, reason)) {
+          throw new Error('Claude 审批响应未送达，Hook 已失效')
         }
         deliveredIds.add(id)
       }
@@ -2566,6 +2666,8 @@ export class SessionController {
       // Pick it up before removing the primary request and its identity.
     }
     for (const id of deliveredIds) {
+      const identity = managed.claudeHookIdentities?.get(id)
+      if (action === 'allow' && identity) this.rememberApprovedClaudeHook(managed, identity, Date.now())
       managed.claudeHookIdentities?.delete(id)
       managed.claudeHookAliases?.delete(id)
     }
@@ -2606,7 +2708,7 @@ export class SessionController {
   private queueApproval(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'inputIssue' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
   ): ApprovalRequest {
     const terminalIndex = input.source === 'terminal'
       ? this.findTerminalApprovalToUpdate(managed, input.command)
@@ -2632,6 +2734,7 @@ export class SessionController {
       ...(input.command ? { command: input.command } : {}),
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.inputTruncated ? { inputTruncated: true } : {}),
+      ...approvalInputIssueFields(input.inputIssue),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
       ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
@@ -2695,7 +2798,7 @@ export class SessionController {
   private approvalForActivity(
     managed: ManagedSession,
     input: Pick<ApprovalRequest, 'requestId' | 'source' | 'risk' | 'reason'>
-      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
+      & Partial<Pick<ApprovalRequest, 'toolName' | 'command' | 'inputSummary' | 'inputTruncated' | 'inputIssue' | 'filePath' | 'targetPaths' | 'agentReason' | 'dangerRuleId' | 'dangerRuleName' | 'nativeTurnId' | 'hookCwd' | 'hookModel' | 'permissionMode' | 'transcriptPath' | 'toolInput' | 'rawPayload'>>,
   ): ApprovalRequest {
     return {
       requestId: input.requestId,
@@ -2712,6 +2815,7 @@ export class SessionController {
       ...(input.command ? { command: input.command } : {}),
       ...(input.inputSummary ? { inputSummary: input.inputSummary } : {}),
       ...(input.inputTruncated ? { inputTruncated: true } : {}),
+      ...approvalInputIssueFields(input.inputIssue),
       ...(input.filePath ? { filePath: input.filePath } : {}),
       ...(input.targetPaths?.length ? { targetPaths: [...input.targetPaths] } : {}),
       ...(input.nativeTurnId ? { nativeTurnId: input.nativeTurnId } : {}),
@@ -2780,14 +2884,19 @@ export class SessionController {
     this.changed(managed.summary.sessionId)
   }
 
+  private async failAutomaticReview(managed: ManagedSession, request: ApprovalRequest, reason: string, routing?: LlmReviewRouting): Promise<void> {
+    request.llmReviewStatus = 'failed'
+    request.llmReviewError = reason
+    request.llmReview = { ...unavailableReviewConclusion(reason), ...routing }
+    this.fullAutoActivity?.reviewFailed?.(request, reason)
+    await this.rejectAutomaticRequest(managed, request, reason, true)
+    this.changed(managed.summary.sessionId)
+  }
+
   private scheduleLlmReview(managed: ManagedSession, request: ApprovalRequest, assessment: LocalApprovalAssessment): void {
     if (this.approvalReviews.has(request.requestId)) return
     if (!this.llmReview?.getSettings().enabled) {
-      request.llmReviewStatus = 'failed'
-      request.llmReviewError = '审核器未启用，本次请求未获批准；这不是命令危险性的结论'
-      this.fullAutoActivity?.reviewFailed?.(request, request.llmReviewError)
-      void this.rejectAutomaticRequest(managed, request, request.llmReviewError)
-      this.changed(managed.summary.sessionId)
+      void this.failAutomaticReview(managed, request, '审核器未启用，本次请求已拒绝；这不是命令危险性的结论')
       return
     }
     const review = { abort: new AbortController() }
@@ -2801,7 +2910,7 @@ export class SessionController {
         || managed.summary.userStopRequested || managed.hostTransitioning || isTerminalStatus(managed.summary.status)
         || managed.generation !== generation || this.approvalMode(managed) !== 'agent-review'
         || this.approvalModeVersions.get(managed.summary.sessionId) !== modeVersion
-        || this.approvalPolicyVersion !== policyVersion || !this.llmReview?.getSettings().enabled) return undefined
+        || this.approvalPolicyVersion !== policyVersion) return undefined
       const current = managed.approvalRequests.find(item => item.requestId === request.requestId)
       return current && sameApprovalReviewSubject(current, snapshot) ? current : undefined
     }
@@ -2810,26 +2919,40 @@ export class SessionController {
     delete request.llmReviewError
     this.fullAutoActivity?.reviewStarted?.(request)
     this.changed(managed.summary.sessionId)
-    void this.llmReview.reviewApproval(snapshot, assessment.reason, review.abort.signal).then(async conclusion => {
+    // A legacy/injected reviewer can throw before returning its promise. Route
+    // synchronous failures through the same denial path as rejected promises.
+    void Promise.resolve().then(() => {
+      if (review.abort.signal.aborted) return undefined
+      return this.llmReview!.reviewApproval(snapshot, assessment.reason, review.abort.signal)
+    }).then(async rawConclusion => {
       const current = currentRequest()
       if (!current) return
+      if (!this.llmReview?.getSettings().enabled) {
+        await this.failAutomaticReview(managed, current, '审核器已停用，本次请求已拒绝；这不是命令危险性的结论')
+        return
+      }
+      let conclusion = automaticReviewConclusion(rawConclusion!)
+      // Reassess before recording the final outcome, so an incomplete request
+      // can never be audited as allowed while receiving a denial.
+      let latestAssessment: LocalApprovalAssessment
+      try { latestAssessment = this.assessRequest(current) } catch {
+        await this.failAutomaticReview(managed, current, '本地规则复核未能完成，本次请求已拒绝；这不是命令危险性的结论。请检查规则配置后重新提交完整请求')
+        return
+      }
+      if (latestAssessment.status === 'incomplete') {
+        conclusion = { ...conclusion, verdict: 'deny', requiresHumanApproval: false, summary: latestAssessment.reason }
+      }
       current.llmReviewStatus = 'completed'
       current.llmReview = conclusion
       this.fullAutoActivity?.reviewed?.(current, conclusion)
-      // Reassess with current rules before committing a response.
-      const latestAssessment = this.assessRequest(current)
-      if (latestAssessment.status === 'incomplete') {
-        await this.rejectAutomaticRequest(managed, current, latestAssessment.reason)
-        return
-      }
       const delivery = this.approvalDeliveryContext(managed)
       try {
-      if (conclusion.verdict === 'allow' && !conclusion.requiresHumanApproval) {
-        await this.approveRequest(current.requestId, false)
-        this.reportAutomaticApproval(managed, current)
-      } else {
-        await this.rejectAutomaticRequest(managed, current, conclusion.summary + '\n' + conclusion.reasons.join('；'))
-      }
+        if (conclusion.verdict === 'allow') {
+          await this.approveRequest(current.requestId, false)
+          if (this.sameApprovalDelivery(managed, delivery) && !managed.summary.userStopRequested) this.reportAutomaticApproval(managed, current)
+        } else {
+          await this.rejectAutomaticRequest(managed, current, conclusion.summary + '\n' + conclusion.reasons.join('；'))
+        }
       } catch {
         await this.stopAfterApprovalDeliveryFailure(managed, current, delivery)
       }
@@ -2837,11 +2960,11 @@ export class SessionController {
     }).catch(async error => {
       const current = currentRequest()
       if (!current) return
-      current.llmReviewStatus = 'failed'
-      current.llmReviewError = error instanceof Error ? error.message : String(error)
-      this.fullAutoActivity?.reviewFailed?.(current, current.llmReviewError)
-      await this.rejectAutomaticRequest(managed, current, '审核服务未能给出有效结论：' + current.llmReviewError + '。本次未执行；审核不可用不代表该命令已被判定危险')
-      this.changed(managed.summary.sessionId)
+      const detail = (error instanceof Error ? error.message : String(error)).slice(0, 800)
+      const routing = error instanceof LlmReviewerPoolError
+        ? { attempts: error.attempts.map(attempt => ({ ...attempt })) }
+        : undefined
+      await this.failAutomaticReview(managed, current, '审核服务未能给出有效结论：' + detail + '。本次已拒绝；审核不可用不代表该命令已被判定危险', routing)
     }).finally(() => {
       if (this.approvalReviews.get(request.requestId) === review) this.approvalReviews.delete(request.requestId)
     })
@@ -2885,6 +3008,7 @@ export class SessionController {
   private copyApprovalRequest(request: ApprovalRequest): ApprovalRequest {
     return {
       ...request,
+      ...approvalInputIssueFields(request.inputIssue),
       ...(request.targetPaths ? { targetPaths: [...request.targetPaths] } : {}),
       ...(request.llmReview ? {
         llmReview: {

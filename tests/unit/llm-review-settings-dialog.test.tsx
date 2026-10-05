@@ -8,13 +8,91 @@ import type { AgentManagerApi, LlmReviewSettingsSummary } from '../../src/shared
 const initial: LlmReviewSettingsSummary = {enabled:false,backend:'api',level:'high',hasApiKey:false,retryCount:0,
   timeoutSeconds:30,scheduledRuleAuditEnabled:false,scheduledRuleAuditHours:24,proxyEnabled:false,
   proxyHost:'127.0.0.1',proxyPort:7897,hasProxyPassword:false,ruleAuditState:{status:'idle'}}
-let api: Pick<AgentManagerApi,'getLlmReviewSettings'|'updateLlmReviewSettings'|'reviewApprovalRules'|'listLlmReviewModels'|'listApprovalRules'>
+let api: Pick<AgentManagerApi,'getLlmReviewSettings'|'updateLlmReviewSettings'|'reviewApprovalRules'|'listLlmReviewModels'|'listApprovalRules'|'testLlmReviewer'|'importLlmReviewer'|'listCCSwitchProviders'>
 beforeEach(()=>{
   api={getLlmReviewSettings:vi.fn(async()=>({...initial})),
     updateLlmReviewSettings:vi.fn(async input=>({...initial,...input,apiKey:undefined,proxyPassword:undefined,hasApiKey:Boolean(input.apiKey)})),
     reviewApprovalRules:vi.fn(async()=>({status:'running' as const,source:'manual' as const})),
-    listLlmReviewModels:vi.fn(async()=>['review-a','review-b']),listApprovalRules:vi.fn(async()=>[])}
+    listLlmReviewModels:vi.fn(async()=>['review-a','review-b']),listApprovalRules:vi.fn(async()=>[]),
+    testLlmReviewer:vi.fn(async()=>({model:'connection-model'})),
+    importLlmReviewer:vi.fn(async()=>({...initial})),listCCSwitchProviders:vi.fn(async()=>[])}
   window.agentManager=api as AgentManagerApi
+})
+
+const pool: LlmReviewSettingsSummary = { ...initial, reviewers: [
+  { id: 'A', name: 'Alpha', enabled: true, backend: 'api', protocol: 'openai-chat', baseUrl: 'https://alpha.example/v1', model: 'alpha-model', hasApiKey: true },
+  { id: 'B', name: 'Beta', enabled: false, backend: 'claude-cli', cliModel: 'claude-fixture', hasApiKey: false },
+] }
+
+describe('reviewer pool settings form', () => {
+  beforeEach(() => {
+    vi.mocked(api.getLlmReviewSettings).mockResolvedValue(pool)
+    vi.mocked(api.updateLlmReviewSettings).mockImplementation(async input => ({ ...initial, ...input, hasApiKey: true,
+      reviewers: input.reviewers?.map(({ apiKey, clearApiKey: _clear, ...entry }) => ({ ...entry, hasApiKey: Boolean(apiKey) || entry.id === 'A' })),
+    }))
+  })
+  it('preserves edits and new secrets per ID while selecting, renaming, disabling and reordering entries', async () => {
+    await open()
+    expect(screen.getByLabelText('API Key')).toHaveValue('')
+    fireEvent.change(screen.getByLabelText('审核器名称'), { target: { value: 'Edited Alpha' } })
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'fictional-draft-secret' } })
+    fireEvent.click(screen.getByRole('button', { name: /2\. Beta/ }))
+    expect(screen.getByLabelText('审核后端')).toHaveValue('claude-cli')
+    fireEvent.change(screen.getByLabelText('审核模型（可选）'), { target: { value: 'updated-cli-model' } })
+    fireEvent.click(screen.getByRole('checkbox', { name: '启用 Beta' }))
+    fireEvent.click(screen.getByRole('button', { name: '上移 Beta' }))
+    fireEvent.click(screen.getByRole('button', { name: /2\. Edited Alpha/ }))
+    expect(screen.getByLabelText('API Key')).toHaveValue('fictional-draft-secret')
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(api.updateLlmReviewSettings).toHaveBeenCalledOnce())
+    expect(vi.mocked(api.updateLlmReviewSettings).mock.calls[0]?.[0].reviewers).toEqual([
+      expect.objectContaining({ id: 'B', enabled: true, cliModel: 'updated-cli-model' }),
+      expect.objectContaining({ id: 'A', name: 'Edited Alpha', apiKey: 'fictional-draft-secret' }),
+    ])
+    await waitFor(() => expect(screen.getByLabelText('API Key')).toHaveValue(''))
+  })
+  it('can add an entry and remove every entry from a disabled pool', async () => {
+    await open()
+    fireEvent.click(screen.getByRole('button', { name: '添加审核器' }))
+    expect(screen.getByLabelText('审核器名称')).toHaveValue('审核器 3')
+    fireEvent.click(screen.getByRole('button', { name: '移除 审核器 3' }))
+    fireEvent.click(screen.getByRole('button', { name: '移除 Alpha' }))
+    fireEvent.click(screen.getByRole('button', { name: '移除 Beta' }))
+    expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(api.updateLlmReviewSettings).toHaveBeenCalledWith(expect.objectContaining({ reviewers: [] })))
+  })
+  it('passes the selected reviewer ID when fetching models and testing a connection', async () => {
+    await open()
+    fireEvent.click(screen.getByRole('button', { name: '获取模型' }))
+    await screen.findByRole('option', { name: 'review-a' })
+    expect(api.listLlmReviewModels).toHaveBeenCalledWith(expect.objectContaining({ reviewers: expect.any(Array) }), 'A')
+    fireEvent.click(screen.getByRole('button', { name: /2\. Beta/ }))
+    fireEvent.click(screen.getByRole('button', { name: '测试连接' }))
+    await screen.findByText('连接正常 · connection-model')
+    expect(api.testLlmReviewer).toHaveBeenCalledWith(expect.objectContaining({ reviewers: expect.any(Array) }), 'B')
+  })
+  it('saves edited drafts before importing only the searched selected Provider ID', async () => {
+    vi.mocked(api.listCCSwitchProviders).mockResolvedValue([
+      { id: 'provider-selected', name: 'Chosen Gateway', agentKind: 'codex', isCurrent: false, hasApiKey: true, model: 'chosen-model' },
+      { id: 'provider-other', name: 'Other Gateway', agentKind: 'codex', isCurrent: true, hasApiKey: true },
+    ])
+    vi.mocked(api.importLlmReviewer).mockResolvedValue({ ...pool, reviewers: [...pool.reviewers!, { id: 'imported', name: 'Chosen Gateway', enabled: false, backend: 'api', protocol: 'openai-responses', baseUrl: 'https://chosen.example', model: 'chosen-model', hasApiKey: true }] })
+    await open()
+    fireEvent.change(screen.getByLabelText('审核器名称'), { target: { value: 'Keep this edit' } })
+    fireEvent.click(screen.getByRole('button', { name: '从 CC Switch 导入' }))
+    await screen.findByRole('button', { name: /Chosen Gateway/ })
+    fireEvent.change(screen.getByLabelText('搜索 CC Switch 配置'), { target: { value: 'chosen-model' } })
+    expect(screen.queryByRole('button', { name: /Other Gateway/ })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /Chosen Gateway/ }))
+    fireEvent.click(screen.getByRole('button', { name: '保存并导入所选配置' }))
+    await waitFor(() => expect(api.importLlmReviewer).toHaveBeenCalledWith({ agentKind: 'codex', providerId: 'provider-selected' }))
+    expect(vi.mocked(api.updateLlmReviewSettings).mock.calls[0]?.[0].reviewers?.[0]?.name).toBe('Keep this edit')
+    expect(vi.mocked(api.updateLlmReviewSettings).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.importLlmReviewer).mock.invocationCallOrder[0]!)
+    await waitFor(() => expect(screen.getByLabelText('API 协议')).toHaveValue('openai-responses'))
+    expect(screen.getByLabelText('API Key')).toHaveValue('')
+    expect(screen.getByRole('checkbox', { name: '启用 Chosen Gateway' })).not.toBeChecked()
+  })
 })
 afterEach(cleanup)
 async function open(){render(<LlmReviewSettingsDialog onClose={()=>{}} />);await waitFor(()=>expect(screen.getByRole('button',{name:'保存设置'})).toBeEnabled())}

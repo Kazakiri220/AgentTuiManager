@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import net from 'node:net'
 import { boundedHookText as boundedText, permissionHookFields } from './permission-hook-input'
+import type { ApprovalInputIssue } from '../src/shared/manager-api'
 
 interface CodexPermissionInput {
   hook_event_name?: unknown
@@ -60,6 +61,7 @@ function permissionDetails(input: CodexPermissionInput): {
   toolInputSummary?: string
   reason?: string
   inputTruncated?: boolean
+  inputIssue?: ApprovalInputIssue
 } {
   const toolName = boundedText(input.tool_name, 256) ?? ''
   const details = objectInput(input)

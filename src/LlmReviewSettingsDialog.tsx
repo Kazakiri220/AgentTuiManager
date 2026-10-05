@@ -1,6 +1,15 @@
 import { type FormEvent, useEffect, useRef, useState } from 'react'
 
-import type { LlmReviewSettingsInput, LlmReviewSettingsSummary, LlmRuleAuditFinding, LlmRuleAuditResult } from './shared/manager-api'
+import type { CCSwitchProviderSummary, LlmReviewerInput, LlmReviewerSummary, LlmReviewSettingsInput, LlmReviewSettingsSummary, LlmRuleAuditFinding, LlmRuleAuditResult } from './shared/manager-api'
+import CCSwitchProviderList from './CCSwitchProviderList'
+import './llm-reviewer-pool.css'
+
+type ReviewerDraft = LlmReviewerInput & { hasApiKey: boolean }
+function fromLegacy(value: LlmReviewSettingsSummary): ReviewerDraft {
+  return { id: 'legacy-reviewer', name: '默认审核器', enabled: true, backend: value.backend ?? 'api',
+    protocol: value.protocol ?? 'openai-chat', anthropicAuth: value.anthropicAuth, baseUrl: value.baseUrl, model: value.model,
+    cliExecutable: value.cliExecutable, cliModel: value.cliModel, hasApiKey: value.hasApiKey }
+}
 
 const DEFAULTS: LlmReviewSettingsSummary = {
   enabled: false,
@@ -40,6 +49,17 @@ function isDangerousFinding(finding: LlmRuleAuditFinding): boolean {
 
 export default function LlmReviewSettingsDialog({ onClose, initialView = 'settings' }: { onClose: () => void; initialView?: 'settings' | 'results' }): JSX.Element {
   const [settings, setSettings] = useState<LlmReviewSettingsSummary>(DEFAULTS)
+  const [reviewers, setReviewers] = useState<ReviewerDraft[]>([])
+  const [poolActive, setPoolActive] = useState(false)
+  const [selectedId, setSelectedId] = useState('')
+  const [importOpen, setImportOpen] = useState(false)
+  const [importKind, setImportKind] = useState<'codex' | 'claude'>('codex')
+  const [providers, setProviders] = useState<CCSwitchProviderSummary[]>([])
+  const [providerId, setProviderId] = useState('')
+  const [providersLoading, setProvidersLoading] = useState(false)
+  const [providerError, setProviderError] = useState('')
+  const [testing, setTesting] = useState(false)
+  const providerRequest = useRef(0)
   const [apiKey, setApiKey] = useState('')
   const [proxyPassword, setProxyPassword] = useState('')
   const [clearApiKey, setClearApiKey] = useState(false)
@@ -65,10 +85,33 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     && typeof window.agentManager.updateLlmReviewSettings === 'function'
     && typeof window.agentManager.reviewApprovalRules === 'function'
 
+  const showReviewer = (entry: ReviewerDraft | LlmReviewerSummary): void => {
+    setSelectedId(entry.id)
+    setSettings(current => ({ ...current, backend: entry.backend, protocol: entry.protocol ?? 'openai-chat',
+      anthropicAuth: entry.anthropicAuth,
+      baseUrl: entry.baseUrl, model: entry.model, hasApiKey: entry.hasApiKey,
+      cliExecutable: entry.cliExecutable, cliModel: entry.cliModel }))
+    setApiKey('apiKey' in entry ? entry.apiKey ?? '' : '')
+    setClearApiKey('clearApiKey' in entry ? Boolean(entry.clearApiKey) : false)
+  }
+
+  const loadSummary = (value: LlmReviewSettingsSummary, preferredId?: string): void => {
+    setSettings(value)
+    if (value.reviewers !== undefined) {
+      setPoolActive(true)
+      const entries = value.reviewers
+      setReviewers(entries)
+      const selected = entries.find(entry => entry.id === preferredId) ?? entries[0]
+      if (selected) showReviewer(selected)
+      else setSelectedId('')
+    }
+    setApiKey(''); setClearApiKey(false)
+  }
+
   useEffect(() => {
     if (!apiAvailable) { setBusy(false); setError('LLM 审查需要重启 Manager 后启用'); return }
     void window.agentManager.getLlmReviewSettings().then((value) => {
-      setSettings(value)
+      loadSummary(value)
       setAuditResult(value.lastRuleAudit)
     }).catch((reason) => setError(readableError(reason))).finally(() => setBusy(false))
   }, [apiAvailable])
@@ -98,9 +141,56 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
   useEffect(() => {
     modelRequest.current += 1
     setModels([]); setModelMessage(''); setModelsLoading(false)
-  }, [settings.backend, settings.baseUrl, apiKey, clearApiKey, settings.proxyEnabled, settings.proxyHost,
+  }, [selectedId, settings.protocol, settings.anthropicAuth, settings.backend, settings.baseUrl, apiKey, clearApiKey, settings.proxyEnabled, settings.proxyHost,
     settings.proxyPort, settings.proxyUsername, proxyPassword, clearProxyPassword])
   useEffect(() => () => { modelRequest.current += 1 }, [])
+
+  const refreshProviders = async (): Promise<void> => {
+    const request = ++providerRequest.current
+    setProvidersLoading(true); setProviderError('')
+    try {
+      const result = await window.agentManager.listCCSwitchProviders(importKind)
+      if (request !== providerRequest.current) return
+      setProviders(result)
+      setProviderId(current => result.some(item => item.id === current) ? current : '')
+    } catch (reason) { if (request === providerRequest.current) setProviderError(readableError(reason)) }
+    finally { if (request === providerRequest.current) setProvidersLoading(false) }
+  }
+  useEffect(() => {
+    if (importOpen) { setProviders([]); setProviderId(''); void refreshProviders() }
+    return () => { providerRequest.current += 1 }
+  }, [importOpen, importKind])
+
+  const currentDraft = (): ReviewerDraft => ({
+    ...(reviewers.find(entry => entry.id === selectedId) ?? fromLegacy(settings)),
+    backend: settings.backend ?? 'api', protocol: settings.protocol ?? 'openai-chat', anthropicAuth: settings.anthropicAuth,
+    baseUrl: settings.baseUrl, model: settings.model, cliExecutable: settings.cliExecutable, cliModel: settings.cliModel,
+    apiKey: apiKey || undefined, clearApiKey, hasApiKey: settings.hasApiKey,
+  })
+  const draftPool = (): ReviewerDraft[] => reviewers.map(entry => entry.id === selectedId ? currentDraft() : entry)
+  const selectReviewer = (id: string): void => {
+    const entries = draftPool()
+    setReviewers(entries)
+    const next = entries.find(entry => entry.id === id)
+    if (next) showReviewer(next)
+  }
+  const addReviewer = (): void => {
+    const entry: ReviewerDraft = { id: crypto.randomUUID(), name: `审核器 ${reviewers.length + 1}`, enabled: true, backend: 'api', protocol: 'openai-chat', hasApiKey: false }
+    setReviewers([...(poolActive ? draftPool() : [currentDraft()]), entry]); setPoolActive(true); showReviewer(entry)
+  }
+  const moveReviewer = (id: string, direction: number): void => {
+    const entries = draftPool(); const index = entries.findIndex(entry => entry.id === id)
+    const target = index + direction
+    if (index < 0 || target < 0 || target >= entries.length) return
+    ;[entries[index], entries[target]] = [entries[target]!, entries[index]!]
+    setReviewers(entries)
+  }
+  const removeReviewer = (id: string): void => {
+    const entries = draftPool().filter(entry => entry.id !== id)
+    setReviewers(entries)
+    if (id === selectedId && entries[0]) showReviewer(entries[0])
+    else if (!entries.length) { setSelectedId(''); setApiKey(''); setClearApiKey(false) }
+  }
 
   const armBackdropClose = (): void => {
     setCloseArmed(true)
@@ -114,6 +204,10 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
   }
 
   const formInput = (): LlmReviewSettingsInput => ({
+        ...(poolActive ? { reviewers: draftPool().map(({ hasApiKey: _hasApiKey, ...entry }) => entry) } : {}),
+        protocol: settings.protocol,
+        anthropicAuth: settings.anthropicAuth,
+        overallTimeoutSeconds: settings.overallTimeoutSeconds ?? 120,
         enabled: settings.enabled,
         backend: settings.backend ?? 'api',
         cliExecutable: settings.cliExecutable,
@@ -138,7 +232,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
   const persistSettings = async (): Promise<void> => {
       if (!apiAvailable) throw new Error('LLM 审查需要重启 Manager 后启用')
       const saved = await window.agentManager.updateLlmReviewSettings(formInput())
-      setSettings(saved); setApiKey(''); setProxyPassword(''); setClearApiKey(false); setClearProxyPassword(false)
+      loadSummary(saved, selectedId); setProxyPassword(''); setClearProxyPassword(false)
       setAuditResult(saved.lastRuleAudit)
   }
 
@@ -156,7 +250,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     saving.current = true; setBusy(true); setError('')
     try {
       if (!apiAvailable) throw new Error('LLM 审查需要重启 Manager 后启用')
-      if ((settings.backend ?? 'api') === 'api') {
+      if (!poolActive && (settings.backend ?? 'api') === 'api') {
         const missing = [!settings.baseUrl?.trim() && 'Base URL',
           (clearApiKey || !apiKey.trim() && !settings.hasApiKey) && 'API Key', !settings.model?.trim() && 'Model'].filter(Boolean)
         if (missing.length) throw new Error('开始审查前，请填写或选择：' + missing.join('、'))
@@ -174,13 +268,40 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     setModelsLoading(true); setModelMessage(''); setError('')
     try {
       if (typeof window.agentManager.listLlmReviewModels !== 'function') throw new Error('获取模型列表需要重启更新后的 Manager')
-      const result = await window.agentManager.listLlmReviewModels(formInput())
+      const result = poolActive ? await window.agentManager.listLlmReviewModels(formInput(), selectedId)
+        : await window.agentManager.listLlmReviewModels(formInput())
       if (request !== modelRequest.current) return
       setModels(result); setManualModel(result.length === 0)
       setModelMessage(result.length ? `已获取 ${result.length} 个模型，请从列表选择。` : '服务未返回可用模型，可以手动输入。')
     } catch (reason) {
       if (request === modelRequest.current) setModelMessage(readableError(reason) + '；也可以手动输入模型。')
     } finally { if (request === modelRequest.current) setModelsLoading(false) }
+  }
+
+  const testConnection = async (): Promise<void> => {
+    if (testing) return
+    const request = ++modelRequest.current
+    setTesting(true); setModelMessage(''); setError('')
+    try {
+      if (!window.agentManager.testLlmReviewer) throw new Error('测试连接需要重启更新后的 Manager')
+      const result = await window.agentManager.testLlmReviewer(formInput(), poolActive ? selectedId : undefined)
+      if (request === modelRequest.current) setModelMessage(`连接正常 · ${result.model}`)
+    } catch (reason) { if (request === modelRequest.current) setModelMessage(readableError(reason)) }
+    finally { setTesting(false) }
+  }
+
+  const importReviewer = async (): Promise<void> => {
+    if (saving.current || !providerId) return
+    saving.current = true; setBusy(true); setError('')
+    try {
+      // The button explicitly saves first, preserving edited entries and their secret drafts.
+      await persistSettings()
+      const saved = await window.agentManager.importLlmReviewer({ agentKind: importKind, providerId })
+      loadSummary(saved, saved.reviewers?.at(-1)?.id)
+      setImportOpen(false)
+      setModelMessage('已导入为停用项，请检查协议和模型后启用并保存。')
+    } catch (reason) { setError(readableError(reason)) }
+    finally { saving.current = false; setBusy(false) }
   }
 
   const openResults = async (): Promise<void> => {
@@ -269,13 +390,35 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     <form className='rules-dialog llm-review-dialog' role='dialog' aria-modal='true' aria-labelledby='llm-review-title' onMouseDown={resetBackdropClose} onSubmit={(event) => { void save(event) }}>
       <header><div><span className='eyebrow'>SECURITY REVIEW</span><h2 id='llm-review-title'>审核器设置</h2></div><span className={'llm-review-state ' + (settings.enabled ? 'enabled' : '')}><i />{settings.enabled ? '审核器已启用' : '审核器已关闭'}</span></header>
       <p className='rules-help'>仅在 Agent 审核模式命中高危规则时调用。按实际影响批准或拒绝；拒绝会反馈给 Agent 修改请求。失败和不确定结论也拒绝，不转人工。</p>
-      <fieldset className='llm-settings-fields' disabled={busy || modelsLoading}>
+      <fieldset className='llm-settings-fields' disabled={busy || modelsLoading || testing}>
 
       <label className='launcher-config-toggle'><span><strong>启用审核器</strong><small>不影响普通、规则自动和无监管模式。</small></span><input type='checkbox' role='switch' checked={settings.enabled} onChange={(event) => setSettings((current) => ({ ...current, enabled: event.target.checked }))} /></label>
+      <section className='reviewer-pool' aria-label='审核器池'>
+        <div className='reviewer-pool-toolbar'><strong>按顺序尝试审核服务</strong><button type='button' className='button-secondary' onClick={addReviewer}>添加审核器</button><button type='button' className='button-secondary' onClick={() => setImportOpen(value => !value)}>从 CC Switch 导入</button></div>
+        <p>连接、超时或响应格式错误时尝试下一项。有效拒绝和不确定结论均立即拒绝，不继续尝试。</p>
+        {poolActive && <ol>{draftPool().map((entry, index) => <li key={entry.id} className={entry.id === selectedId ? 'selected' : ''}>
+          <input type='checkbox' aria-label={`启用 ${entry.name}`} checked={entry.enabled} onChange={event => setReviewers(current => current.map(item => item.id === entry.id ? { ...item, enabled: event.target.checked } : item))} />
+          <button type='button' className='reviewer-pool-select' aria-pressed={entry.id === selectedId} onClick={() => selectReviewer(entry.id)}>{index + 1}. {entry.name}<small>{entry.backend === 'api' ? entry.protocol ?? 'openai-chat' : entry.backend}</small></button>
+          <button type='button' aria-label={`上移 ${entry.name}`} disabled={index === 0} onClick={() => moveReviewer(entry.id, -1)}>↑</button>
+          <button type='button' aria-label={`下移 ${entry.name}`} disabled={index === reviewers.length - 1} onClick={() => moveReviewer(entry.id, 1)}>↓</button>
+          <button type='button' aria-label={`移除 ${entry.name}`} onClick={() => removeReviewer(entry.id)}>移除</button>
+        </li>)}</ol>}
+        {importOpen && <div className='reviewer-pool-import'>
+          <label>CC Switch 类型<select className='launcher-field' value={importKind} onChange={event => setImportKind(event.target.value as 'codex' | 'claude')}><option value='codex'>Codex</option><option value='claude'>Claude</option></select></label>
+          <CCSwitchProviderList providers={providers} selectedId={providerId} loading={providersLoading} error={providerError} disabled={busy} onSelect={provider => setProviderId(provider.id)} onRefresh={() => { void refreshProviders() }} />
+          <p>先保存当前修改，再导入独立的加密配置副本。导入项默认停用，请核对协议和模型。</p>
+          <button type='button' className='button-secondary' disabled={!providerId || providersLoading} onClick={() => { void importReviewer() }}>保存并导入所选配置</button>
+        </div>}
+        {poolActive && reviewers.length > 0 && <label>审核器名称<input className='launcher-field' value={reviewers.find(entry => entry.id === selectedId)?.name ?? ''} onChange={event => setReviewers(current => current.map(entry => entry.id === selectedId ? { ...entry, name: event.target.value } : entry))} /></label>}
+        {poolActive && !reviewers.length && <p>尚未配置审核服务，请添加审核器或从 CC Switch 导入。</p>}
+      </section>
+      {(!poolActive || reviewers.length > 0) && <>
       <label>审核后端<select className='launcher-field' aria-label='审核后端' value={settings.backend ?? 'api'} onChange={event => setSettings(current => ({ ...current, backend: event.target.value as LlmReviewSettingsSummary['backend'] }))}>
         <option value='api'>独立模型 API</option><option value='codex-cli'>Codex 审核 Agent</option><option value='claude-cli'>Claude 审核 Agent</option>
       </select></label>
       {(settings.backend ?? 'api') === 'api' ? <div className='llm-review-fields'>
+        <label>API 协议<select className='launcher-field' value={settings.protocol ?? 'openai-chat'} onChange={event => setSettings(current => ({ ...current, protocol: event.target.value as LlmReviewSettingsSummary['protocol'] }))}><option value='openai-chat'>OpenAI Chat Completions</option><option value='openai-responses'>OpenAI Responses</option><option value='anthropic-messages'>Anthropic Messages</option></select></label>
+        {settings.protocol === 'anthropic-messages' && <label>Anthropic 身份验证<select className='launcher-field' value={settings.anthropicAuth ?? 'api-key'} onChange={event => setSettings(current => ({ ...current, anthropicAuth: event.target.value as 'api-key' | 'bearer' }))}><option value='api-key'>API Key（x-api-key）</option><option value='bearer'>Bearer Token</option></select></label>}
         <label>Base URL<input className='launcher-field' value={settings.baseUrl ?? ''} onChange={event => setSettings(current => ({ ...current, baseUrl: event.target.value }))} placeholder='https://api.example.com/v1' /></label>
         <label>API Key<input className='launcher-field' type='password' autoComplete='off' disabled={clearApiKey} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? '已安全保存，留空保持不变' : '请输入 API Key'} /></label>
         {settings.hasApiKey && <label className='dingtalk-clear-secret'><input type='checkbox' checked={clearApiKey} onChange={event => setClearApiKey(event.target.checked)} />清除已保存的 API Key</label>}
@@ -290,13 +433,18 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
           <button type='button' className='button-secondary' onClick={() => setManualModel(value => !value)}>{manualModel ? '从列表选择' : '手动输入模型'}</button>
           {modelMessage && <p role='status'>{modelMessage}</p>}
         </div>
-        <label>API 失败重试次数<input className='launcher-field' type='number' min={0} max={10} value={settings.retryCount} onChange={event => setSettings(current => ({ ...current, retryCount: Number(event.target.value) }))} /></label>
       </div> : <div className='llm-review-fields'>
         <label>CLI 可执行文件<input className='launcher-field' value={settings.cliExecutable ?? ''} onChange={event => setSettings(current => ({ ...current, cliExecutable: event.target.value }))} placeholder='留空自动查找本机 Codex / Claude' /></label>
         <label>审核模型（可选）<input className='launcher-field' value={settings.cliModel ?? ''} onChange={event => setSettings(current => ({ ...current, cliModel: event.target.value }))} placeholder='留空使用 CLI 配置的模型' /></label>
         <p>使用本机 CLI 的登录或服务商配置。审核 Agent 可只读检查当前项目，不执行待审命令；不兼容的 CLI 版本会报告错误并拒绝本次请求。</p>
       </div>}
+      <div className='reviewer-pool-test'><button type='button' className='button-secondary' onClick={() => { void testConnection() }}>{testing ? '测试中…' : '测试连接'}</button>{(settings.backend ?? 'api') !== 'api' && modelMessage && <p role='status'>{modelMessage}</p>}</div>
+      </>}
       <label>单次审核超时（秒）<input className='launcher-field' type='number' min={5} max={600} value={settings.timeoutSeconds} onChange={event => setSettings(current => ({ ...current, timeoutSeconds: Number(event.target.value) }))} /></label>
+      <label>整体审核时限（秒）<input className='launcher-field' type='number' min={5} max={600} value={settings.overallTimeoutSeconds ?? 120} onChange={event => setSettings(current => ({ ...current, overallTimeoutSeconds: Number(event.target.value) }))} /></label>
+      <label>单个 API 审核器失败重试次数<input className='launcher-field' type='number' min={0} max={10} disabled={poolActive && reviewers.filter(entry => entry.enabled).length > 1} value={settings.retryCount} onChange={event => setSettings(current => ({ ...current, retryCount: Number(event.target.value) }))} /></label>
+      <p className='reviewer-deadline-help'>仅有一个启用的 API 审核器时重试服务故障，每次请求使用单次超时；多个启用项直接按顺序切换。所有重试仍受整体时限约束。</p>
+      <p className='reviewer-deadline-help'>整体时限包含并发等待和所有尝试；达到时限即拒绝，尚未尝试的服务不会继续调用。</p>
 
       <label className='launcher-config-toggle llm-schedule-toggle'><span><strong>定时审查批准规则集合</strong><small>审查只报告问题，不会自动删除或修改规则。</small></span><input type='checkbox' role='switch' checked={settings.scheduledRuleAuditEnabled} onChange={(event) => setSettings((current) => ({ ...current, scheduledRuleAuditEnabled: event.target.checked }))} /></label>
       <label className='llm-audit-interval'>审查周期（小时）<input className='launcher-field' type='number' min={1} max={720} disabled={!settings.scheduledRuleAuditEnabled} value={settings.scheduledRuleAuditHours} onChange={(event) => setSettings((current) => ({ ...current, scheduledRuleAuditHours: Number(event.target.value) }))} /></label>
@@ -315,7 +463,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
       <div className='launcher-config-security'><strong>凭据保护</strong><span>API Key 和代理密码使用 Electron 安全存储加密，不返回页面、不写入审计。</span></div>
       </fieldset>
       {error && <p className='form-error'>{error}</p>}{closeArmed && <p className='launcher-dismiss-hint rules-dismiss-hint'>再点击一次空白处关闭</p>}
-      <footer><button type='button' className='button-secondary' onClick={onClose}>取消</button><button type='submit' className='button-primary' disabled={busy || modelsLoading || !apiAvailable}>{busy ? '请稍后…' : '保存设置'}</button></footer>
+      <footer><button type='button' className='button-secondary' onClick={onClose}>取消</button><button type='submit' className='button-primary' disabled={busy || modelsLoading || testing || !apiAvailable}>{busy ? '请稍后…' : '保存设置'}</button></footer>
     </form>
   </div>
 }

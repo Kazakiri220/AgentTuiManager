@@ -1,10 +1,15 @@
-import { mkdtemp, mkdir, writeFile, appendFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, writeFile, appendFile, rm, rename } from 'node:fs/promises'
+import { promises as fs } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { NativeSessionActivityMonitor, parseNativeActivity, type NativeActivityEvent } from '../../electron/native-session-activity'
 import { sessionDisplayStatus, parseSessionDisplayStatus } from '../../src/shared/session-state'
 import type { SessionSummary } from '../../src/shared/manager-api'
+
+const metadata = (kind: 'codex' | 'claude') => JSON.stringify(kind === 'codex'
+  ? { type: 'session_meta', payload: { id: 'native-one', source: 'cli' } }
+  : { type: 'system', subtype: 'session_start', sessionId: 'native-one' }) + '\n'
 
 function codexQuestion(timestamp: number, id: string, async = false, count = 1) {
   return { timestamp, type: 'response_item', payload: {
@@ -33,7 +38,7 @@ async function questionMonitor(kind: 'codex' | 'claude', rows: unknown[], check:
     session.activityUpdatedAt = Math.max(session.activityUpdatedAt ?? 0, event.timestamp)
   }, { codex: root, claude: root })
   try {
-    await writeFile(path, rows.map(row => JSON.stringify(row) + '\n').join(''))
+    await writeFile(path, metadata(kind) + rows.map(row => JSON.stringify(row) + '\n').join(''))
     await check({ monitor, events, path, session, append: async (...rows) => { await appendFile(path, rows.map(row => JSON.stringify(row) + '\n').join('')) } })
   } finally {
     monitor.stop()
@@ -42,6 +47,66 @@ async function questionMonitor(kind: 'codex' | 'claude', rows: unknown[], check:
 }
 
 describe('native task activity', () => {
+  it.each(['initial', 'append'] as const)('finds a new question before more than 512 KiB of later output: %s scan', async when => {
+    const rows = [codexQuestion(300, 'hidden-call'), { timestamp: 400, type: 'event_msg',
+      payload: { type: 'token_count', padding: 'x'.repeat(600_000) } }]
+    await questionMonitor('codex', when === 'initial' ? rows : [], async ({ monitor, events, append }) => {
+      if (when === 'append') { await monitor.poll(); await append(...rows) }
+      await monitor.poll()
+      expect(events.at(-1)?.pendingUserQuestions?.map(question => question.id)).toEqual(['hidden-call'])
+    })
+  })
+
+  it('carries an incomplete multibyte record across polls without skipping or replaying it', async () => {
+    await questionMonitor('codex', [], async ({ monitor, events, path }) => {
+      const question = codexQuestion(300, 'unicode-call')
+      question.payload.arguments = JSON.stringify({ questions: [{ question: '选择目标？' }] })
+      const bytes = Buffer.from(JSON.stringify(question) + '\n')
+      const split = bytes.indexOf(Buffer.from('选择')) + 1
+      await appendFile(path, bytes.subarray(0, split))
+      await monitor.poll(); expect(events).toHaveLength(0)
+      await appendFile(path, bytes.subarray(split))
+      await monitor.poll()
+      expect(events.at(-1)?.pendingUserQuestions?.[0]?.id).toBe('unicode-call')
+      await monitor.poll(); expect(events).toHaveLength(1)
+    })
+  })
+
+  it('budgets a large scan across ticks, skips oversized records, and publishes only the final actionable snapshot', async () => {
+    await questionMonitor('codex', [codexQuestion(300, 'already-answered'),
+      { padding: 'x'.repeat(9 * 1024 * 1024) }, codexResult(400, 'already-answered'),
+      codexQuestion(500, 'current-question')], async ({ monitor, events }) => {
+      await monitor.poll(); expect(events).toHaveLength(0)
+      await monitor.poll()
+      expect(events).toHaveLength(1)
+      expect(events[0]?.pendingUserQuestions?.map(question => question.id)).toEqual(['current-question'])
+      await monitor.poll(); expect(events).toHaveLength(1)
+    })
+  })
+
+  it('rediscovers replacement content at the same path even when the new file is longer', async () => {
+    await questionMonitor('codex', [codexQuestion(300, 'old-call')], async ({ monitor, events, path }) => {
+      await monitor.poll()
+      await rename(path, path + '.previous')
+      await writeFile(path, metadata('codex') + JSON.stringify(codexQuestion(500, 'new-replacement-call')) + '\n')
+      await monitor.poll()
+      expect(events.at(-1)?.pendingUserQuestions?.map(question => question.id)).toEqual(['new-replacement-call'])
+    })
+  })
+
+  it('discovers the active transcript after more than twenty thousand directory entries', async () => {
+    await questionMonitor('codex', [codexQuestion(300, 'deep-call')], async ({ monitor, events, path }) => {
+      const entries = Array.from({ length: 20_001 }, (_, index) => ({
+        name: 'unrelated-' + index + '.txt', isFile: () => true, isDirectory: () => false,
+      }))
+      entries.push({ name: path.split(/[\\/]/).at(-1)!, isFile: () => true, isDirectory: () => false })
+      const readdir = vi.spyOn(fs, 'readdir').mockResolvedValue(entries as unknown as Awaited<ReturnType<typeof fs.readdir>>)
+      try {
+        await monitor.poll()
+        expect(events.at(-1)?.pendingUserQuestions?.[0]?.id).toBe('deep-call')
+      } finally { readdir.mockRestore() }
+    })
+  })
   it('treats a failed task_complete as an error so overnight recovery uses backoff', () => {
     expect(parseNativeActivity('codex', { timestamp: 1000, type: 'event_msg',
       payload: { type: 'task_complete', error: { message: 'retries exhausted' } } }, 'native-one'))
@@ -116,7 +181,7 @@ describe('native task activity', () => {
       await mkdir(folder, { recursive: true })
       const path = join(folder, 'rollout-test-native-one.jsonl')
       const row = (timestamp: number, type: string) => JSON.stringify({ timestamp, type: 'event_msg', payload: { type } })
-      await writeFile(path, row(100, 'task_complete') + '\n' + row(300, 'task_started') + '\n' + row(400, 'task_complete'))
+      await writeFile(path, metadata('codex') + row(100, 'task_complete') + '\n' + row(300, 'task_started') + '\n' + row(400, 'task_complete'))
       const session = { sessionId: 'manager-one', nativeSessionId: 'native-one',
         agentKind: 'codex', status: 'running', activitySince: 200 } as SessionSummary
       const onActivity = vi.fn()
@@ -344,7 +409,7 @@ describe('native task activity', () => {
         expect(events.at(-1)?.timestamp).toBe(600)
         expect(events.at(-1)?.pendingUserQuestions).toBeUndefined()
         // A truncated/replaced transcript starts fresh rather than retaining stale IDs.
-        await writeFile(path, JSON.stringify({ ...call, timestamp: 700 }) + '\n')
+        await writeFile(path, metadata(kind) + JSON.stringify({ ...call, timestamp: 700 }) + '\n')
         await monitor.poll()
         expect(events.at(-1)?.pendingUserQuestions?.[0]?.id).toBe('resolved')
       })

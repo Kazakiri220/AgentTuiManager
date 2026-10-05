@@ -121,6 +121,9 @@ describe('App terminal wall', () => {
         ruleAuditState: { status: 'idle' as const },
       })),
       listLlmReviewModels: vi.fn(async () => ['review-a', 'review-b']),
+      testLlmReviewer: vi.fn(async () => ({ model: 'review-a' })),
+      importLlmReviewer: vi.fn(),
+      discoverRecentCodexSessions: vi.fn(async () => [{ id: 'codex-1', title: '修复登录流程', updatedAt: 1_786_000_000_000, workspace: 'B:\\chosen\\workspace' }]),
       updateLlmReviewSettings: vi.fn(async (value) => ({
         enabled: value.enabled, level: value.level, baseUrl: value.baseUrl, hasApiKey: Boolean(value.apiKey),
         model: value.model, retryCount: value.retryCount, timeoutSeconds: value.timeoutSeconds,
@@ -1472,6 +1475,107 @@ describe('App terminal wall', () => {
     expect(screen.queryByText(JSON.stringify([finding]))).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '查看完整审查结果' }))
     expect(await screen.findByRole('heading', { name: '批准规则审查结果' })).toBeInTheDocument()
+  })
+
+  it('restores global Codex history without choosing a workspace and searches original directories', async () => {
+    vi.mocked(api.discoverRecentCodexSessions).mockResolvedValue([
+      { id: 'global-a', title: '全局历史 A', workspace: 'D:\\projects\\alpha', updatedAt: Date.now() },
+      { id: 'global-b', title: '全局历史 B', workspace: 'F:\\projects\\beta', updatedAt: Date.now() - 1000 },
+    ])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+    await screen.findByText('全局历史 B')
+    expect(api.chooseWorkspace).not.toHaveBeenCalled()
+    fireEvent.change(screen.getByRole('textbox', { name: '搜索历史会话' }), { target: { value: 'beta' } })
+    expect(screen.queryByText('全局历史 A')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /全局历史 B/ }))
+    expect(screen.getByLabelText('工作区')).toHaveValue('F:\\projects\\beta')
+    fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ workspace: 'F:\\projects\\beta', nativeSessionId: 'global-b', args: ['resume', 'global-b'] })))
+  })
+
+  it('keeps a selected history when returning from provider configuration', async () => {
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+    fireEvent.click(await screen.findByRole('button', { name: /修复登录流程/ }))
+    fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+    await waitFor(() => expect(api.discoverRecentCodexSessions).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole('button', { name: /修复登录流程/ })).toHaveAttribute('aria-pressed', 'true')
+    fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ nativeSessionId: 'codex-1' })))
+  })
+
+  it('focuses an already managed history instead of creating another Agent', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, nativeSessionId: 'native-managed' }])
+    vi.mocked(api.discoverRecentCodexSessions).mockResolvedValue([{ id: 'native-managed', title: '已经运行的历史', workspace: session.workspace, updatedAt: Date.now(), managedSessionId: session.sessionId }])
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+    fireEvent.click(await screen.findByRole('button', { name: /已经运行的历史/ }))
+    fireEvent.click(screen.getByRole('button', { name: '切换到 Agent' }))
+    await screen.findByRole('button', { name: '返回总览' })
+    expect(api.startSession).not.toHaveBeenCalled()
+  })
+
+  it('relocates a missing history directory without losing the selected native session', async () => {
+    vi.mocked(api.discoverRecentCodexSessions).mockResolvedValue([{ id: 'moved-native', title: '目录已移动', workspace: 'D:\\missing-project', updatedAt: Date.now() }])
+    vi.mocked(api.startSession).mockRejectedValueOnce(new Error('工作区目录不存在或无法访问，请选择有效文件夹后重新启动'))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+    fireEvent.click(await screen.findByRole('button', { name: /目录已移动/ }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
+    await screen.findByText(/工作区目录不存在或无法访问/)
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
+    fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
+    await waitFor(() => expect(api.startSession).toHaveBeenLastCalledWith(expect.objectContaining({ workspace: 'B:\\chosen\\workspace', nativeSessionId: 'moved-native' })))
+  })
+
+  it('preserves terminal mounts and active Agent while hovering, hiding and pinning independent panels', async () => {
+    window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'list', groupByWorkspace: false }))
+    const view = render(<App />)
+    await screen.findByRole('button', { name: '切换到 Codex API 重构' })
+    await waitFor(() => expect(Terminal).toHaveBeenCalledTimes(1))
+    const activeCalls = vi.mocked(api.setActiveSession).mock.calls.length
+    const navigation = view.container.querySelector('[data-panel="navigation"]')!
+    const agents = view.container.querySelector('[data-panel="agents"]')!
+    fireEvent.mouseEnter(navigation)
+    await waitFor(() => expect(navigation).toHaveClass('panel-expanded'))
+    fireEvent.click(screen.getByRole('button', { name: '固定导航' }))
+    expect(navigation).toHaveAttribute('data-mode', 'pinned')
+    expect(agents).toHaveAttribute('data-mode', 'rail')
+    fireEvent.click(screen.getByRole('button', { name: '隐藏Agent 列表' }))
+    expect(agents).toHaveAttribute('data-mode', 'hidden')
+    expect(Terminal).toHaveBeenCalledTimes(1)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
+    expect(vi.mocked(api.setActiveSession).mock.calls.length).toBe(activeCalls)
+    expect(view.container.querySelector('.workspace-scope-label')).toBeNull()
+    fireEvent.click(screen.getByRole('switch', { name: '按工作区划分' }))
+    expect(view.container.querySelector('.workspace-scope-label')).toHaveTextContent('api')
+    fireEvent.click(screen.getByRole('button', { name: '统计' }))
+    expect(screen.queryByRole('button', { name: '审计' })).not.toBeInTheDocument()
+    view.unmount()
+    render(<App />)
+    await screen.findByRole('button', { name: '收起导航' })
+    expect(screen.getByRole('button', { name: '统计' })).toHaveAttribute('aria-expanded', 'false')
+  })
+
+  it('shows automatic review progress without manual approval buttons or notification prompts', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, approvalMode: 'agent-review', status: 'needs_approval' }])
+    vi.mocked(api.listPendingApprovals).mockResolvedValue([{ requestId: 'automatic-1', createdAt: Date.now(), sessionId: session.sessionId, displayName: session.displayName, agentKind: 'codex', workspace: session.workspace, command: 'Remove-Item -WhatIf fixture', reason: '需要评估删除范围', risk: 'unknown', canBulkApprove: true, source: 'codex-hook', llmReviewStatus: 'pending' }])
+    render(<App />)
+    await screen.findByText(/LLM 正在审核/)
+    expect(screen.queryByRole('button', { name: '批准' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /处理中心/ }))
+    expect(screen.queryByRole('button', { name: '批准这一次' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '批准全部' })).toBeDisabled()
+    expect(screen.getByText('系统将自动批准或拒绝，无需人工操作')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '通知' }))
+    expect(screen.getByText('当前没有待处理项')).toBeInTheDocument()
   })
 
   it('renders large audit histories in pages of fifty rows', async () => {
