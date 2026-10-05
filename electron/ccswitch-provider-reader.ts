@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 
 import initSqlJs from 'sql.js'
 import type { Database, SqlJsStatic } from 'sql.js'
@@ -69,6 +69,9 @@ function parsedResult(row: CCSwitchProviderRow, baseUrl?: string, apiKey?: strin
 
 function parseClaude(row: CCSwitchProviderRow, settings: Record<string, unknown>): ParsedProvider {
   const env = object(settings.env) ?? {}
+  if (row.id === 'claude-official' && !env.ANTHROPIC_AUTH_TOKEN && !env.ANTHROPIC_API_KEY) {
+    return { ...parsedResult(row), issue: '使用 Claude Code 官方登录；请关闭独立配置并确认 CLI 当前登录账号' }
+  }
   return parsedResult(
     row,
     validBaseUrl(env.ANTHROPIC_BASE_URL) ?? validBaseUrl(row.endpointUrl),
@@ -79,6 +82,9 @@ function parseClaude(row: CCSwitchProviderRow, settings: Record<string, unknown>
 
 function parseCodex(row: CCSwitchProviderRow, settings: Record<string, unknown>): ParsedProvider {
   const auth = object(settings.auth) ?? {}
+  if (!nonEmpty(auth.OPENAI_API_KEY) && (auth.tokens || auth.auth_mode === 'chatgpt')) {
+    return { ...parsedResult(row), issue: '使用 Codex CLI 登录，无法导入为独立 API 配置；请关闭独立配置并确认 CLI 当前登录账号' }
+  }
   const configText = nonEmpty(settings.config)
   const config = configText ? object(parseToml(configText)) ?? {} : {}
   const providerId = nonEmpty(config.model_provider)
@@ -97,14 +103,14 @@ export function parseCCSwitchProvider(row: CCSwitchProviderRow): ParsedProvider 
     const settings = object(JSON.parse(row.settingsConfig))
     if (!settings) throw new Error('配置不是 JSON 对象')
     return row.appType === 'claude' ? parseClaude(row, settings) : parseCodex(row, settings)
-  } catch (error) {
+  } catch {
     return {
       id: row.id,
       name: row.name,
       agentKind: row.appType,
       isCurrent: row.isCurrent,
       hasApiKey: false,
-      issue: `Provider 配置无法解析：${error instanceof Error ? error.message : String(error)}`,
+      issue: 'Provider 配置无法解析，请在 CC Switch 中检查 JSON／TOML 格式',
     }
   }
 }
@@ -139,8 +145,32 @@ function queryRows(database: Database, agentKind: SupportedAgentKind): CCSwitchP
   }
 }
 
+function defaultAppPathsFile(): string {
+  const configRoot = process.platform === 'win32' ? process.env.APPDATA || join(homedir(), 'AppData', 'Roaming')
+    : process.platform === 'darwin' ? join(homedir(), 'Library', 'Application Support')
+      : process.env.XDG_CONFIG_HOME || join(homedir(), '.config')
+  return join(configRoot, 'com.ccswitch.desktop', 'app_paths.json')
+}
+
+/** Follow CC Switch's own directory setting on every refresh/import. */
+export async function resolveCCSwitchDatabasePath(appPathsFile = defaultAppPathsFile(), homeDirectory = homedir()): Promise<string> {
+  let content: string
+  try { content = await readFile(appPathsFile, 'utf8') }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return join(homeDirectory, '.cc-switch', 'cc-switch.db')
+    throw new Error('无法读取 CC Switch 数据目录设置，请检查 app_paths.json 的访问权限')
+  }
+  let settings: Record<string, unknown> | undefined
+  try { settings = object(JSON.parse(content)) } catch { /* Do not echo configuration contents. */ }
+  if (!settings) throw new Error('CC Switch 的 app_paths.json 格式无效，请在 CC Switch 中检查数据目录设置')
+  const override = settings.app_config_dir_override
+  if (override == null || override === '') return join(homeDirectory, '.cc-switch', 'cc-switch.db')
+  if (typeof override !== 'string' || !isAbsolute(override.trim())) throw new Error('CC Switch 自定义数据目录必须是绝对路径')
+  return join(override.trim(), 'cc-switch.db')
+}
+
 export class CCSwitchProviderReader {
-  constructor(private readonly databasePath = join(homedir(), '.cc-switch', 'cc-switch.db')) {}
+  constructor(private readonly databasePath?: string, private readonly appPathsFile = defaultAppPathsFile(), private readonly homeDirectory = homedir()) {}
 
   async list(agentKind: SupportedAgentKind): Promise<CCSwitchProviderSummary[]> {
     return (await this.read(agentKind)).map(({ apiKey: _apiKey, ...summary }) => summary)
@@ -165,12 +195,13 @@ export class CCSwitchProviderReader {
   }
 
   private async read(agentKind: SupportedAgentKind): Promise<ParsedProvider[]> {
+    const databasePath = this.databasePath ?? await resolveCCSwitchDatabasePath(this.appPathsFile, this.homeDirectory)
     let bytes: Buffer
     try {
-      bytes = await readFile(this.databasePath)
+      bytes = await readFile(databasePath)
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
-      if (code === 'ENOENT') throw new Error('未找到 CCSwitch 数据库，请先安装并打开 CCSwitch')
+      if (code === 'ENOENT') throw new Error(`未找到 CCSwitch 数据库：${databasePath}。请检查 CC Switch 当前数据目录`)
       throw new Error(`读取 CCSwitch 数据库失败：${error instanceof Error ? error.message : String(error)}`)
     }
     const SQL = await sql()

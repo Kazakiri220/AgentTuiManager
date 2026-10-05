@@ -310,6 +310,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
         ...(command.filePath ? { filePath: command.filePath } : {}),
         ...(command.targetPaths ? { targetPaths: command.targetPaths } : {}),
         ...(command.toolInputSummary ? { toolInputSummary: command.toolInputSummary } : {}),
+        ...(command.inputTruncated ? { inputTruncated: true } : {}),
         ...(command.reason ? { reason: command.reason } : {}),
         ...(command.toolUseId ? { toolUseId: command.toolUseId } : {}),
         ...(command.agentId ? { agentId: command.agentId } : {}),
@@ -329,7 +330,7 @@ function handleCommand(socket: Socket, command: HostCommand): void {
       const hook = permissionHookSockets.get(command.requestId)
       if (hook && !hook.socket.destroyed) {
         permissionHookSockets.delete(command.requestId)
-        hook.socket.write(`${JSON.stringify({ type: 'permission-response', requestId: command.requestId, action: command.action })}\n`, (error) => {
+        hook.socket.write(`${JSON.stringify({ type: 'permission-response', requestId: command.requestId, action: command.action, ...(command.reason ? { reason: command.reason.slice(0, 2000) } : {}) })}\n`, (error) => {
           send(socket, { type: 'permission-response-ack', requestId: command.requestId, delivered: !error })
           hook.socket.end()
         })

@@ -7,7 +7,7 @@ import { resolveNetworkRetry } from './agent-network-retry'
 import { autoCompactArgs } from '../src/shared/auto-compact'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
-import type { AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
+import type { ApprovalMode, AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
 
 const DEFAULT_TIMEOUT_MS = 5_000
 
@@ -25,6 +25,7 @@ export interface HostRecord {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
   permissionHook?: 'claude' | 'codex'
   pid: number
   endpoint: string
@@ -48,6 +49,7 @@ export interface StartHostOptions {
   agentConfig?: AgentConfigSummary
   agentProxy?: AgentProxySummary
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
   nativeSessionId?: string
   recovery?: RecoveryRecipe
 }
@@ -59,6 +61,7 @@ export interface HostMetadataUpdate {
   agentConfig?: AgentConfigSummary | null
   agentProxy?: AgentProxySummary | null
   fullAutoEnabled?: boolean
+  approvalMode?: ApprovalMode
 }
 
 export interface HostHandle {
@@ -69,8 +72,8 @@ export interface HostHandle {
   write(data: string): void
   resize(cols: number, rows: number): void
   replay(timeoutMs?: number): Promise<string>
-  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void
-  respondToPermissionChecked?(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean>
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): void
+  respondToPermissionChecked?(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): Promise<boolean>
   stop(): Promise<void>
   preserveOnDisconnect?(): Promise<void>
   resumeManagement?(): void
@@ -168,11 +171,11 @@ class PipeHostHandle implements HostHandle {
     return pending.promise.then((event) => event.type === 'replay' ? event.data : '')
   }
 
-  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny'): void {
-    this.send({ type: 'permission-response', requestId, action })
+  respondToPermission(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): void {
+    this.send({ type: 'permission-response', requestId, action, ...(reason ? { reason: reason.slice(0, 2000) } : {}) })
   }
 
-  respondToPermissionChecked(requestId: string, action: 'allow' | 'ask' | 'deny'): Promise<boolean> {
+  respondToPermissionChecked(requestId: string, action: 'allow' | 'ask' | 'deny', reason?: string): Promise<boolean> {
     const previous = this.permissionResponseWaiters.get(requestId)
     if (previous) {
       clearTimeout(previous.timer)
@@ -186,7 +189,7 @@ class PipeHostHandle implements HostHandle {
       }, Math.max(1_000, Math.min(this.timeoutMs, 5_000)))
       this.permissionResponseWaiters.set(requestId, { resolve, timer })
       try {
-        this.send({ type: 'permission-response', requestId, action })
+        this.send({ type: 'permission-response', requestId, action, ...(reason ? { reason: reason.slice(0, 2000) } : {}) })
       } catch {
         clearTimeout(timer)
         this.permissionResponseWaiters.delete(requestId)
@@ -392,6 +395,7 @@ export class SessionHostManager {
       ...(options.agentConfig ? { agentConfig: { ...options.agentConfig, extraArgs: [...options.agentConfig.extraArgs] } } : {}),
       ...(options.agentProxy?.enabled ? { agentProxy: { ...options.agentProxy } } : {}),
       ...(options.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
+      ...(options.approvalMode ? { approvalMode: options.approvalMode } : {}),
       pid: 0,
       endpoint,
       lifecycle: 'starting',
@@ -569,6 +573,7 @@ export class SessionHostManager {
       ...(update.agentConfig === undefined || update.agentConfig === null ? {} : { agentConfig: { ...update.agentConfig, extraArgs: [...update.agentConfig.extraArgs] } }),
       ...(update.agentProxy === undefined || update.agentProxy === null ? {} : { agentProxy: { ...update.agentProxy } }),
       ...(update.fullAutoEnabled === undefined ? {} : { fullAutoEnabled: update.fullAutoEnabled }),
+      ...(update.approvalMode === undefined ? {} : { approvalMode: update.approvalMode }),
       updatedAt: new Date().toISOString(),
     }
     if (update.agentConfig === null) delete updated.agentConfig

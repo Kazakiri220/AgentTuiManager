@@ -1,11 +1,13 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import TerminalTile from './TerminalTile'
+import { playAttentionAudio } from './attention-audio'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
 import SessionContinuationDialog from './SessionContinuationDialog'
 import type { NetworkRetrySettings } from './shared/network-retry'
-import UnattendedControls from './UnattendedControls'
+import ApprovalModeDialog from './ApprovalModeDialog'
+import { APPROVAL_MODE_LABEL, approvalModeOf } from './shared/approval-mode'
 import { useStoppedSessionGrace } from './useStoppedSessionGrace'
 import { SESSION_STATUS_LABEL, sessionDisplayStatus, type SessionDisplayStatus } from './shared/session-state'
 import ApprovalRulesDialog from './ApprovalRulesDialog'
@@ -30,29 +32,6 @@ function AgentLogo({ kind, className = '', label }: { kind: AgentKind; className
   return source ? <img className={className} src={source} alt={label ?? (kind === 'claude' ? 'Claude Code' : kind === 'deepseek' ? 'DeepSeek Harness' : 'Codex')} /> : <span className={className}>{kind === 'pi' ? 'Pi' : kind === 'generic' ? '›_' : 'C'}</span>
 }
 
-function FullAutoDialog({ session, onClose, onChanged }: { session: SessionSummary; onClose: () => void; onChanged: () => void }): JSX.Element {
-  const [confirmed, setConfirmed] = useState(false)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState('')
-  const enabling = !session.fullAutoEnabled
-  const submit = async (): Promise<void> => {
-    setBusy(true); setError('')
-    try {
-      if (typeof window.agentManager.setFullAutoMode !== 'function') throw new Error('全自动模式需要重启 Manager 后启用')
-      await window.agentManager.setFullAutoMode(session.sessionId, enabling)
-      onChanged(); onClose()
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)) }
-    finally { setBusy(false) }
-  }
-  return <div className='modal-backdrop full-auto-backdrop' role='presentation'><section className='full-auto-dialog' role='dialog' aria-modal='true' aria-labelledby='full-auto-title'>
-    <header><div><p className={enabling ? 'detail-kicker delete' : 'detail-kicker read'}>{enabling ? '高风险模式' : '当前已开启'}</p><h2 id='full-auto-title'>{enabling ? '开启全自动模式' : '关闭全自动模式'}</h2></div></header>
-    <div className='full-auto-dialog-body'><p>仅对 <strong>{session.displayName}</strong> 生效。适合你暂时离开、但仍希望 Agent 连续工作的场景。</p>
-      {enabling ? <><div className='full-auto-warning'><strong>除删除和严重危险命令外，其他工具请求都会自动批准</strong><span>操作将直接执行，也可能修改工作区外内容。请先确认 Agent 当前任务和运行环境无误。</span></div><ul><li>删除操作始终需要逐次人工批准</li><li>递归强制删除、提权、下载后执行、敏感文件覆盖和系统破坏命令会被拦截</li><li>Shell 工具未提供完整命令参数时不会自动放行</li><li>每次自动批准和拦截都会写入审计</li></ul><label className='full-auto-confirm'><input type='checkbox' checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} />我了解风险，并确认暂时离开期间允许此 Agent 自动执行普通操作</label></> : <div className='full-auto-safe-note'>关闭后，后续没有命中安全规则的请求会重新进入处理中心。已经执行的操作不会撤销。</div>}
-      <UnattendedControls session={session} onChanged={onChanged} />
-      {error && <p className='form-error'>{error}</p>}
-    </div><footer><button className='button-secondary' type='button' onClick={onClose}>取消</button><button className={enabling ? 'button-danger full-auto-confirm-button' : 'button-primary'} type='button' disabled={busy || (enabling && !confirmed)} onClick={() => { void submit() }}>{busy ? '请稍后…' : enabling ? '开启全自动模式' : '关闭全自动模式'}</button></footer>
-  </section></div>
-}
 
 function workspaceKey(value: string): string {
   return value.replace(/\//g, '\\').replace(/[\\]+$/, '').toLocaleLowerCase('en-US')
@@ -117,12 +96,15 @@ function CCSwitchProviderList({
     <div className='launcher-section-title'><h2>选择 Provider</h2><button type='button' className='button-secondary mini-button' disabled={disabled || loading} onClick={onRefresh}>{loading ? '读取中…' : '刷新'}</button></div>
     {error && <p className='launcher-state error'>读取失败：{error}</p>}
     {!error && !loading && providers.length === 0 && <p className='launcher-state'>没有找到匹配的 Provider</p>}
-    <div className='ccswitch-provider-list'>
+    {!error && !loading && providers.length > 0 && <p className='ccswitch-provider-count'>{providers[0]?.agentKind === 'codex' ? 'Codex' : 'Claude Code'} · 共 {providers.length} 个配置，{providers.filter(provider => !provider.issue).length} 个可导入。滚动查看完整列表。</p>}
+    <div className='ccswitch-provider-list' aria-label='CC Switch 配置列表'>
       {providers.map((provider) => <button
         type='button'
         key={provider.id}
         className={`ccswitch-provider-item${selectedId === provider.id ? ' active' : ''}${provider.issue ? ' invalid' : ''}`}
         disabled={disabled || Boolean(provider.issue)}
+        aria-pressed={selectedId === provider.id}
+        title={provider.issue ? `${provider.name}：${provider.issue}` : provider.name}
         onClick={() => onSelect(provider)}
       >
         <span className='ccswitch-provider-main'><strong>{provider.name}</strong>{provider.isCurrent && <em>当前</em>}<small>{providerHost(provider.baseUrl)}</small></span>
@@ -843,6 +825,7 @@ export default function App(): JSX.Element {
   const [overviewMode, setOverviewMode] = useState<'wall' | 'list'>(initialOverviewPreferences.current.overviewMode)
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
   const [listActiveId, setListActiveId] = useState<string>()
+  const [wallActiveId, setWallActiveId] = useState<string>()
   const [statusFilter, setStatusFilter] = useState<SessionDisplayStatus[]>(initialOverviewPreferences.current.statusFilter ?? [])
   const [activeWorkspace, setActiveWorkspace] = useState<string | undefined>(initialOverviewPreferences.current.activeWorkspace)
   const [sessionOrder, setSessionOrder] = useState<string[]>(initialOverviewPreferences.current.sessionOrder ?? [])
@@ -929,6 +912,8 @@ export default function App(): JSX.Element {
     reloadInFlight.current = pending
     return pending
   }, [])
+
+  useEffect(() => window.agentManager.onAttentionSound?.(playAttentionAudio), [])
 
   useEffect(() => {
     void reload()
@@ -1020,6 +1005,13 @@ export default function App(): JSX.Element {
   const overviewSessionIds = useMemo(() => new Set(overviewSessions.map((session) => session.sessionId)), [overviewSessions])
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
+  const hasAttentionOverlay = showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety
+    || showDingTalkSettings || showLlmReviewSettings || Boolean(fullAutoSessionId || continuationSource) || showNotifications
+  const activeSoundSessionId = view !== 'overview' || hasAttentionOverlay ? undefined : selected?.sessionId
+    ?? (overviewMode === 'list' ? activeListSessionId : wallActiveId && overviewSessionIds.has(wallActiveId) ? wallActiveId : undefined)
+  useEffect(() => {
+    void window.agentManager.setActiveSession?.(activeSoundSessionId ?? null)?.catch(() => undefined)
+  }, [activeSoundSessionId])
   const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
   const pendingCount = useMemo(() => approvals.filter((request) => currentWorkspace && workspaceKey(request.workspace) === workspaceKey(currentWorkspace)).length
     + visibleSessions.filter((session) => session.status === 'needs_attention').length, [approvals, currentWorkspace, visibleSessions])
@@ -1088,7 +1080,7 @@ export default function App(): JSX.Element {
         <button type='button' className='button-secondary' onClick={() => setSelectedId(undefined)} aria-label='返回总览'>← 返回总览</button>
         <strong>{selected.displayName}</strong>
         <span>{selected.agentKind.toUpperCase()} · {selected.workspace}</span>
-        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled || selected.unattended?.enabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{selected.unattended?.enabled ? '无监管中' : selected.fullAutoEnabled ? '全自动中' : '全自动模式'}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
+        <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled || selected.unattended?.enabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{APPROVAL_MODE_LABEL[approvalModeOf(selected)]}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
       </div> : <header className='topbar'>
         <div className='brand-block'><img src={managerLogoUrl} alt='Agent TUI Manager' /></div>
         <div className='app-title'><strong>Agent TUI Manager</strong><small title={groupByWorkspace ? currentWorkspace : '全部工作区'}>{groupByWorkspace ? currentWorkspace ?? '尚未选择工作区' : '全部工作区'}</small></div>
@@ -1128,7 +1120,7 @@ export default function App(): JSX.Element {
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
           <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>
+          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>审核器设置</span></button>
         </nav>
         <section className='workspace-main'>
           <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
@@ -1157,6 +1149,9 @@ export default function App(): JSX.Element {
               <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{mountedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
+                approval={approvals.find((request) => request.sessionId === session.sessionId)}
+                active={activeSoundSessionId === session.sessionId}
+                onActivate={() => setWallActiveId(session.sessionId)}
                 detail={Boolean(selected)}
                 embedded={overviewMode === 'list' && !selected}
                 hidden={!selected && (!overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId)}
@@ -1190,7 +1185,7 @@ export default function App(): JSX.Element {
       {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}
       {showDingTalkSettings && <DingTalkSettingsDialog onClose={() => setShowDingTalkSettings(false)} />}
       {showLlmReviewSettings && <LlmReviewSettingsDialog initialView={llmReviewInitialView} onClose={() => setShowLlmReviewSettings(false)} />}
-      {fullAutoSession && <FullAutoDialog session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}
+      {fullAutoSession && <ApprovalModeDialog onConfigureReviewer={() => { setFullAutoSessionId(undefined); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }} session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}
     </main>
   )
 }

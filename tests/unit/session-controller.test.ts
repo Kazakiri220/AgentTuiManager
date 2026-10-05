@@ -7,6 +7,7 @@ import type { HostHandle, HostRecord, StartHostOptions } from '../../electron/se
 import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
 import { parseNativeActivity } from '../../electron/native-session-activity'
+import { sessionDisplayStatus } from '../../src/shared/session-state'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
@@ -446,10 +447,10 @@ describe('SessionController recovery evidence', () => {
           : 'Would you like to run the following command?\r\n$ Remove-Item important.txt\r\n1. Yes, proceed\r\n2. No') })
       }
       await vi.advanceTimersByTimeAsync(4000)
-      expect(handle.writes).toEqual(scenario === 'user-input' ? ['\r', 'x'] : ['\r'])
+      expect(handle.writes).toEqual(scenario === 'user-input' ? ['\r', 'x'] : scenario === 'next-command' ? ['\r', '\x1b'] : ['\r'])
       expect(activity.approved).toHaveBeenCalledTimes(scenario === 'ready' ? 1 : 0)
       if (scenario === 'next-command') {
-        expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({ command: 'Remove-Item important.txt' })])
+        expect(controller.listPendingApprovals()).toEqual([])
       }
     } finally { vi.useRealTimers() }
   })
@@ -470,7 +471,9 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(800)
       expect(handle.writes).toHaveLength(3)
       await vi.advanceTimersByTimeAsync(2000)
-      expect(controller.listPendingApprovals()).toHaveLength(1)
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      expect(handle.stops).toBe(1)
       await vi.advanceTimersByTimeAsync(5000)
       expect(handle.writes).toHaveLength(3)
     } finally { vi.useRealTimers() }
@@ -540,6 +543,57 @@ describe('SessionController recovery evidence', () => {
     controller.observeNativeActivity(first, { activity: 'completed', timestamp: timestamp + 2 })
     expect(controller.listSessions()[0]).toMatchObject({ status: 'needs_approval', activity: 'completed' })
     expect(handles[0]!.writes).toEqual([])
+  })
+
+  it('accepts task events written before the new host finishes connecting', async () => {
+    let now = 1000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const { controller, manager } = fixture()
+      vi.mocked(manager.start).mockImplementationOnce(async options => {
+        const handle = new FakeHandle('early-task-host')
+        expect(options.initialPrompt).toBe('Synthetic initial task')
+        now = 2000
+        return handle
+      })
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' }, 'Synthetic initial task')
+      expect(manager.start).toHaveBeenCalledOnce()
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 1500 })
+      expect(controller.listSessions()[0]).toMatchObject({ activity: 'running', activitySince: 1000, activityUpdatedAt: 1500 })
+    } finally { clock.mockRestore() }
+  })
+
+  it('lets buffered native tool activity replace provisional readiness without changing approvals or stopped state', async () => {
+    let now = 1000
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now)
+    try {
+      const { controller, handles } = fixture()
+      const session = await controller.startSession({ ...request(), nativeSessionId: 'native-one' })
+      now = 3000
+      handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+      await settle()
+      expect(controller.listSessions()[0]?.activity).toBe('idle')
+      const toolCall = parseNativeActivity('codex', { timestamp: 2000, type: 'response_item',
+        payload: { type: 'custom_tool_call', name: 'functions.exec', call_id: 'tool-1', input: 'synthetic' } }, 'native-one')!
+      controller.observeNativeActivity(controller.listSessions()[0]!, toolCall)
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('running')
+      expect(controller.listSessions()[0]?.activityUpdatedAt).toBe(2000)
+
+      controller.observeNativeActivity(session, { activity: 'completed', timestamp: 4000 })
+      handles[0]!.emit({ type: 'output', data: 'Synthetic tool output\r\n›\r\n' })
+      await settle()
+      controller.observeNativeActivity(session, toolCall)
+      expect(controller.listSessions()[0]?.activity).toBe('completed')
+
+      handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'activity-approval', toolName: 'Bash', command: 'npm run test' })
+      await settle()
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 5000 })
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('needs_approval')
+      await controller.stopSession(session.sessionId)
+      controller.observeNativeActivity(session, { activity: 'running', timestamp: 6000 })
+      expect(sessionDisplayStatus(controller.listSessions()[0]!)).toBe('stopped')
+      expect(handles[0]!.writes).toEqual([])
+    } finally { clock.mockRestore() }
   })
 
   it('still refuses to restart an unbound native session without a recovery recipe', async () => {
@@ -889,11 +943,13 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession(request())
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'output', data: '$ git status --short\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
     await settle()
     expect(base.handles[0]!.writes).toEqual(['\r'])
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
 
+    await controller.setApprovalMode(session.sessionId, 'manual')
     base.handles[0]!.emit({ type: 'output', data: 'command completed' })
     await settle()
     base.handles[0]!.emit({ type: 'output', data: '$ Remove-Item -Recurse build\r\nWould you like to run the following command?\r\n1. Yes, proceed\r\n2. No' })
@@ -987,6 +1043,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession(request())
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'output', data: '\x1b]9;Approval requested: git status --short\x07' })
     await settle()
     expect(controller.listSessions().find((item) => item.sessionId === session.sessionId)?.status).toBe('running')
@@ -1001,6 +1058,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'read-1', toolName: 'Read' })
     await settle()
     expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'read-1', action: 'allow' }])
@@ -1248,12 +1306,12 @@ describe('SessionController recovery evidence', () => {
       base.handles[0]!.emit({ type: 'output', data: prompt })
       await vi.advanceTimersByTimeAsync(1_000)
       expect(base.handles[0]!.writes).toEqual(['\r'])
-      expect(activity.approved).not.toHaveBeenCalled()
+      expect(activity.approved).toHaveBeenCalledTimes(1)
 
       base.handles[0]!.emit({ type: 'output', data: prompt })
       await vi.advanceTimersByTimeAsync(1_000)
       expect(base.handles[0]!.writes).toEqual(['\r'])
-      expect(activity.approved).not.toHaveBeenCalled()
+      expect(activity.approved).toHaveBeenCalledTimes(1)
       expect(controller.listPendingApprovals()).toEqual([])
     } finally {
       vi.useRealTimers()
@@ -1425,6 +1483,7 @@ describe('SessionController recovery evidence', () => {
     const base = fixture()
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine())
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    await controller.setApprovalMode(session.sessionId, 'rules-auto')
     base.handles[0]!.emit({
       type: 'permission-request',
       requestId: 'bash-ls-1',
@@ -1524,9 +1583,9 @@ describe('SessionController recovery evidence', () => {
     expect(controller.listPendingApprovals()).toEqual([])
   })
 
-  it('auto-approves an in-workspace edit after full-auto is enabled and preserves deletion requests', async () => {
+  it('auto-approves an in-workspace edit after full-auto is enabled and denies deletion requests', async () => {
     const base = fixture()
-    const activity = { approved: vi.fn(), blocked: vi.fn() }
+    const activity = { approved: vi.fn(), blocked: vi.fn(), rejected: vi.fn() }
     const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, activity)
     const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
     await controller.setFullAutoMode(session.sessionId, true)
@@ -1541,11 +1600,11 @@ describe('SessionController recovery evidence', () => {
     })
     await settle()
 
-    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-auto', action: 'allow' }])
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'edit-auto', action: 'allow' }, { requestId: 'delete-blocked', action: 'deny' }])
     expect(activity.approved).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'edit-auto', agentReason: '更新界面' }))
-    expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
-    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual(['delete-blocked'])
-    expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { fullAutoEnabled: true })
+    expect(activity.rejected).toHaveBeenCalledWith(expect.objectContaining({ requestId: 'delete-blocked' }), expect.stringContaining('删除'))
+    expect(controller.listPendingApprovals().map((item) => item.requestId)).toEqual([])
+    expect(base.manager.updateMetadata).toHaveBeenCalledWith('host-1', { approvalMode: 'rules-auto', fullAutoEnabled: true })
   })
 
   it('auto-approves ordinary Claude tools without a saved rule or target path', async () => {
@@ -1565,7 +1624,7 @@ describe('SessionController recovery evidence', () => {
     expect(activity.approved).toHaveBeenCalledTimes(2)
   })
 
-  it('does not report a full-auto socket write as confirmed approval and restores a stuck modal', async () => {
+  it('does not report a full-auto socket write as confirmed approval and stops a stuck modal', async () => {
     vi.useFakeTimers()
     try {
       const base = fixture()
@@ -1589,10 +1648,12 @@ describe('SessionController recovery evidence', () => {
       await vi.advanceTimersByTimeAsync(2_000)
       expect(base.handles[0]!.writes).toEqual(['\r', '\r'])
       await vi.advanceTimersByTimeAsync(1_000)
-      expect(controller.listPendingApprovals()).toEqual([expect.objectContaining({
+      expect(controller.listPendingApprovals()).toEqual([])
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      expect(base.handles[0]!.stops).toBe(1)
+      expect(activity.blocked).toHaveBeenCalledWith(expect.objectContaining({
         source: 'terminal', command: 'pnpm --dir frontend build',
-        reason: expect.stringContaining('自动重试已停止'),
-      })])
+      }), expect.stringContaining('重试耗尽'))
       expect(activity.approved).not.toHaveBeenCalled()
       await vi.advanceTimersByTimeAsync(5_000)
       expect(base.handles[0]!.writes).toHaveLength(2)
@@ -1634,8 +1695,8 @@ describe('SessionController recovery evidence', () => {
 
     base.handles[0]!.emit({ type: 'permission-request', requestId: 'inspect-2', toolName: 'InspectResource', operation: 'unknown' })
     await settle()
-    expect(base.handles[0]!.permissionResponses.at(-1)).toEqual({ requestId: 'inspect-2', action: 'allow' })
-    expect(controller.listPendingApprovals()).toEqual([])
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'inspect-1', action: 'allow' }])
+    expect(controller.listPendingApprovals().map(item => item.requestId)).toEqual(['inspect-2'])
   })
 
   it('suggests a read-only command after three manual approvals and accepts the exact rule', async () => {

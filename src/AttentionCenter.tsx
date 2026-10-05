@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 
 import type { ApprovalRequest, ApprovalRisk, SessionSummary } from './shared/manager-api'
+import { approvalReviewLabel } from './shared/approval-review-label'
 
 interface AttentionCenterProps {
   sessions: SessionSummary[]
@@ -136,7 +137,7 @@ export default function AttentionCenter({
               onClick={() => setSelectedKey(item.key)}
             >
               <i className='severity' />
-              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{item.request.llmReviewStatus === 'pending' ? 'LLM 审查中' : risk.label}</em></span>
+              <span><span className='queue-top'><strong>{item.request.displayName}</strong><em>{item.request.llmReviewStatus ? approvalReviewLabel(item.request) : risk.label}</em></span>
                 <span className='queue-command'>{item.request.toolName ? item.request.toolName + ' · ' : ''}{approvalDisplay(item.request)}</span>
                 <span className='queue-meta'>{item.request.agentKind.toUpperCase()} · {item.request.workspace}{item.request.dangerRuleName ? ' · 命中：' + item.request.dangerRuleName : ''}</span>
               </span>
@@ -216,8 +217,8 @@ function ApprovalDetail({
       <p>{request.reason}</p>
     </div>
     {request.llmReviewStatus && <section className={'llm-approval-review status-' + request.llmReviewStatus}>
-      <header><div><strong>LLM 安全审查</strong><span>{request.llmReviewStatus === 'pending' ? '正在分析命令、路径和环境假设' : request.llmReviewStatus === 'failed' ? '审查失败 · 已转人工' : request.llmReview?.requiresHumanApproval ? '建议人工确认' : '可由全自动模式放行'}</span></div>{request.llmReview && <em>风险 {request.llmReview.riskScore}/100</em>}</header>
-      {request.llmReviewStatus === 'pending' && <p>本地硬规则仍然优先；等待期间不会自动执行。</p>}
+      <header><div><strong>LLM 安全审查</strong><span>{approvalReviewLabel(request)}</span></div>{request.llmReview && <em>风险 {request.llmReview.riskScore}/100</em>}</header>
+      {request.llmReviewStatus === 'pending' && <p>正在审查本地规则标记的风险；结论返回前等待处理。</p>}
       {request.llmReviewError && <p>{request.llmReviewError}</p>}
       {request.llmReview && <>
         <h3>{request.llmReview.summary}</h3>
@@ -226,7 +227,7 @@ function ApprovalDetail({
         {request.llmReview.assumptions.length > 0 && <div><strong>路径与环境假设</strong><ul>{request.llmReview.assumptions.map((assumption, index) => <li key={index}>{assumption}</li>)}</ul></div>}
         <footer><span>{request.llmReview.model}</span><span>{new Date(request.llmReview.reviewedAt).toLocaleString('zh-CN')}</span></footer>
       </>}
-      <small>LLM 仅提供安全辅助判断，不能覆盖本地高危规则。</small>
+      <small>Agent 审核模式只放行明确批准的请求；拒绝、不确定或审核失败会拒绝本次请求，并让 Agent 调整方案，不转人工。</small>
     </section>}
     {error && <p className='form-error'>{error}</p>}
     <div className='detail-actions'>

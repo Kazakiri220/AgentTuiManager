@@ -133,6 +133,8 @@ export interface DingTalkSettingsSummary {
 }
 
 export type LlmReviewLevel = 'low' | 'medium' | 'high'
+export type LlmReviewerBackend = 'api' | 'codex-cli' | 'claude-cli'
+export type ApprovalMode = 'manual' | 'agent-review' | 'rules-auto' | 'unattended'
 export type LlmReviewVerdict = 'allow' | 'manual' | 'deny' | 'uncertain'
 export type LlmReviewStatus = 'pending' | 'completed' | 'failed'
 export type LlmRuleAuditStatus = 'idle' | 'running' | 'completed' | 'failed'
@@ -146,6 +148,9 @@ export interface LlmRuleAuditState {
 }
 
 export interface LlmReviewSettingsInput {
+  backend?: LlmReviewerBackend
+  cliExecutable?: string
+  cliModel?: string
   enabled: boolean
   level: LlmReviewLevel
   baseUrl?: string
@@ -192,6 +197,9 @@ export interface LlmRuleAuditResult {
 }
 
 export interface LlmReviewSettingsSummary {
+  backend?: LlmReviewerBackend
+  cliExecutable?: string
+  cliModel?: string
   enabled: boolean
   level: LlmReviewLevel
   baseUrl?: string
@@ -257,6 +265,7 @@ export interface ApprovalRequest {
   toolName?: string
   command?: string
   inputSummary?: string
+  inputTruncated?: boolean
   reason: string
   agentReason?: string
   filePath?: string
@@ -331,6 +340,7 @@ export interface ApprovalRuleSuggestion {
 }
 
 export interface SessionSummary extends SessionState {
+  approvalMode?: ApprovalMode
   displayName: string
   agentKind: AgentKind
   nativeSessionId?: string
@@ -467,6 +477,11 @@ export type ManagerEvent =
   | { type: 'agent-install-progress'; progress: AgentInstallProgress }
 
 export const IPC_CHANNELS = {
+  setActiveSession: 'agent-manager:set-active-session',
+  attentionSound: 'agent-manager:attention-sound',
+  attentionSoundReady: 'agent-manager:attention-sound-ready',
+  attentionSoundResult: 'agent-manager:attention-sound-result',
+  testAttentionSound: 'agent-manager:test-attention-sound',
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
   openDeepSeekWeb: 'agent-manager:open-deepseek-web',
@@ -490,6 +505,7 @@ export const IPC_CHANNELS = {
   renameSession: 'agent-manager:rename-session',
   updateSessionConfig: 'agent-manager:update-session-config',
   updateSessionProxy: 'agent-manager:update-session-proxy',
+  setApprovalMode: 'agent-manager:set-approval-mode',
   setFullAutoMode: 'agent-manager:set-full-auto-mode',
   setUnattendedMode: 'agent-manager:set-unattended-mode',
   saveUnattendedSettings: 'agent-manager:save-unattended-settings',
@@ -518,6 +534,7 @@ export const IPC_CHANNELS = {
   removeDangerRule: 'agent-manager:remove-danger-rule',
   testDangerCommand: 'agent-manager:test-danger-command',
   getLlmReviewSettings: 'agent-manager:get-llm-review-settings',
+  listLlmReviewModels: 'agent-manager:list-llm-review-models',
   updateLlmReviewSettings: 'agent-manager:update-llm-review-settings',
   reviewApprovalRules: 'agent-manager:review-approval-rules',
   chooseWorkspace: 'agent-manager:choose-workspace',
@@ -533,6 +550,9 @@ export const IPC_CHANNELS = {
 } as const
 
 export interface AgentManagerApi {
+  setActiveSession(sessionId: string | null): Promise<void>
+  onAttentionSound(listener: () => Promise<void>): () => void
+  testAttentionSound(): Promise<void>
   readonly platform: NodeJS.Platform
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
@@ -557,6 +577,7 @@ export interface AgentManagerApi {
   renameSession(sessionId: string, displayName: string): Promise<void>
   updateSessionConfig(sessionId: string, config: AgentConfigInput): Promise<void>
   updateSessionProxy(sessionId: string, proxy: AgentProxyInput): Promise<void>
+  setApprovalMode(sessionId: string, mode: ApprovalMode, settings?: UnattendedSettings): Promise<void>
   setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
   setUnattendedMode?(sessionId: string, settings: UnattendedSettings): Promise<void>
   saveUnattendedSettings?(sessionId: string, settings: UnattendedSettings): Promise<void>
@@ -585,6 +606,7 @@ export interface AgentManagerApi {
   removeDangerRule(ruleId: string): Promise<void>
   testDangerCommand(command: string): Promise<DangerRuleTestResult>
   getLlmReviewSettings(): Promise<LlmReviewSettingsSummary>
+  listLlmReviewModels(settings: LlmReviewSettingsInput): Promise<string[]>
   updateLlmReviewSettings(settings: LlmReviewSettingsInput): Promise<LlmReviewSettingsSummary>
   reviewApprovalRules(): Promise<LlmRuleAuditState>
   chooseWorkspace(): Promise<string | undefined>

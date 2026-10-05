@@ -56,6 +56,9 @@ describe('App terminal wall', () => {
     vi.clearAllMocks()
     window.localStorage.clear()
     api = {
+      setActiveSession: vi.fn(async () => undefined),
+      onAttentionSound: vi.fn(() => () => undefined),
+      testAttentionSound: vi.fn(async () => undefined),
       platform: 'win32',
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(async (request) => ({ ...session, displayName: request.displayName, agentKind: request.agentKind, workspace: request.workspace })), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
@@ -70,6 +73,7 @@ describe('App terminal wall', () => {
       renameSession: vi.fn(),
       updateSessionConfig: vi.fn(),
       updateSessionProxy: vi.fn(),
+      setApprovalMode: vi.fn(),
       setFullAutoMode: vi.fn(),
       listCCSwitchProviders: vi.fn(async () => []),
       getContinueKeywordSettings: vi.fn(async () => ({ enabled: false, quietSeconds: 10, keywords: [] })),
@@ -116,6 +120,7 @@ describe('App terminal wall', () => {
         proxyEnabled: false, proxyHost: '127.0.0.1', proxyPort: 7897, hasProxyPassword: false,
         ruleAuditState: { status: 'idle' as const },
       })),
+      listLlmReviewModels: vi.fn(async () => ['review-a', 'review-b']),
       updateLlmReviewSettings: vi.fn(async (value) => ({
         enabled: value.enabled, level: value.level, baseUrl: value.baseUrl, hasApiKey: Boolean(value.apiKey),
         model: value.model, retryCount: value.retryCount, timeoutSeconds: value.timeoutSeconds,
@@ -189,6 +194,31 @@ describe('App terminal wall', () => {
     expect(Terminal).not.toHaveBeenCalled()
   })
 
+  it('reports the Agent receiving wall pointer or keyboard focus, and clears it while covered', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'session-2', displayName: 'Second Agent' }])
+    render(<App />)
+    const first = await screen.findByTestId('terminal-tile-session-1')
+    const second = await screen.findByTestId('terminal-tile-session-2')
+    expect(api.setActiveSession).toHaveBeenLastCalledWith(null)
+    fireEvent.pointerDown(first)
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-1')
+    expect(first).toHaveClass('terminal-card-active')
+    fireEvent.focus(second)
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
+    expect(first).not.toHaveClass('terminal-card-active')
+    expect(second).toHaveClass('terminal-card-active')
+    fireEvent.click(screen.getByRole('button', { name: /会话安全$/ }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith(null)
+    fireEvent.click(screen.getByRole('button', { name: '关闭会话安全设置' }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
+    fireEvent.click(screen.getByRole('button', { name: '审计' }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith(null)
+    fireEvent.click(screen.getByRole('button', { name: /Agent 总览$/ }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
+    fireEvent.click(first)
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-1')
+  })
+
   it('switches Agent list mode without recreating mounted terminals', async () => {
     const claudeSession: SessionSummary = {
       ...session,
@@ -209,11 +239,13 @@ describe('App terminal wall', () => {
 
     const modeSwitch = screen.getByRole('group', { name: 'Agent 显示模式' })
     fireEvent.click(within(modeSwitch).getByRole('button', { name: /列表/ }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-1')
     expect(firstTile).not.toHaveClass('terminal-card-hidden')
     expect(secondTile).toHaveClass('terminal-card-hidden')
     expect(screen.getByLabelText('Agent 列表')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: '切换到 Claude 文档整理' }))
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
     expect(firstTile).toHaveClass('terminal-card-hidden')
     expect(secondTile).not.toHaveClass('terminal-card-hidden')
     expect(Terminal).toHaveBeenCalledTimes(2)
@@ -224,6 +256,7 @@ describe('App terminal wall', () => {
     expect(screen.queryByRole('button', { name: '切换到 Claude 文档整理' })).not.toBeInTheDocument()
     expect(firstTile).not.toHaveClass('terminal-card-hidden')
     expect(secondTile).toHaveClass('terminal-card-hidden')
+    expect(api.setActiveSession).toHaveBeenLastCalledWith('session-1')
     expect(within(document.querySelector('.sidebar') as HTMLElement).getByRole('button', { name: /api/ })).toBeInTheDocument()
     expect(Terminal).toHaveBeenCalledTimes(2)
 
@@ -495,17 +528,16 @@ describe('App terminal wall', () => {
     await waitFor(() => expect(api.rejectRequest).toHaveBeenCalledWith('approval-reject'))
   })
 
-  it('requires explicit risk confirmation before enabling full-auto mode', async () => {
+  it('switches a running session through the four approval modes', async () => {
     render(<App />)
     const tile = await screen.findByTestId('terminal-tile-session-1')
-    fireEvent.click(within(tile).getByRole('button', { name: '全自动' }))
-    const dialog = screen.getByRole('dialog', { name: '开启全自动模式' })
-    const enable = within(dialog).getByRole('button', { name: '开启全自动模式' })
-    expect(enable).toBeDisabled()
-    fireEvent.click(within(dialog).getByRole('checkbox', { name: /允许此 Agent 自动执行普通操作/ }))
-    expect(enable).toBeEnabled()
-    fireEvent.click(enable)
-    await waitFor(() => expect(api.setFullAutoMode).toHaveBeenCalledWith('session-1', true))
+    fireEvent.click(within(tile).getByRole('button', { name: '审批模式：普通模式' }))
+    const dialog = screen.getByRole('dialog', { name: '切换审批模式' })
+    expect(within(dialog).getAllByRole('radio')).toHaveLength(4)
+    expect(within(dialog).getByRole('radio', { name: /普通模式/ })).toBeChecked()
+    fireEvent.click(within(dialog).getByRole('radio', { name: /规则自动/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '切换为规则自动' }))
+    await waitFor(() => expect(api.setApprovalMode).toHaveBeenCalledWith('session-1', 'rules-auto'))
   })
 
   it('approves and remembers a safe custom tool from the global attention center', async () => {
@@ -818,6 +850,22 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
     expect(await screen.findByText(/CCSwitch 当前仅支持 Codex 和 Claude Code/)).toBeInTheDocument()
     expect(api.listCCSwitchProviders).not.toHaveBeenCalled()
+  })
+  it('shows a complete long CC Switch list and can select the last provider', async () => {
+    vi.mocked(api.listCCSwitchProviders).mockResolvedValue(Array.from({length:26},(_,index)=>({
+      id:'provider-'+index, name:'Gateway '+index, agentKind:'codex', isCurrent:index===0, hasApiKey:true,
+    })))
+    render(<App />); await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', {name:/新建 Agent/}))
+    fireEvent.click(screen.getByRole('button', {name:'独立配置'}))
+    fireEvent.click(screen.getByRole('switch', {name:'启用独立配置'}))
+    fireEvent.click(screen.getByRole('button', {name:/CCSwitch 只读选择本机 Provider/}))
+    await screen.findByText(/共 26 个配置，26 个可导入/)
+    const list=screen.getByLabelText('CC Switch 配置列表')
+    expect(within(list).getAllByRole('button')).toHaveLength(26)
+    const last=within(list).getByRole('button',{name:/Gateway 25/})
+    fireEvent.click(last); expect(last).toHaveAttribute('aria-pressed','true')
+    expect(within(list).getByRole('button',{name:/Gateway 0 /})).toHaveAttribute('aria-pressed','false')
   })
 
   it('submits CCSwitch with Codex retries 100 and auto compact 500K', async () => {
@@ -1353,7 +1401,7 @@ describe('App terminal wall', () => {
     })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
     expect(await screen.findByText('审查正在后台进行')).toBeInTheDocument()
     expect(screen.getByDisplayValue('45')).toHaveValue(45)
 
@@ -1367,7 +1415,7 @@ describe('App terminal wall', () => {
       ruleAuditState: { status: 'completed', source: 'manual', completedAt: Date.now() },
       lastRuleAudit: { reviewedAt: Date.now(), model: 'security-model', ruleCount: 1, summary: '后台审查已经完成', findings: [] },
     })
-    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
     expect(await screen.findByText('后台审查已经完成')).toBeInTheDocument()
   })
 
@@ -1386,7 +1434,7 @@ describe('App terminal wall', () => {
     })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /LLM 审查/ }))
+    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
     fireEvent.click(await screen.findByRole('button', { name: '查看审查结果' }))
 
     expect(await screen.findByRole('heading', { name: '批准规则审查结果' })).toBeInTheDocument()

@@ -1,0 +1,34 @@
+/** Tracks renderer playback receipts so a lost IPC cannot silently eat a reminder. */
+export class AttentionAudioDelivery {
+  private ready = false
+  private sequence = 0
+  private pending = new Map<string, ReturnType<typeof setTimeout>>()
+  constructor(private readonly port: { send(id: string): void; fallback(): void }) {}
+
+  setReady(ready: boolean): void {
+    this.ready = ready
+    if (!ready) for (const id of [...this.pending.keys()]) this.acknowledge(id, false)
+  }
+
+  play(): void {
+    if (!this.ready) { this.port.fallback(); return }
+    const id = String(++this.sequence)
+    this.pending.set(id, setTimeout(() => this.acknowledge(id, false), 2_000))
+    try { this.port.send(id) } catch { this.acknowledge(id, false) }
+  }
+
+  acknowledge(id: unknown, success: unknown): void {
+    if (typeof id !== 'string' || typeof success !== 'boolean') return
+    const timer = this.pending.get(id)
+    if (!timer) return
+    clearTimeout(timer)
+    this.pending.delete(id)
+    if (!success) this.port.fallback()
+  }
+
+  dispose(): void {
+    for (const timer of this.pending.values()) clearTimeout(timer)
+    this.pending.clear()
+    this.ready = false
+  }
+}

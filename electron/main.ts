@@ -1,4 +1,9 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, safeStorage, Tray, type IpcMainInvokeEvent } from 'electron'
+import { isAbsolute as isAbsoluteDataPath } from 'node:path'
+import { isApprovalMode, APPROVAL_MODE_LABEL } from '../src/shared/approval-mode'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, safeStorage, shell, Tray, type IpcMainInvokeEvent } from 'electron'
+import { AttentionSound } from './attention-sound'
+import { AttentionAudioDelivery } from './attention-audio-delivery'
+import { TerminalQuestionSignal } from './terminal-question-signal'
 import { statSync } from 'node:fs'
 import { parseNetworkRetry } from '../src/shared/network-retry'
 import { parseAutoCompactTokens } from '../src/shared/auto-compact'
@@ -38,6 +43,7 @@ import { NativeDragBridge, type NativeDragEvent } from './native-drag-bridge'
 import { detectAgentEnvironment, installAgent, installNodeAndNpm, installRipgrep } from './agent-environment-manager'
 import { environmentWithFreshPath, pathFromEnvironment } from './platform-environment'
 import { LlmReviewSettingsStore } from './llm-review-settings-store'
+import { listLlmReviewModels } from './llm-model-catalog'
 import { LlmSecurityReviewer } from './llm-security-reviewer'
 import { TokenUsageStore } from './token-usage-store'
 import { NativeSessionActivityMonitor } from './native-session-activity'
@@ -47,6 +53,23 @@ let mainWindow: BrowserWindow | undefined
 const deepSeekWebWindows = new DeepSeekWebWindows()
 let tray: Tray | undefined
 let controller: SessionController
+let activeSessionId: string | undefined
+const questionSignals = new Map<string, { activitySince?: number; signal: TerminalQuestionSignal }>()
+const attentionSound = new AttentionSound({
+  session: id => controller?.listSessions().find(session => session.sessionId === id),
+  approvals: id => controller?.listPendingApprovals().filter(request => request.sessionId === id) ?? [],
+  isActive: id => activeSessionId === id && Boolean(mainWindow && !mainWindow.isDestroyed() && mainWindow.isFocused()),
+  play: () => playAttentionChime(),
+})
+const attentionAudioDelivery = new AttentionAudioDelivery({
+  send: id => {
+    if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()
+      || mainWindow.webContents.isLoadingMainFrame()) throw new Error('Audio renderer unavailable')
+    mainWindow.webContents.send(IPC_CHANNELS.attentionSound, id)
+  },
+  fallback: () => { try { shell.beep() } catch { /* Sound must never interrupt sessions. */ } },
+})
+function playAttentionChime(): void { attentionAudioDelivery.play() }
 let auditStore: ActivityAuditStore
 let tokenUsageStore: TokenUsageStore
 let nativeActivityMonitor: NativeSessionActivityMonitor | undefined
@@ -73,6 +96,11 @@ const sessionSnapshots = new Map<string, SessionSummary>()
 const pendingOutputEvents = new Map<string, { sessionId: string; data: string; sequence?: number }>()
 let outputFlushTimer: ReturnType<typeof setTimeout> | undefined
 let externalDragProjection: ExternalTerminalDragProjection | null = null
+const isolatedUserData = process.env.AGENT_TUI_USER_DATA_DIR
+if (isolatedUserData) {
+  if (!isAbsoluteDataPath(isolatedUserData)) throw new Error('AGENT_TUI_USER_DATA_DIR must be absolute')
+  app.setPath('userData', isolatedUserData)
+}
 const hasSingleInstanceLock = app.requestSingleInstanceLock()
 
 const MAX_TEXT = 4_096
@@ -258,6 +286,10 @@ function dingTalkSettings(value: unknown): DingTalkSettingsInput {
 function llmReviewSettings(value: unknown): LlmReviewSettingsInput {
   if (!value || typeof value !== 'object') throw new Error('LLM 审查设置格式无效')
   const input = value as Record<string, unknown>
+  const backend = input.backend ?? 'api'
+  if (!['api', 'codex-cli', 'claude-cli'].includes(String(backend))) throw new Error('审核器类型无效')
+  const cliExecutable = optionalConfigText(input.cliExecutable, '审核 CLI 路径', 4096)
+  const cliModel = optionalConfigText(input.cliModel, '审核 CLI 模型', 256)
   const level = input.level
   if (level !== 'low' && level !== 'medium' && level !== 'high') throw new Error('LLM 审查等级无效')
   if (!Number.isInteger(input.retryCount) || Number(input.retryCount) < 0 || Number(input.retryCount) > 10) throw new Error('LLM 审查失败重试次数必须是 0 到 10 的整数')
@@ -271,6 +303,9 @@ function llmReviewSettings(value: unknown): LlmReviewSettingsInput {
   const proxyPassword = optionalConfigText(input.proxyPassword, 'LLM review proxy password', 2_048)
   return {
     enabled: input.enabled === true,
+    backend: backend as LlmReviewSettingsInput['backend'],
+    ...(cliExecutable ? { cliExecutable } : {}),
+    ...(cliModel ? { cliModel } : {}),
     level,
     ...(baseUrl ? { baseUrl } : {}),
     ...(apiKey ? { apiKey } : {}),
@@ -458,6 +493,14 @@ function approvalRequestId(value: unknown): string {
 
 function broadcast(event: ManagerEvent): void {
   if (event.type === 'output') {
+    const session = controller?.listSessions().find(item => item.sessionId === event.sessionId)
+    if (session) {
+      const existing = questionSignals.get(event.sessionId)
+      const signal = existing?.activitySince === session.activitySince && existing ? existing.signal : new TerminalQuestionSignal()
+      questionSignals.set(event.sessionId, { activitySince: session.activitySince, signal })
+      const question = signal.observe(event.data)
+      if (question) attentionSound.terminalQuestion(event.sessionId, question, () => signal.current === question)
+    }
     const previous = pendingOutputEvents.get(event.sessionId)
     pendingOutputEvents.set(event.sessionId, {
       sessionId: event.sessionId,
@@ -468,6 +511,16 @@ function broadcast(event: ManagerEvent): void {
     return
   }
   if (event.type === 'sessions-changed') auditSessionTransition(event.sessionId)
+  if (event.type === 'sessions-changed') {
+    attentionSound.sessionChanged(event.sessionId)
+    const current = controller.listSessions().find(session => session.sessionId === event.sessionId)
+    const question = questionSignals.get(event.sessionId)
+    if (!current || current.userStopRequested || current.activity === 'completed' || ['stopped', 'completed', 'failed'].includes(current.status)
+      || question && question.activitySince !== current.activitySince) {
+      question?.signal.reset()
+      questionSignals.delete(event.sessionId)
+    }
+  }
   if (event.type === 'sessions-changed') deepSeekWebWindows.sync(event.sessionId, controller.listSessions().find(item => item.sessionId === event.sessionId))
   for (const window of mainWindow ? [mainWindow] : []) {
     if (!window.isDestroyed()) window.webContents.send(IPC_CHANNELS.event, event)
@@ -647,7 +700,7 @@ async function runLlmRuleAudit(approvalPolicy: ApprovalPolicyStore, source: 'man
     recordAudit({
       level: 'info', category: 'review', action: 'llm_rule_audit_started',
       message: source === 'manual' ? '已手动启动 LLM 批准规则审查' : '已按计划启动 LLM 批准规则审查',
-      details: { source, ruleCount: approvalRules.length, model: settings.model ?? 'not-configured' },
+      details: { source, ruleCount: approvalRules.length, backend: settings.backend ?? 'api', model: settings.backend && settings.backend !== 'api' ? settings.cliModel ?? 'CLI 默认模型' : settings.model ?? 'not-configured' },
     })
     try {
       const result = await llmSecurityReviewer.reviewRuleSet(
@@ -727,6 +780,22 @@ async function restoreNativeSessionProvider(session: SessionSummary | undefined)
 }
 
 function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
+  ipcMain.handle(IPC_CHANNELS.testAttentionSound, (event) => {
+    trustedRenderer(event)
+    playAttentionChime()
+  })
+  ipcMain.on(IPC_CHANNELS.attentionSoundReady, (event, ready: unknown) => {
+    try { trustedRenderer(event); if (typeof ready === 'boolean') attentionAudioDelivery.setReady(ready) } catch { /* Untrusted renderer. */ }
+  })
+  ipcMain.on(IPC_CHANNELS.attentionSoundResult, (event, id: unknown, success: unknown) => {
+    try { trustedRenderer(event); attentionAudioDelivery.acknowledge(id, success) } catch { /* Untrusted renderer. */ }
+  })
+  ipcMain.handle(IPC_CHANNELS.setActiveSession, (event, id: unknown) => {
+    trustedRenderer(event)
+    const target = id === null ? undefined : sessionId(id)
+    activeSessionId = target && controller.listSessions().some(session => session.sessionId === target) ? target : undefined
+    if (activeSessionId && mainWindow?.isFocused()) attentionSound.acknowledge(activeSessionId)
+  })
   ipcMain.handle(IPC_CHANNELS.openExternalWeb, async (event, url: unknown) => {
     trustedRenderer(event)
     await openExternalWeb(url)
@@ -801,6 +870,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     const target = sessionId(id)
     const input = terminalInput(data)
+    if (/[\r\n\x03]/.test(input)) questionSignals.get(target)?.signal.reset()
     const before = controller.listPendingApprovals().filter((request) => request.sessionId === target)
     const result = controller.write(target, input)
     const afterIds = new Set(controller.listPendingApprovals().filter((request) => request.sessionId === target).map((request) => request.requestId))
@@ -978,6 +1048,14 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       details: summary ? { protocol: summary.protocol, host: summary.host, port: summary.port, authenticated: Boolean(summary.username || summary.hasPassword) } : { enabled: false },
     })
   })
+  ipcMain.handle(IPC_CHANNELS.setApprovalMode, async (event, id: unknown, mode: unknown, settings: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    if (!isApprovalMode(mode)) throw new Error('审批模式无效')
+    await controller.setApprovalMode(target, mode, settings === undefined ? undefined : parseUnattendedSettings(settings))
+    recordAudit({ level: mode === 'manual' ? 'info' : 'warning', category: 'approval', action: 'approval_mode_changed',
+      message: '已切换为' + APPROVAL_MODE_LABEL[mode], sessionId: target, details: { mode } })
+  })
   ipcMain.handle(IPC_CHANNELS.setFullAutoMode, async (event, id: unknown, value: unknown) => {
     trustedRenderer(event)
     const target = sessionId(id)
@@ -1153,11 +1231,13 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.addApprovalRule, async (event, command: unknown) => {
     trustedRenderer(event)
     await approvalPolicy.addRule(text(command, 'approval rule', 2_048))
+    await controller.refreshApprovalPolicy()
     recordAudit({ level: 'info', category: 'rule', action: 'rule_added', message: '已添加自动批准规则' })
   })
   ipcMain.handle(IPC_CHANNELS.removeApprovalRule, async (event, command: unknown) => {
     trustedRenderer(event)
     await approvalPolicy.removeRule(text(command, 'approval rule', 2_048))
+    await controller.refreshApprovalPolicy()
     recordAudit({ level: 'info', category: 'rule', action: 'rule_removed', message: '已撤销自动批准规则' })
   })
   ipcMain.handle(IPC_CHANNELS.listDangerRules, (event) => {
@@ -1172,6 +1252,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
       name: text(input.name, 'danger rule name', 80),
       keyword: text(input.keyword, 'danger rule keyword', 256),
     })
+    await controller.refreshApprovalPolicy()
     recordAudit({
       level: 'warning', category: 'rule', action: 'danger_rule_added',
       message: '已添加自定义高危规则「' + rule.name + '」',
@@ -1184,6 +1265,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     if (typeof enabled !== 'boolean') throw new Error('高危规则启用状态无效')
     const ruleId = text(id, 'danger rule id', 128)
     await approvalPolicy.setDangerRuleEnabled(ruleId, enabled)
+    await controller.refreshApprovalPolicy()
     recordAudit({
       level: 'warning', category: 'rule', action: enabled ? 'danger_rule_enabled' : 'danger_rule_disabled',
       message: enabled ? '已启用自定义高危规则' : '已停用自定义高危规则',
@@ -1194,6 +1276,7 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     trustedRenderer(event)
     const ruleId = text(id, 'danger rule id', 128)
     await approvalPolicy.removeDangerRule(ruleId)
+    await controller.refreshApprovalPolicy()
     recordAudit({
       level: 'warning', category: 'rule', action: 'danger_rule_removed',
       message: '已删除自定义高危规则',
@@ -1202,15 +1285,21 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   })
   ipcMain.handle(IPC_CHANNELS.testDangerCommand, (event, command: unknown) => {
     trustedRenderer(event)
-    return approvalPolicy.testDangerCommand(text(command, 'danger command test', 2_048))
+    return approvalPolicy.testDangerCommand(text(command, 'danger command test', 16_384))
   })
   ipcMain.handle(IPC_CHANNELS.getLlmReviewSettings, (event) => {
     trustedRenderer(event)
     return { ...llmReviewSettingsStore.getSummary(), ruleAuditState: { ...llmRuleAuditState } }
   })
+  ipcMain.handle(IPC_CHANNELS.listLlmReviewModels, (event, value: unknown) => {
+    trustedRenderer(event)
+    return listLlmReviewModels(llmReviewSettingsStore.preview(llmReviewSettings(value)))
+  })
   ipcMain.handle(IPC_CHANNELS.updateLlmReviewSettings, async (event, value: unknown) => {
     trustedRenderer(event)
     const saved = await llmReviewSettingsStore.update(llmReviewSettings(value))
+    if (llmRuleAuditState.status === 'failed') llmRuleAuditState = { status: 'idle' }
+    await controller.refreshApprovalPolicy()
     scheduleLlmRuleAudit(approvalPolicy)
     recordAudit({
       level: saved.enabled || saved.scheduledRuleAuditEnabled ? 'warning' : 'info',
@@ -1330,9 +1419,13 @@ async function promptStartupWorkspace(window: BrowserWindow): Promise<void> {
 function createWindow(): BrowserWindow {
   const window = new BrowserWindow({
     width: 1280, height: 820, minWidth: 860, minHeight: 600, backgroundColor: '#111719', autoHideMenuBar: true, icon: APP_LOGO_PATH,
-    webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true },
+    webPreferences: { preload: join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false, sandbox: true,
+      autoplayPolicy: 'no-user-gesture-required', backgroundThrottling: false },
   })
   window.setMenuBarVisibility(false)
+  window.on('focus', () => { if (activeSessionId) attentionSound.acknowledge(activeSessionId) })
+  window.webContents.on('render-process-gone', () => { activeSessionId = undefined; attentionAudioDelivery.setReady(false) })
+  window.webContents.on('did-start-loading', () => { activeSessionId = undefined; attentionAudioDelivery.setReady(false) })
   routeExternalLinks(window.webContents)
   window.on('close', (event) => {
     if (!quitting) { event.preventDefault(); window.hide() }
@@ -1492,13 +1585,12 @@ void app.whenReady().then(async () => {
       const subject = approvalSubject(command)
       recordAudit({ level: 'warning', category: 'approval', action: 'approval_detected', message: `检测到 ${subject} 授权请求`, details: { subject, ...(command ? { command } : {}) } })
       const decision = approvalPolicy.decide(command)
-      if (decision.action === 'auto-approve') {
-        recordAudit({ level: 'info', category: 'approval', action: 'approval_auto', message: `${subject} 已按安全规则自动批准`, details: { subject, ...(command ? { command } : {}), risk: decision.risk, rule: decision.matchedRule ?? 'built-in' } })
-      }
+
       return decision
     },
     noteManualApproval: (command: string | undefined) => approvalPolicy.noteManualApproval(command),
     canBulkApproveCommand: (command: string | undefined) => approvalPolicy.canBulkApproveCommand(command),
+    assessApprovalRequest: (input: Parameters<typeof approvalPolicy.assessApprovalRequest>[0]) => approvalPolicy.assessApprovalRequest(input),
     canFullAutoApprove: (input: Parameters<typeof approvalPolicy.canFullAutoApprove>[0]) => approvalPolicy.canFullAutoApprove(input),
     async addRule(command: string) {
       await approvalPolicy.addRule(command)
@@ -1509,7 +1601,7 @@ void app.whenReady().then(async () => {
     pending(request: ApprovalRequest) {
       recordAudit({
         level: 'warning', category: 'approval', action: 'approval_waiting',
-        message: (request.toolName ?? approvalSubject(request.command)) + ' 正在等待人工处理',
+        message: (request.toolName ?? approvalSubject(request.command)) + ' 审批请求已接收',
         sessionId: request.sessionId,
         details: {
           requestId: request.requestId,
@@ -1567,9 +1659,11 @@ void app.whenReady().then(async () => {
       })
     },
     blocked(request: ApprovalRequest, reason: string) {
+      const manual = controller.listSessions().find(session => session.sessionId === request.sessionId)?.approvalMode === 'manual'
+      if (manual) attentionSound.approvalNeedsUser(request)
       recordAudit({
         level: 'warning', category: 'approval', action: 'full_auto_blocked',
-        message: '全自动模式已拦截高风险操作：' + (request.toolName ?? approvalSubject(request.command)),
+        message: (manual ? '审批需要人工处理：' : '自动审批处理异常：') + (request.toolName ?? approvalSubject(request.command)),
         sessionId: request.sessionId,
         details: {
           requestId: request.requestId,
@@ -1581,6 +1675,11 @@ void app.whenReady().then(async () => {
           decision: 'blocked',
         },
       })
+    },
+    rejected(request: ApprovalRequest, reason: string) {
+      recordAudit({ level: 'warning', category: 'approval', action: 'approval_auto_rejected',
+        message: '已自动拒绝：' + (request.toolName ?? approvalSubject(request.command)), sessionId: request.sessionId,
+        details: { requestId: request.requestId, policyReason: reason, decision: 'deny', ...(request.command ? { command: request.command } : {}) } })
     },
     reviewStarted(request: ApprovalRequest) {
       recordAudit({
@@ -1597,13 +1696,14 @@ void app.whenReady().then(async () => {
     },
     reviewed(request: ApprovalRequest, conclusion: NonNullable<ApprovalRequest['llmReview']>) {
       recordAudit({
-        level: conclusion.requiresHumanApproval ? 'warning' : 'info',
+        level: conclusion.verdict === 'allow' ? 'info' : 'warning',
         category: 'review', action: 'llm_approval_review_completed',
         message: 'LLM 审查结论：' + conclusion.summary,
         sessionId: request.sessionId,
         details: {
           requestId: request.requestId, verdict: conclusion.verdict,
           riskScore: conclusion.riskScore, requiresHumanApproval: conclusion.requiresHumanApproval,
+          automaticDecision: conclusion.verdict === 'allow' && !conclusion.requiresHumanApproval ? 'allow' : 'deny',
           model: conclusion.model, reasons: JSON.stringify(conclusion.reasons),
           hazards: JSON.stringify(conclusion.hazards), assumptions: JSON.stringify(conclusion.assumptions),
           ...(request.command ? { command: request.command } : {}),
@@ -1613,7 +1713,7 @@ void app.whenReady().then(async () => {
     reviewFailed(request: ApprovalRequest, error: string) {
       recordAudit({
         level: 'error', category: 'review', action: 'llm_approval_review_failed',
-        message: 'LLM 安全审查失败，已转人工处理', sessionId: request.sessionId,
+        message: 'LLM 安全审查失败，本次请求将拒绝，不转人工', sessionId: request.sessionId,
         details: { requestId: request.requestId, error, ...(request.command ? { command: request.command } : {}) },
       })
     },
@@ -1637,8 +1737,8 @@ void app.whenReady().then(async () => {
       const settings = llmReviewSettingsStore.getRuntimeSettings()
       return { enabled: settings.enabled, level: settings.level }
     },
-    reviewApproval: (request: ApprovalRequest, hardBlockedReason?: string) =>
-      llmSecurityReviewer.reviewApproval(request, llmReviewSettingsStore.getRuntimeSettings(), hardBlockedReason),
+    reviewApproval: (request: ApprovalRequest, localRiskReason?: string, signal?: AbortSignal) =>
+      llmSecurityReviewer.reviewApproval(request, llmReviewSettingsStore.getRuntimeSettings(), localRiskReason, signal),
   }
   controller = new SessionController(manager, broadcast, { discover: discoverNativeSessions }, auditedApprovalPolicy, recoveryPolicy, fullAutoActivity, continueKeywordStore, recoveryActivity, sessionCatalog, llmApprovalReview,
     entry => recordAudit({ ...entry, category: 'approval', level: 'warning' }))
@@ -1708,9 +1808,19 @@ void app.whenReady().then(async () => {
   registerIpc(approvalPolicy)
   scheduleLlmRuleAudit(approvalPolicy)
   await controller.restoreSessions(sessionSafetyStore.getSettings().preserveWorkspaceOnCrash)
+  attentionSound.seed(controller.listSessions())
   nativeActivityMonitor = new NativeSessionActivityMonitor(
     () => controller.listSessions(),
-    (session, event) => controller.observeNativeActivity(session, event),
+    (session, event) => {
+      controller.observeNativeActivity(session, event)
+      const current = controller.listSessions().find(item => item.sessionId === session.sessionId)
+      if (current?.nativeSessionId === session.nativeSessionId && current?.activitySince === session.activitySince) {
+        if (attentionSound.observeQuestions(session.sessionId, event.pendingUserQuestions ?? [])) {
+          questionSignals.get(session.sessionId)?.signal.reset()
+          questionSignals.delete(session.sessionId)
+        }
+      }
+    },
   )
   nativeActivityMonitor.start()
   for (const session of controller.listSessions()) {
@@ -1750,5 +1860,5 @@ app.on('before-quit', (event) => {
   if (quitting) nativeDragBridge?.stop()
 })
 
-app.on('will-quit', () => { nativeActivityMonitor?.stop() })
+app.on('will-quit', () => { attentionSound.dispose(); attentionAudioDelivery.dispose(); questionSignals.clear(); nativeActivityMonitor?.stop() })
 }

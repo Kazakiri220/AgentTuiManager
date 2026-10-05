@@ -384,7 +384,15 @@ button:disabled { cursor: default; opacity: .55; }
 .continue-keyword-dialog > .launcher-config-security { margin-right: 18px; margin-left: 18px; }
 .mini-button { min-height: 27px; height: 27px; padding: 0 9px; font-size: 9px; }
 .ccswitch-provider-section { display: grid; gap: 10px; }
-.ccswitch-provider-list { display: grid; gap: 7px; max-height: 250px; overflow: auto; }
+.ccswitch-provider-count { margin: 0; color: var(--muted); font-size: 10px; }
+.llm-settings-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.llm-model-picker { grid-column: 1 / -1; display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: end; gap: 8px; }
+.llm-model-picker label { min-width: 0; }
+.llm-model-picker p { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 10px; }
+.ccswitch-provider-list { display: grid; grid-auto-rows: max-content; gap: 7px; max-height: min(400px, 45vh); overflow: auto; scrollbar-gutter: stable; scrollbar-color: #617b73 #111719; }
+.ccswitch-provider-list::-webkit-scrollbar { width: 10px; }
+.ccswitch-provider-list::-webkit-scrollbar-thumb { background: #617b73; border: 2px solid #111719; border-radius: 5px; }
+.ccswitch-provider-list::-webkit-scrollbar-track { background: #111719; }
 .ccswitch-provider-item { width: 100%; min-height: 62px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 5px 12px; padding: 9px 11px; color: var(--text); background: var(--panel); border: 1px solid var(--line); border-radius: 6px; text-align: left; }
 .ccswitch-provider-item.active { background: #20332d; border-color: var(--green); outline: 2px solid rgba(77, 204, 153, .2); }
 .ccswitch-provider-item.invalid { opacity: .66; border-color: #754045; }
@@ -793,3 +801,13 @@ button:disabled { cursor: default; opacity: .55; }
 .unattended-settings > label:not(.full-auto-confirm) input { min-height: 36px; padding: 0 10px; border: 1px solid #344145; border-radius: 5px; background: #111719; color: #e7eeee; }
 .unattended-settings textarea { padding: 8px 10px; border: 1px solid #344145; border-radius: 5px; background: #111719; color: #e7eeee; font: inherit; resize: vertical; min-height: 80px; }
 .unattended-settings select { min-height: 36px; padding: 0 10px; border: 1px solid #344145; border-radius: 5px; background: #111719; color: #e7eeee; }
+
+/* Per-session approval modes are mutually exclusive. */
+.approval-mode-options { display: grid; gap: 10px; border: 0; padding: 0; margin: 16px 0; }
+.approval-mode-options legend { font-weight: 600; margin-bottom: 8px; }
+.approval-mode-options > label { display: flex; gap: 12px; padding: 12px; border: 1px solid var(--border, #3c484b); border-radius: 8px; cursor: pointer; }
+.approval-mode-options > label.selected { border-color: var(--accent, #67b8aa); background: var(--blue-soft, #20302f); }
+.approval-mode-options label span { display: grid; gap: 5px; }
+.approval-mode-options small { line-height: 1.5; opacity: .8; }
+.approval-mode-dialog { max-height: 90vh; overflow-y: auto; }
+.terminal-card-active { border-color: var(--green); box-shadow: inset 0 0 0 1px var(--green); }
