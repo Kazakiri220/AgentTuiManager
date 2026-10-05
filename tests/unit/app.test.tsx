@@ -28,6 +28,31 @@ const session: SessionSummary = {
 }
 
 describe('App terminal wall', () => {
+  it('restores the full sidebar after resize even when the unmaximize notification is missed', async () => {
+    let maximized = true
+    window.agentManager = { ...api, getWindowState: vi.fn(async () => ({ maximized })) }
+    const { container } = render(<App />)
+    await waitFor(() => expect(container.querySelector('main')).toHaveClass('maximized-rail'))
+    maximized = false
+    fireEvent(window, new Event('resize'))
+    await waitFor(() => expect(container.querySelector('main')).not.toHaveClass('maximized-rail'))
+  })
+
+  it('does not let a stale initial query overwrite the restored window notification', async () => {
+    let resolveState!: (value: { maximized: boolean }) => void
+    let notify!: (value: { maximized: boolean }) => void
+    window.agentManager = { ...api,
+      getWindowState: () => new Promise(resolve => { resolveState = resolve }),
+      onWindowState: listener => { notify = listener; return () => undefined },
+    }
+    const { container } = render(<App />)
+    act(() => notify({ maximized: true }))
+    expect(container.querySelector('main')).toHaveClass('maximized-rail')
+    act(() => notify({ maximized: false }))
+    await act(async () => resolveState({ maximized: true }))
+    expect(container.querySelector('main')).not.toHaveClass('maximized-rail')
+  })
+
   it('recognizes terminal protocol replies that Codex Host already answered', () => {
     expect(isTerminalProtocolResponse('\x1b[1;1R')).toBe(true)
     expect(isTerminalProtocolResponse('\x1b[?1;2c')).toBe(true)
@@ -835,6 +860,11 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
     fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
     expect(await screen.findByText('Team Gateway')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('搜索 Provider 名称'), { target: { value: '不存在的名称' } })
+    expect(screen.queryByText('Team Gateway')).not.toBeInTheDocument()
+    expect(screen.getByText('没有匹配名称的 Provider')).toBeInTheDocument()
+    fireEvent.change(screen.getByLabelText('搜索 Provider 名称'), { target: { value: ' team GATE ' } })
+    expect(screen.getByText('Team Gateway')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('流式断线重连次数（0–100）'), { target: { value: '100' } })
     fireEvent.change(screen.getByLabelText('HTTP 请求重试次数（0–100）'), { target: { value: '100' } })
     fireEvent.change(screen.getByLabelText('自动压缩阈值（K Tokens）'), { target: { value: '500' } })

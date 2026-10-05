@@ -7,6 +7,24 @@ import { sessionDisplayStatus, parseSessionDisplayStatus } from '../../src/share
 import type { SessionSummary } from '../../src/shared/manager-api'
 
 describe('native task activity', () => {
+  it('switches transcript polling after a corrected native ID and sees completion', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'atm-activity-rebind-'))
+    try {
+      await writeFile(join(root, 'rollout-native-old.jsonl'), JSON.stringify({ timestamp: 300, type: 'event_msg', payload: { type: 'task_started' } }) + '\n')
+      await writeFile(join(root, 'rollout-native-new.jsonl'), JSON.stringify({ timestamp: 500, type: 'event_msg', payload: { type: 'task_complete' } }) + '\n')
+      let session = { sessionId: 'window', nativeSessionId: 'native-old', agentKind: 'codex', status: 'running', activitySince: 200 } as SessionSummary
+      const onActivity = vi.fn()
+      const monitor = new NativeSessionActivityMonitor(() => [session], onActivity, { codex: root, claude: root })
+      await monitor.poll()
+      expect(onActivity).toHaveBeenLastCalledWith(session, { activity: 'running', timestamp: 300 })
+      session = { ...session, nativeSessionId: 'native-new', activityUpdatedAt: 400 }
+      await monitor.poll()
+      expect(onActivity).toHaveBeenLastCalledWith(session, { activity: 'completed', timestamp: 500 })
+      await monitor.poll()
+      expect(onActivity).toHaveBeenCalledTimes(2)
+      monitor.stop()
+    } finally { await rm(root, { recursive: true, force: true }) }
+  })
   it('treats a failed task_complete as an error so overnight recovery uses backoff', () => {
     expect(parseNativeActivity('codex', { timestamp: 1000, type: 'event_msg',
       payload: { type: 'task_complete', error: { message: 'retries exhausted' } } }, 'native-one'))

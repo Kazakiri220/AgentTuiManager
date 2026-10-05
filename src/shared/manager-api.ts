@@ -331,6 +331,8 @@ export interface ApprovalRuleSuggestion {
 }
 
 export interface SessionSummary extends SessionState {
+  startupFailureCount?: number
+  startupRecoveryRequired?: boolean
   displayName: string
   agentKind: AgentKind
   nativeSessionId?: string
@@ -467,6 +469,8 @@ export type ManagerEvent =
   | { type: 'agent-install-progress'; progress: AgentInstallProgress }
 
 export const IPC_CHANNELS = {
+  getWindowState: 'agent-manager:get-window-state',
+  windowState: 'agent-manager:window-state',
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
   openDeepSeekWeb: 'agent-manager:open-deepseek-web',
@@ -481,6 +485,8 @@ export const IPC_CHANNELS = {
   resize: 'agent-manager:resize',
   stopSession: 'agent-manager:stop-session',
   restartSession: 'agent-manager:restart-session',
+  listBindingSessions: 'agent-manager:list-binding-sessions',
+  replaceSessionBinding: 'agent-manager:replace-session-binding',
   continueSession: 'agent-manager:continue-session',
   tryRecoveryOnce: 'agent-manager:try-recovery-once',
   acceptRecoverySuggestion: 'agent-manager:accept-recovery-suggestion',
@@ -493,6 +499,7 @@ export const IPC_CHANNELS = {
   setFullAutoMode: 'agent-manager:set-full-auto-mode',
   setUnattendedMode: 'agent-manager:set-unattended-mode',
   saveUnattendedSettings: 'agent-manager:save-unattended-settings',
+  listProviderModels: 'agent-manager:list-provider-models',
   listCCSwitchProviders: 'agent-manager:list-ccswitch-providers',
   getContinueKeywordSettings: 'agent-manager:get-continue-keyword-settings',
   updateContinueKeywordSettings: 'agent-manager:update-continue-keyword-settings',
@@ -534,6 +541,8 @@ export const IPC_CHANNELS = {
 
 export interface AgentManagerApi {
   readonly platform: NodeJS.Platform
+  getWindowState?(): Promise<{ maximized: boolean }>
+  onWindowState?(listener: (state: { maximized: boolean }) => void): () => void
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
   openDeepSeekWeb(sessionId: string): Promise<void>
@@ -548,6 +557,8 @@ export interface AgentManagerApi {
   resize(sessionId: string, cols: number, rows: number): Promise<void> | void
   stopSession(sessionId: string): Promise<void>
   restartSession(sessionId: string): Promise<void>
+  listBindingSessions?(sessionId: string): Promise<NativeSessionSummary[]>
+  replaceSessionBinding?(sessionId: string, nativeSessionId: string | null): Promise<void>
   continueSession(sessionId: string): Promise<void> | void
   tryRecoveryOnce(sessionId: string): Promise<void>
   acceptRecoverySuggestion(sessionId: string): Promise<void>
@@ -560,6 +571,7 @@ export interface AgentManagerApi {
   setFullAutoMode(sessionId: string, enabled: boolean): Promise<void>
   setUnattendedMode?(sessionId: string, settings: UnattendedSettings): Promise<void>
   saveUnattendedSettings?(sessionId: string, settings: UnattendedSettings): Promise<void>
+  listProviderModels?(input: { baseUrl: string; apiKey?: string; sessionId?: string; clearApiKey?: boolean }): Promise<string[]>
   listCCSwitchProviders(agentKind: AgentKind): Promise<CCSwitchProviderSummary[]>
   getContinueKeywordSettings(): Promise<ContinueKeywordSettings>
   updateContinueKeywordSettings(settings: ContinueKeywordSettings): Promise<ContinueKeywordSettings>

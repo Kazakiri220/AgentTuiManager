@@ -9,7 +9,7 @@
 
 Windows / macOS · MIT Open Source
 
-当前代码版本：**0.4.11**。各平台安装包以 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases) 实际附件为准。
+当前代码版本：**0.4.13**。各平台安装包以 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases) 实际附件为准。
 
 ---
 
@@ -174,6 +174,7 @@ Agent TUI Manager 只是管理进程和交互。
 - **会话 ID 与手动刷新**：窗口工作目录旁可复制原生会话 ID，终端复制按钮旁提供手动刷新。
 - **关键词续跑**：检查最近回复或错误，结合待命/完成/异常状态触发；取消静默等待设置，支持每个 Agent 独立的最大连续次数（默认 3 次）。待审批、未提交输入和手动中断不触发。
 - **Codex Astra 兼容**：Manager 启动/恢复 Codex 时注入 `-c tui.whimsy=false`，关闭输入栏星星等装饰效果，保留普通动画，不改全局配置。设置随应用分发；已运行的 Codex 需停止后重新启动。
+- **窗口布局同步**：窗口最大化时侧栏收为图标栏，还原窗口后自动恢复完整菜单；悬停菜单不会改变终端工作区尺寸。
 
 切换页签不再额外触发兜底刷新；真实尺寸变化仍正常适配，手动刷新按钮保留。关闭装饰效果不代表所有 CLI 版本的终端渲染问题都已解决。
 
@@ -420,7 +421,7 @@ claude --resume <session-id>
 - 外部终端**拖入**仍为 Beta，默认关闭；**拖出**可用
 - 代理目前支持 **HTTP**；HTTPS / SOCKS5 配置尚未开放
 - Pi 新建入口暂不可用；DeepSeek Harness 使用官方 Web，不是与 Claude Code / Codex 同等粒度的终端集成
-- 各平台产物以对应 Release 的附件为准；0.4.11 已构建 Windows x64 安装包，macOS 需要在对应平台另行构建
+- 各平台产物以对应 Release 的附件为准；0.4.13 已构建 Windows x64 安装包，macOS 需要在对应平台另行构建
 
 ---
 

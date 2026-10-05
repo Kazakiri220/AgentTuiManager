@@ -3,7 +3,10 @@ import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } fro
 import TerminalTile from './TerminalTile'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
+import ProviderModelField from './ProviderModelField'
 import SessionContinuationDialog from './SessionContinuationDialog'
+import SessionBindingDialog from './SessionBindingDialog'
+import SessionRecoveryDialog from './SessionRecoveryDialog'
 import type { NetworkRetrySettings } from './shared/network-retry'
 import UnattendedControls from './UnattendedControls'
 import { useStoppedSessionGrace } from './useStoppedSessionGrace'
@@ -113,12 +116,16 @@ function CCSwitchProviderList({
   onSelect: (provider: CCSwitchProviderSummary) => void
   onRefresh: () => void
 }): JSX.Element {
+  const [search, setSearch] = useState('')
+  const filtered = providers.filter(provider => provider.name.toLocaleLowerCase().includes(search.trim().toLocaleLowerCase()))
   return <div className='ccswitch-provider-section'>
     <div className='launcher-section-title'><h2>选择 Provider</h2><button type='button' className='button-secondary mini-button' disabled={disabled || loading} onClick={onRefresh}>{loading ? '读取中…' : '刷新'}</button></div>
+    <input className='launcher-field' aria-label='搜索 Provider 名称' placeholder='搜索 Provider 名称' disabled={disabled} value={search} onChange={event => setSearch(event.target.value)} />
     {error && <p className='launcher-state error'>读取失败：{error}</p>}
+    {!error && !loading && providers.length > 0 && filtered.length === 0 && <p className='launcher-state'>没有匹配名称的 Provider</p>}
     {!error && !loading && providers.length === 0 && <p className='launcher-state'>没有找到匹配的 Provider</p>}
     <div className='ccswitch-provider-list'>
-      {providers.map((provider) => <button
+      {filtered.map((provider) => <button
         type='button'
         key={provider.id}
         className={`ccswitch-provider-item${selectedId === provider.id ? ' active' : ''}${provider.issue ? ' invalid' : ''}`}
@@ -617,7 +624,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
             {configSource === 'custom' ? <><div className='launcher-config-form'>
               <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} placeholder={agentKind === 'claude' ? 'https://api.anthropic.com' : agentKind === 'deepseek' ? 'https://api.deepseek.com' : 'https://api.openai.com/v1'} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => setConfigApiKey(event.target.value)} placeholder='仅加密保存在本机' /></label>
-              <label>Model<input className='launcher-field' disabled={!configEnabled || agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
+              <ProviderModelField baseUrl={configBaseUrl} apiKey={configApiKey} disabled={!configEnabled} deepseek={agentKind === 'deepseek'} value={configModel} onChange={setConfigModel} />
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} placeholder={'--feature\nvalue'} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 不写入 Host 注册表、审计正文或终端回放；Manager 启动 Agent 时才临时解密。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
@@ -789,7 +796,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
               <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => { setConfigApiKey(event.target.value); if (event.target.value) setClearApiKey(false) }} placeholder={session.agentConfig?.hasApiKey ? '已安全保存，留空保持不变' : '仅加密保存在本机'} /></label>
               {session.agentConfig?.hasApiKey && <label className='launcher-clear-secret'><input type='checkbox' disabled={!configEnabled} checked={clearApiKey} onChange={(event) => { setClearApiKey(event.target.checked); if (event.target.checked) setConfigApiKey('') }} />清除已保存的 API Key</label>}
-              <label>Model<input className='launcher-field' disabled={!configEnabled || session.agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={session.agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
+              <ProviderModelField baseUrl={configBaseUrl} apiKey={configApiKey} sessionId={session.sessionId} clearApiKey={clearApiKey} disabled={!configEnabled} deepseek={session.agentKind === 'deepseek'} value={configModel} onChange={setConfigModel} />
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 只保存在 Manager 的加密配置中，不修改 Agent 本机配置。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
@@ -833,6 +840,9 @@ export default function App(): JSX.Element {
   const [llmReviewInitialView, setLlmReviewInitialView] = useState<'settings' | 'results'>('settings')
   const [showEditor, setShowEditor] = useState(false)
   const [continuationSource, setContinuationSource] = useState<SessionSummary>()
+  const [bindingTarget, setBindingTarget] = useState<{ session: SessionSummary; mode: 'history' | 'fresh' }>()
+  const [recoveryChoiceId, setRecoveryChoiceId] = useState<string>()
+  const dismissedRecoveryChoices = useRef(new Set<string>())
   const [editingSessionId, setEditingSessionId] = useState<string>()
   const [showNotifications, setShowNotifications] = useState(false)
   const [notificationMounted, setNotificationMounted] = useState(false)
@@ -852,12 +862,90 @@ export default function App(): JSX.Element {
   const [handoffError, setHandoffError] = useState('')
   const [externalDrag, setExternalDrag] = useState<ExternalTerminalDragProjection | null>(null)
   const [externalImport, setExternalImport] = useState<ExternalImportIntent>()
+  const [immersiveMode, setImmersiveMode] = useState(false)
+  const [maximizedRail, setMaximizedRail] = useState(false)
+  const [railOpen, setRailOpen] = useState(false)
+  const [immersiveError, setImmersiveError] = useState('')
+  const immersiveRequest = useRef(false)
   const notificationRef = useRef<HTMLDivElement>(null)
   const notificationHideTimer = useRef<ReturnType<typeof setTimeout>>()
+  const enterImmersive = useCallback(async (): Promise<void> => {
+    setImmersiveError('')
+    immersiveRequest.current = true
+    try {
+      if (!document.fullscreenElement) {
+        if (!document.documentElement.requestFullscreen) throw new Error('当前窗口暂不支持全屏')
+        await document.documentElement.requestFullscreen()
+      }
+      setImmersiveMode(Boolean(document.fullscreenElement) && immersiveRequest.current)
+      setRailOpen(false)
+    } catch (reason) {
+      immersiveRequest.current = false
+      setImmersiveMode(false)
+      setImmersiveError(reason instanceof Error ? reason.message : String(reason))
+    }
+  }, [])
+  const exitImmersive = useCallback(async (): Promise<void> => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen()
+      immersiveRequest.current = false
+      setImmersiveMode(false)
+      setRailOpen(false)
+    } catch (reason) { setImmersiveError(reason instanceof Error ? reason.message : String(reason)) }
+  }, [])
+  useEffect(() => {
+    const onFullscreenChange = (): void => {
+      if (!document.fullscreenElement) { immersiveRequest.current = false; setImmersiveMode(false); setRailOpen(false) }
+      else if (immersiveRequest.current) setImmersiveMode(true)
+    }
+    document.addEventListener('fullscreenchange', onFullscreenChange)
+    return () => document.removeEventListener('fullscreenchange', onFullscreenChange)
+  }, [])
+  useEffect(() => {
+    let active = true
+    let revision = 0
+    let resizeTimer: ReturnType<typeof setTimeout> | undefined
+    const syncState = (): void => {
+      const request = ++revision
+      const statePromise = window.agentManager.getWindowState?.()
+      if (statePromise) void statePromise.then(state => {
+        if (active && request === revision) setMaximizedRail(state.maximized)
+      }).catch(() => undefined)
+    }
+    const unsubscribe = window.agentManager.onWindowState?.(state => {
+      ++revision
+      if (active) setMaximizedRail(state.maximized)
+    })
+    const onResize = (): void => {
+      if (resizeTimer) clearTimeout(resizeTimer)
+      resizeTimer = setTimeout(syncState, 150)
+    }
+    syncState()
+    window.addEventListener('resize', onResize)
+    return () => {
+      active = false
+      if (resizeTimer) clearTimeout(resizeTimer)
+      window.removeEventListener('resize', onResize)
+      unsubscribe?.()
+    }
+  }, [])
   useEffect(() => {
     writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
   }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder, statusFilter])
+  useEffect(() => {
+    if (bindingTarget || recoveryChoiceId) return
+    const failed = sessions.find(session => session.startupRecoveryRequired
+      && ['codex', 'claude'].includes(session.agentKind)
+      && !dismissedRecoveryChoices.current.has(`${session.sessionId}:${session.activitySince}`))
+    if (failed) setRecoveryChoiceId(failed.sessionId)
+  }, [bindingTarget, recoveryChoiceId, sessions])
+  const dismissRecoveryChoice = (): void => {
+    const target = sessions.find(session => session.sessionId === recoveryChoiceId)
+    if (target) dismissedRecoveryChoices.current.add(`${target.sessionId}:${target.activitySince}`)
+    setRecoveryChoiceId(undefined)
+  }
   const closeOtherOverlays = useCallback((except: OverlayKind): void => {
+    setBindingTarget(undefined)
     if (except !== 'continuation') setContinuationSource(undefined)
     if (except !== 'agent-form') setShowForm(false)
     if (except !== 'agent-editor') setShowEditor(false)
@@ -1083,7 +1171,7 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <main className={`app-shell platform-${window.agentManager.platform}${selected ? ' detail-shell' : ''}`}>
+    <main className={`app-shell platform-${window.agentManager.platform}${selected ? ' detail-shell' : ''}${immersiveMode ? ' immersive-mode' : ''}${maximizedRail ? ' maximized-rail' : ''}${railOpen ? ' rail-open' : ''}`}>
       {selected ? <div className='detail-toolbar'>
         <button type='button' className='button-secondary' onClick={() => setSelectedId(undefined)} aria-label='返回总览'>← 返回总览</button>
         <strong>{selected.displayName}</strong>
@@ -1117,21 +1205,40 @@ export default function App(): JSX.Element {
         <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}>关键词续跑</button>
         <button className='button-primary' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
       </header>}
+      {immersiveMode && !selected && <div className='immersive-toolbar' role='toolbar' aria-label='沉浸模式工具栏'>
+        <button type='button' className='immersive-brand' title='Agent 总览' aria-label='Agent 总览' onClick={() => { setView('overview'); setSelectedId(undefined) }}>▦<span>Agent 总览</span></button>
+        <div className='immersive-stats'><span title='Agent 数量' aria-label={`Agent 数量 ${overviewSessions.length}`}>◉ {overviewSessions.length}</span><span className='running' title='Running' aria-label={`运行中 ${runningCount}`}>● {runningCount}</span><button type='button' title='待处理' aria-label={`待处理 ${overviewPendingCount}`} onClick={() => setView('attention')}>! {overviewPendingCount}<span>待处理</span></button></div>
+        <button type='button' title='切换布局' aria-label='切换布局' onClick={() => setOverviewMode(value => value === 'wall' ? 'list' : 'wall')}>{overviewMode === 'wall' ? '▦' : '☰'}<span>布局</span></button>
+        <button type='button' title={groupByWorkspace ? '按工作区：已开启' : '按工作区：已关闭'} aria-label='按工作区' aria-pressed={groupByWorkspace} onClick={() => setGroupByWorkspace(value => !value)}>▣<span>工作区</span></button>
+        <button type='button' title='退出沉浸' aria-label='退出沉浸' onClick={() => { void exitImmersive() }}>⛶<span>退出沉浸</span></button>
+      </div>}
+      {!immersiveMode && maximizedRail && !selected && <button type='button' className='immersive-edge-menu' aria-label='显示侧边菜单' title='显示侧边菜单' aria-expanded={railOpen}
+        onMouseEnter={() => setRailOpen(true)} onFocus={() => setRailOpen(true)} onClick={() => setRailOpen(value => !value)}>»</button>}
+      {immersiveMode && !selected && view === 'overview' && groupByWorkspace && workspaceGroups.length > 1 && <div className='immersive-workspace-switch' role='group' aria-label='切换工作区'>
+        {(['previous', 'next'] as const).map(direction => <button key={direction} type='button' className={direction} aria-label={direction === 'previous' ? '上一个工作区' : '下一个工作区'}
+          title={`${direction === 'previous' ? '上一个' : '下一个'}工作区 · ${activeWorkspaceName}`} onClick={() => {
+            const index = workspaceGroups.findIndex(group => workspaceKey(group.workspace) === workspaceKey(currentWorkspace ?? ''))
+            setActiveWorkspace(workspaceGroups[(Math.max(0, index) + (direction === 'previous' ? -1 : 1) + workspaceGroups.length) % workspaceGroups.length]!.workspace)
+          }}>{direction === 'previous' ? '‹' : '›'}</button>)}
+      </div>}
+      {immersiveError && <div className='immersive-error' role='alert'>{immersiveError}<button type='button' aria-label='关闭全屏提示' onClick={() => setImmersiveError('')}>×</button></div>}
       <div className={`workspace-layout${selected ? ' workspace-layout-detail' : ''}`}>
-        <nav className='sidebar'>
+        <nav className='sidebar' aria-label='侧边菜单' onMouseEnter={() => setRailOpen(true)} onMouseLeave={() => setRailOpen(false)} onClick={() => { if (immersiveMode || maximizedRail) setRailOpen(false) }}
+          onKeyDown={event => { if (event.key === 'Escape') { setRailOpen(false); event.stopPropagation() } }}
+          onBlur={event => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setRailOpen(false) }}>
           {groupByWorkspace && <><p className='nav-label'>工作区</p>{workspaceGroups.map((group) => <button className={`nav-item${currentWorkspace && workspaceKey(group.workspace) === workspaceKey(currentWorkspace) ? ' active' : ''}`} type='button' key={workspaceKey(group.workspace)} onClick={() => setActiveWorkspace(group.workspace)}><span>▣</span><span title={group.workspace}>{group.workspace.split(/[\\/]/).filter(Boolean).at(-1)}</span><i className='nav-count neutral'>{group.sessions.length}</i></button>)}</>}
           <p className={`nav-label${groupByWorkspace ? ' nav-section' : ''}`}>视图</p>
-          <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
-          <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
-          <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button><button className={`nav-item${view === 'tokens' ? ' active' : ''}`} type='button' aria-label='Token 用量' onClick={() => setView('tokens')}><span>∑</span><span>Token 用量</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>
+          <button title='Agent 总览' className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
+          <button title='处理中心' className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
+          <button title='审计' className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button><button title='Token 用量' className={`nav-item${view === 'tokens' ? ' active' : ''}`} type='button' aria-label='Token 用量' onClick={() => setView('tokens')}><span>∑</span><span>Token 用量</span></button>
+          <button title='安全规则' className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
+          <button title='关键词续跑' className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
+          <button title='会话安全' className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
+          <button title='钉钉远程' className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
+          <button title='LLM 审查' className='nav-item' type='button' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>LLM 审查</span></button>
         </nav>
         <section className='workspace-main'>
-          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
+          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}{view === 'overview' && <button className='immersive-entry' type='button' title='进入沉浸模式' onClick={() => { void enterImmersive() }}>⛶ 沉浸</button>}<span>{view === 'attention' || !groupByWorkspace ? '全部工作区' : activeWorkspaceName}</span></>}</div>
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
@@ -1185,6 +1292,17 @@ export default function App(): JSX.Element {
       {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace) => { setActiveWorkspace(workspace); setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
       {editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}
       {continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}
+      {bindingTarget && <SessionBindingDialog session={bindingTarget.session} mode={bindingTarget.mode} onClose={() => setBindingTarget(undefined)} onChanged={() => { void reload() }} />}
+      {recoveryChoiceId && sessions.find(session => session.sessionId === recoveryChoiceId)?.startupRecoveryRequired && <SessionRecoveryDialog
+        session={sessions.find(session => session.sessionId === recoveryChoiceId)!} onClose={dismissRecoveryChoice}
+        onChoose={choice => {
+          const target = sessions.find(session => session.sessionId === recoveryChoiceId)
+          dismissRecoveryChoice()
+          if (!target) return
+          if (choice === 'retry') {
+            void window.agentManager.restartSession(target.sessionId).catch(() => undefined).finally(() => { void reload() })
+          } else setBindingTarget({ session: target, mode: choice })
+        }} />}
       {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
       {showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}
       {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}

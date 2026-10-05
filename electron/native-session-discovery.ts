@@ -317,6 +317,31 @@ export async function discoverNativeSessions(
   return []
 }
 
+/** 切换绑定时只接受存在实际对话内容的会话，不把输入历史当成对话。 */
+export async function discoverBindableSessions(agentKind: AgentKind, workspace: string, options: NativeSessionDiscoveryOptions = {}): Promise<NativeSessionSummary[]> {
+  if (agentKind !== 'claude') return discoverNativeSessions(agentKind, workspace, options)
+  const reader = options.reader ?? defaultReader
+  const root = options.roots?.claude ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+  const history = new Map((await discoverClaude(workspace, root, reader)).map(item => [item.id, item]))
+  const files = await reader.listFiles(join(root, 'projects')).catch(() => [])
+  const sessions: NativeSessionSummary[] = []
+  for (const file of files.slice(0, MAX_DISCOVERY_FILES)) {
+    if (!file.endsWith('.jsonl') || /[\\/]subagents[\\/]/i.test(file)) continue
+    const id = basename(file, '.jsonl')
+    let count = 0
+    for await (const line of linesOrEmpty(reader, file)) {
+      if (++count > 100) break
+      const record = jsonRecord(line)
+      if (!record || record.sessionId !== id || record.isSidechain === true || !sameWorkspace(record.cwd, workspace)) continue
+      if (record.type !== 'user' && record.type !== 'assistant') continue
+      const previous = history.get(id)
+      sessions.push({ id, workspace, title: previous?.title ?? id, updatedAt: await reader.mtime(file).catch(() => previous?.updatedAt ?? 0) })
+      break
+    }
+  }
+  return sortSessions(sessions)
+}
+
 export async function discoverRecentNativeSessions(
   agentKind: 'codex' | 'claude',
   since: number,

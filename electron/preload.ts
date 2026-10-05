@@ -5,6 +5,12 @@ import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessio
 
 const api: AgentManagerApi = {
   platform: process.platform,
+  getWindowState: () => ipcRenderer.invoke(IPC_CHANNELS.getWindowState),
+  onWindowState: (listener) => {
+    const handler = (_event: Electron.IpcRendererEvent, state: { maximized: boolean }): void => listener(state)
+    ipcRenderer.on(IPC_CHANNELS.windowState, handler)
+    return () => { ipcRenderer.removeListener(IPC_CHANNELS.windowState, handler) }
+  },
   listSessions: () => ipcRenderer.invoke(IPC_CHANNELS.listSessions),
   terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
   openDeepSeekWeb: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openDeepSeekWeb, sessionId),
@@ -19,6 +25,8 @@ const api: AgentManagerApi = {
   resize: (sessionId, cols, rows) => ipcRenderer.invoke(IPC_CHANNELS.resize, sessionId, cols, rows),
   stopSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.stopSession, sessionId),
   restartSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.restartSession, sessionId),
+  listBindingSessions: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.listBindingSessions, sessionId),
+  replaceSessionBinding: (sessionId, nativeSessionId) => ipcRenderer.invoke(IPC_CHANNELS.replaceSessionBinding, sessionId, nativeSessionId),
   continueSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.continueSession, sessionId),
   tryRecoveryOnce: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.tryRecoveryOnce, sessionId),
   acceptRecoverySuggestion: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.acceptRecoverySuggestion, sessionId),
@@ -31,6 +39,7 @@ const api: AgentManagerApi = {
   setFullAutoMode: (sessionId, enabled) => ipcRenderer.invoke(IPC_CHANNELS.setFullAutoMode, sessionId, enabled),
   setUnattendedMode: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.setUnattendedMode, sessionId, settings),
   saveUnattendedSettings: (sessionId, settings) => ipcRenderer.invoke(IPC_CHANNELS.saveUnattendedSettings, sessionId, settings),
+  listProviderModels: (input) => ipcRenderer.invoke(IPC_CHANNELS.listProviderModels, input),
   listCCSwitchProviders: (agentKind) => ipcRenderer.invoke(IPC_CHANNELS.listCCSwitchProviders, agentKind),
   getContinueKeywordSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getContinueKeywordSettings),
   updateContinueKeywordSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateContinueKeywordSettings, settings),

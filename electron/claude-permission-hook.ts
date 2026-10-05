@@ -2,6 +2,8 @@ import { createHash, randomUUID } from 'node:crypto'
 import net from 'node:net'
 
 interface HookInput {
+  session_id?: unknown
+  cwd?: unknown
   tool_name?: unknown
   tool_input?: unknown
   tool_use_id?: unknown
@@ -120,6 +122,8 @@ async function main(): Promise<void> {
       rawPayload: input,
       ...(boundedText(input.tool_use_id, 256) ? { toolUseId: boundedText(input.tool_use_id, 256) } : {}),
       ...(boundedText(input.agent_id, 256) ? { agentId: boundedText(input.agent_id, 256) } : {}),
+      ...(boundedText(input.session_id, 256) ? { nativeSessionId: boundedText(input.session_id, 256) } : {}),
+      ...(boundedText(input.cwd, 4096) ? { cwd: boundedText(input.cwd, 4096) } : {}),
       ...(boundedText(input.agent_type, 128) ? { agentType: boundedText(input.agent_type, 128) } : {}),
       ...(fingerprint ? { toolInputFingerprint: fingerprint } : {}),
       ...details,

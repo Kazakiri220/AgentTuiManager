@@ -669,6 +669,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
       setActionError((message) => isClosedPreviousHostError(message) ? '' : message)
     }
   }, [session.status])
+  useEffect(() => { setActionError('') }, [session.activitySince, session.nativeSessionId])
 
   const openDetail = (): void => { if (!detail && !embedded && !terminalEnded) onOpen?.() }
   const runAction = (action: () => Promise<void> | void, busy?: 'restart' | 'remove'): void => {
@@ -695,7 +696,7 @@ export default function TerminalTile({ session, detail = false, embedded = false
           <div><h2>{session.displayName}</h2><div className="terminal-session-meta"><p title={session.workspace}>{session.workspace}</p>{session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}</div></div>
         </div>
         <div className="terminal-actions">
-          <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
+          <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{session.status === 'starting' ? '正在启动' : SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
           {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (session.fullAutoEnabled || session.unattended?.enabled ? ' active' : '')} type="button" title={session.unattended?.enabled ? '管理无监管模式' : session.fullAutoEnabled ? '关闭全自动模式' : '开启全自动模式'} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{session.unattended?.enabled ? '无监管中' : session.fullAutoEnabled ? '全自动中' : '全自动'}</button>}
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {onContinuation && (session.agentKind === 'codex' || session.agentKind === 'claude') && <button className="button-ghost" type="button" disabled={!session.nativeSessionId} title={session.nativeSessionId ? '新窗口清洗续写，继承配置' : '等待原生会话 ID 后可续写'} aria-label={`新窗口续写 ${session.displayName}`} onClick={event => { event.stopPropagation(); onContinuation() }}>↗</button>}

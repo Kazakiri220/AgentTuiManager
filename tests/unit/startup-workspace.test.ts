@@ -21,12 +21,12 @@ describe('startup workspace native resume', () => {
       restartSession: vi.fn(async (id: string) => { calls.push('start-' + id); if (id === 'b') throw new Error('connection failed') }),
     }
     const result = await restoreStartupWorkspace(['a', 'b', 'c', 'missing', 'a'], port)
-    expect(calls).toEqual(['start-a', 'start-b', 'start-c'])
+    expect(calls).toEqual(['start-a', 'start-b', 'start-c', 'start-missing'])
     expect(port.setFullAutoMode).not.toHaveBeenCalled()
     expect(sessions[0]!.fullAutoEnabled).toBe(true)
     expect(sessions[1]!.fullAutoEnabled).toBe(false)
-    expect(result.restored).toEqual(['a', 'c'])
-    expect(result.failed.map(item => item.sessionId)).toEqual(['b', 'missing'])
+    expect(result.restored).toEqual(['a', 'c', 'missing'])
+    expect(result.failed.map(item => item.sessionId)).toEqual(['b'])
     expect(result.failed[0]!.reason).toBe('connection failed')
   })
 

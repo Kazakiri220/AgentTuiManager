@@ -11,7 +11,7 @@ export function workspaceRestoreCandidates(ids: string[], sessions: SessionSumma
     && ['stopped', 'failed', 'completed'].includes(session.status))
 }
 
-/** Sequential native resumes only. Never creates a replacement conversation. */
+/** 有绑定时恢复原会话；从未取得 ID 的窗口按原配置启动。 */
 export async function restoreStartupWorkspace(ids: string[], port: StartupWorkspacePort) {
   const result: { restored: string[]; failed: Array<{ sessionId: string; name: string; reason: string }> } = { restored: [], failed: [] }
   const resumedNative = new Set<string>()
@@ -19,16 +19,15 @@ export async function restoreStartupWorkspace(ids: string[], port: StartupWorksp
     const session = workspaceRestoreCandidates([id], port.listSessions())[0]
     if (!session) continue
     try {
-      if (!session.nativeSessionId) throw new Error('尚无原生会话 ID，请手动选择历史会话')
       const nativeKey = JSON.stringify([session.agentKind, session.nativeSessionId])
-      if (resumedNative.has(nativeKey) || port.listSessions().some(other => other.sessionId !== id
+      if (session.nativeSessionId && (resumedNative.has(nativeKey) || port.listSessions().some(other => other.sessionId !== id
         && other.agentKind === session.agentKind && other.nativeSessionId === session.nativeSessionId
-        && !['stopped', 'failed', 'completed'].includes(other.status))) {
+        && !['stopped', 'failed', 'completed'].includes(other.status)))) {
         throw new Error('同一原生会话已有运行窗口，已跳过重复恢复')
       }
       // Restart inherits the persisted per-window full-auto setting.
       await port.restartSession(id)
-      resumedNative.add(nativeKey)
+      if (session.nativeSessionId) resumedNative.add(nativeKey)
       result.restored.push(id)
     } catch (error) {
       result.failed.push({ sessionId: id, name: session.displayName, reason: error instanceof Error ? error.message : String(error) })
