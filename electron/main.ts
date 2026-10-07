@@ -4,6 +4,7 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net,
 import { AttentionSound } from './attention-sound'
 import { isAttentionSessionActive } from './attention-focus'
 import { AttentionAudioDelivery } from './attention-audio-delivery'
+import { TerminalSettingsStore } from './terminal-settings-store'
 import { AttentionAudioSettingsStore } from './attention-audio-settings-store'
 import { NativeAttentionAudio } from './native-attention-audio'
 import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings, type AttentionAudioSettings } from '../src/shared/attention-audio-settings'
@@ -100,6 +101,7 @@ const attentionAudioDelivery = new AttentionAudioDelivery({
     message: outcome === 'renderer_completed' ? '音频通道已完成提示音播放' : outcome === 'muted' ? '提示音音量为 0%，已静音' : '提示音已调用备用音频播放', details: { outcome } }),
 })
 function playAttentionChime(preview?: AttentionAudioSettings): void { attentionAudioDelivery.play(preview) }
+let terminalSettingsStore: TerminalSettingsStore
 let attentionAudioSettingsStore: AttentionAudioSettingsStore
 let auditStore: ActivityAuditStore
 let tokenUsageStore: TokenUsageStore
@@ -827,6 +829,14 @@ async function restoreNativeSessionProvider(session: SessionSummary | undefined)
 }
 
 function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
+  ipcMain.handle(IPC_CHANNELS.getTerminalSettings, event => {
+    trustedRenderer(event)
+    return terminalSettingsStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.updateTerminalSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    return terminalSettingsStore.update(value)
+  })
   ipcMain.handle(IPC_CHANNELS.getAttentionSoundSettings, event => {
     trustedRenderer(event)
     return attentionAudioSettingsStore.getSettings()
@@ -1675,6 +1685,7 @@ void app.whenReady().then(async () => {
   continueKeywordStore = await ContinueKeywordStore.load(join(app.getPath('userData'), 'continue-keywords.json'))
   sessionSafetyStore = await SessionSafetyStore.load(join(app.getPath('userData'), 'session-safety.json'))
   sessionCatalog = await ManagedSessionCatalog.load(join(app.getPath('userData'), 'managed-sessions.json'))
+  terminalSettingsStore = await TerminalSettingsStore.load(join(app.getPath('userData'), 'terminal-settings.json'))
   attentionAudioSettingsStore = await AttentionAudioSettingsStore.load(join(app.getPath('userData'), 'attention-sound-settings.json'))
   dingTalkSettingsStore = await DingTalkSettingsStore.load(join(app.getPath('userData'), 'dingtalk-settings.json'), safeStorage)
   llmReviewSettingsStore = await LlmReviewSettingsStore.load(join(app.getPath('userData'), 'llm-review-settings.json'), safeStorage)
@@ -1686,6 +1697,7 @@ void app.whenReady().then(async () => {
     ? join('/tmp', `agent-tui-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`)
     : undefined
   const manager = new SessionHostManager({
+    getCodexTerminalMode: () => terminalSettingsStore.getSettings().codexMode,
     onStartupProgress: (progress) => recordAudit({
       level: progress.failed ? 'warning' : 'info', category: 'session', action: 'host_startup_phase',
       message: progress.failed ? '终端启动阶段失败' : progress.phase === 'complete' ? '终端启动握手完成' : '终端启动阶段完成',

@@ -55,6 +55,7 @@ describe('TerminalTile write watchdog', () => {
     terminalMocks.write.mockReset()
     terminalMocks.cols = 100
     terminalMocks.rows = 30
+    terminalMocks.buffer.active.type = 'normal'
     terminalMocks.buffer.active.baseY = 100
     terminalMocks.buffer.active.viewportY = 100
     terminalMocks.options.fontSize = 12
@@ -98,6 +99,35 @@ describe('TerminalTile write watchdog', () => {
     expect(handler(new KeyboardEvent('keyup', { key: 'c', ctrlKey: true }))).toBe(false)
     expect(handler(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true, repeat: true }))).toBe(false)
     expect(window.agentManager.writeClipboardText).toHaveBeenCalledTimes(1)
+  })
+
+  it('leaves native mouse input and alternate-screen scrolling to Codex', async () => {
+    vi.useFakeTimers()
+    terminalMocks.write.mockImplementation((_data, done) => done?.())
+    const view = render(<TerminalTile session={session} />)
+    await act(async () => { await Promise.resolve(); vi.advanceTimersByTime(250) })
+    const host = view.container.querySelector('.terminal-live-host')!
+    const viewport = host.querySelector('.xterm-viewport')!
+    fireEvent.pointerDown(viewport)
+    terminalMocks.buffer.active.viewportY = 80
+    fireEvent.scroll(viewport)
+    fireEvent.pointerUp(document)
+    terminalMocks.buffer.active.type = 'alternate'
+    terminalMocks.buffer.active.baseY = 0
+    terminalMocks.buffer.active.viewportY = 0
+    terminalMocks.scrollToBottom.mockClear(); terminalMocks.scrollToLine.mockClear()
+    act(() => listener?.({ type: 'output', sessionId: session.sessionId, data: 'fullscreen frame' }))
+    await act(async () => vi.advanceTimersByTime(20))
+    fireEvent.wheel(host, { deltaY: -120 })
+    fireEvent.click(view.getByRole('button', { name: '刷新终端显示' }))
+    expect(terminalMocks.scrollToLine).not.toHaveBeenCalled()
+    expect(terminalMocks.scrollToBottom).not.toHaveBeenCalled()
+    const mouse = '\x1b[<0;5;20M\x1b[<32;9;20M\x1b[<0;9;20m'
+    await act(async () => { terminalMocks.onData.mock.calls[0]![0](mouse) })
+    expect(window.agentManager.write).toHaveBeenCalledWith(session.sessionId, mouse)
+    const handler = terminalMocks.attachCustomKeyEventHandler.mock.calls[0]![0]
+    expect(handler(new KeyboardEvent('keydown', { key: 'c', ctrlKey: true }))).toBe(true)
+    expect(handler(new KeyboardEvent('keydown', { key: 'Delete' }))).toBe(true)
   })
 
   it('retains Ctrl+C interruption without selection and preserves explicit copy shortcuts', () => {

@@ -101,6 +101,7 @@ export interface SessionHostManagerOptions {
   onStartupProgress?: (progress: HostStartupProgress) => void
   leaseMs?: number
   preserveOnLeaseExpiry?: boolean
+  getCodexTerminalMode?: () => import('../src/shared/terminal-settings').CodexTerminalMode
   resolveAgentConfig?: (profileId: string, agentKind: AgentKind, args: string[]) => Promise<{ environment: Record<string, string>; args: string[] }>
   resolveAgentProxy?: (proxyId: string) => Promise<Record<string, string>>
 }
@@ -367,6 +368,7 @@ export class SessionHostManager {
   private readonly hostEntry: string
   private readonly nodeExecutable: string
   private readonly timeoutMs: number
+  private readonly getCodexTerminalMode?: SessionHostManagerOptions['getCodexTerminalMode']
   private readonly resolveAgentConfig?: SessionHostManagerOptions['resolveAgentConfig']
   private readonly resolveAgentProxy?: SessionHostManagerOptions['resolveAgentProxy']
   private readonly managerId = randomUUID()
@@ -383,6 +385,7 @@ export class SessionHostManager {
     this.onStartupProgress = options.onStartupProgress
     this.leaseMs = Math.max(5_000, Math.min(60_000, options.leaseMs ?? 15_000))
     this.preserveOnLeaseExpiry = options.preserveOnLeaseExpiry !== false
+    this.getCodexTerminalMode = options.getCodexTerminalMode
     this.resolveAgentConfig = options.resolveAgentConfig
     this.resolveAgentProxy = options.resolveAgentProxy
   }
@@ -392,6 +395,7 @@ export class SessionHostManager {
   }
 
   async start(options: StartHostOptions): Promise<HostHandle> {
+    const codexTerminalMode = this.getCodexTerminalMode?.() ?? 'scrollback'
     await mkdir(this.runtimeDir, { recursive: true })
     if (this.socketDir !== this.runtimeDir) await mkdir(this.socketDir, { recursive: true, mode: 0o700 })
     const hostId = randomUUID()
@@ -472,6 +476,7 @@ export class SessionHostManager {
       report('ready')
       handle.send({
         type: 'start',
+        ...(options.agentKind === 'codex' ? { codexTerminalMode } : {}),
         ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
         agentKind: options.agentKind,
         executable: options.executable,

@@ -71,6 +71,8 @@ describe('App terminal wall', () => {
       setActiveSession: vi.fn(async () => undefined),
       onAttentionSound: vi.fn(() => () => undefined),
       testAttentionSound: vi.fn(async () => undefined),
+      getTerminalSettings: vi.fn(async () => ({ codexMode: 'scrollback' as const })),
+      updateTerminalSettings: vi.fn(async settings => settings),
       getAttentionSoundSettings: vi.fn(async () => ({ sound: 'classic' as const, volume: 100 })),
       updateAttentionSoundSettings: vi.fn(async settings => settings),
       platform: 'win32',

@@ -1,5 +1,6 @@
 import type { HostEvent } from './protocol'
 import type { NetworkRetrySettings } from './network-retry'
+import type { TerminalSettings } from './terminal-settings'
 import type { AttentionAudioSettings } from './attention-audio-settings'
 import type { SessionState } from './session-state'
 
@@ -531,6 +532,8 @@ export const IPC_CHANNELS = {
   attentionSoundReady: 'agent-manager:attention-sound-ready',
   attentionSoundResult: 'agent-manager:attention-sound-result',
   testAttentionSound: 'agent-manager:test-attention-sound',
+  getTerminalSettings: 'agent-manager:get-terminal-settings',
+  updateTerminalSettings: 'agent-manager:update-terminal-settings',
   getAttentionSoundSettings: 'agent-manager:get-attention-sound-settings',
   updateAttentionSoundSettings: 'agent-manager:update-attention-sound-settings',
   listSessions: 'agent-manager:list-sessions',
@@ -611,6 +614,8 @@ export interface AgentManagerApi {
   setActiveSession(sessionId: string | null): Promise<void>
   onAttentionSound(listener: (settings: AttentionAudioSettings) => Promise<void>): () => void
   testAttentionSound(settings?: AttentionAudioSettings): Promise<void>
+  getTerminalSettings(): Promise<TerminalSettings>
+  updateTerminalSettings(settings: TerminalSettings): Promise<TerminalSettings>
   getAttentionSoundSettings(): Promise<AttentionAudioSettings>
   updateAttentionSoundSettings(settings: AttentionAudioSettings): Promise<AttentionAudioSettings>
   readonly platform: NodeJS.Platform

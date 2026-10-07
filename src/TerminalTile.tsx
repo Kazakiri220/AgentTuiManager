@@ -195,13 +195,14 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       try { action() } finally { programmaticScrollDepth -= 1 }
     }
     const restoreUserScroll = (): void => {
+      if (terminal.buffer.active.type !== 'normal') { userScrollOffset = undefined; return }
       if (userScrollOffset === undefined) return
       const target = Math.max(0, terminal.buffer.active.baseY - userScrollOffset)
       programmaticScroll(() => terminal.scrollToLine(target))
     }
     const scrollToLatest = (): void => {
       userScrollOffset = undefined
-      programmaticScroll(() => terminal.scrollToBottom())
+      if (terminal.buffer.active.type === 'normal') programmaticScroll(() => terminal.scrollToBottom())
     }
     const preserveLatestReplayScrollback = (data: string): string => {
       const standard = data.lastIndexOf('\x1b[3J')
@@ -279,7 +280,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
           terminal.refresh(0, Math.max(0, terminal.rows - 1))
         }
         if (synchronizedResizeRedraw) {
-          if (resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
+          if (terminal.buffer.active.type === 'normal' && resizeWasAtBottom && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
           requestAnimationFrame(() => requestAnimationFrame(hideResizeCover))
         }
         if (pendingOutput && !outputFrame) outputFrame = requestAnimationFrame(flushOutput)
@@ -387,6 +388,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
     const rememberGestureScroll = (): void => {
       // Public onScroll also reports TUI output and asynchronous viewport sync.
       // Those events must not turn an input redraw into a history-browsing lock.
+      if (terminal.buffer.active.type !== 'normal') { userScrollOffset = undefined; return }
       if (programmaticScrollDepth > 0 || (!pointerScrollGesture && !keyboardScrollGesture)) return
       const buffer = terminal.buffer.active
       userScrollOffset = buffer.viewportY < buffer.baseY ? buffer.baseY - buffer.viewportY : undefined
@@ -620,7 +622,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       // A resize changes how many lines fit, so re-anchor explicitly rather than leaving
       // the viewport wherever the reflow happened to drop it. Going fullscreen and back
       // otherwise left the tile parked at the top of the history.
-      if (userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
+      if (terminal.buffer.active.type === 'normal' && userScrollOffset === undefined) programmaticScroll(() => terminal.scrollToBottom())
       else restoreUserScroll()
       sendPtyResize(cols, rows)
       if (forceRedraw || manualRedrawRequested) scheduleResize()

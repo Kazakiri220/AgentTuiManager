@@ -7,6 +7,8 @@ import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessio
 const api: AgentManagerApi = {
   setActiveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.setActiveSession, sessionId),
   testAttentionSound: (settings) => ipcRenderer.invoke(IPC_CHANNELS.testAttentionSound, settings),
+  getTerminalSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getTerminalSettings),
+  updateTerminalSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateTerminalSettings, settings),
   getAttentionSoundSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAttentionSoundSettings),
   updateAttentionSoundSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAttentionSoundSettings, settings),
   onAttentionSound: (listener) => {

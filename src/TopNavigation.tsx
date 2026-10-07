@@ -3,7 +3,7 @@ import MotionPresence from './MotionPresence'
 import { usePreference } from './ui-preferences'
 import './top-navigation.css'
 
-export type NavigationAction = 'overview' | 'attention' | 'audit' | 'tokens' | 'attention-sound' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review'
+export type NavigationAction = 'overview' | 'attention' | 'audit' | 'tokens' | 'attention-sound' | 'terminal-settings' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review'
 type NavigationView = 'overview' | 'attention' | 'audit' | 'tokens'
 type MenuName = 'statistics' | 'settings' | 'shortcuts'
 type ShortcutSlot = { id: string; action: NavigationAction; visible: boolean }
@@ -12,6 +12,7 @@ export const TOP_NAVIGATION_SHORTCUTS_KEY = 'agent-tui-manager:top-navigation-sh
 export const NAVIGATION_ACTIONS: ReadonlyArray<{ action: NavigationAction; label: string }> = [
   { action: 'overview', label: 'Agent 总览' }, { action: 'attention', label: '处理中心' },
   { action: 'audit', label: '审计' }, { action: 'tokens', label: 'Token 用量' },
+  { action: 'terminal-settings', label: '终端显示模式' },
   { action: 'attention-sound', label: '提示音设置' }, { action: 'approval-rules', label: '安全规则' },
   { action: 'continue-keywords', label: '关键词续跑' }, { action: 'session-safety', label: '会话安全' },
   { action: 'dingtalk', label: '钉钉远程' }, { action: 'llm-review', label: '审核器设置' },
@@ -36,6 +37,7 @@ function NavigationIcon({ action }: { action: NavigationAction | MenuName | 'con
     audit: 'M5 4h14v17H5zM8 9h8M8 13h8M8 17h5',
     tokens: 'M5 4h14M5 20h14M18 4l-8 8 8 8',
     settings: 'M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
+    'terminal-settings': 'M3 4h18v16H3zM6 8l4 4-4 4M12 16h6',
     'attention-sound': 'M11 4v13M11 6l8-2v11M11 17a3 3 0 1 1-3-3 3 3 0 0 1 3 3M19 15a3 3 0 1 1-3-3 3 3 0 0 1 3 3',
     'approval-rules': 'M12 3l8 3v6c0 5-8 9-8 9S4 17 4 12V6zM8 12l3 3 5-6',
     'continue-keywords': 'M19 8a8 8 0 1 0 1 7M19 3v5h-5M10 8l5 4-5 4z',

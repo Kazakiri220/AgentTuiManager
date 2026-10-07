@@ -830,3 +830,11 @@ button:disabled { cursor: default; opacity: .55; }
 .provider-model-field > button { justify-self: start; }
 .session-binding-actions { display: flex; flex-shrink: 0; flex-wrap: wrap; gap: 7px; padding: 7px; background: var(--panel); border-bottom: 1px solid var(--line); }
 .recovery-choice-actions { flex-wrap: wrap; gap: 8px; }
+
+/* Terminal settings share the modal motion tokens; the footer never scrolls. */
+.terminal-settings-dialog { display: flex; flex-direction: column; overflow: hidden; }
+.terminal-settings-dialog > header, .terminal-settings-dialog > footer { flex-shrink: 0; }
+.terminal-settings-body { flex: 1; overflow-y: auto; min-height: 0; padding-right: 3px; }
+.terminal-settings-dialog fieldset { display: grid; gap: 12px; min-width: 0; margin: 22px 0; padding: 0; border: 0; }
+.terminal-settings-dialog label { font-size: 12px; }
+.terminal-settings-dialog select { width: 100%; min-height: 38px; padding: 7px 10px; color: var(--text); background: #0e1517; border: 1px solid #39474b; border-radius: 5px; }

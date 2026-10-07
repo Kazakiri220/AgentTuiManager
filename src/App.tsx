@@ -16,6 +16,7 @@ import { rememberRecentWorkspace } from './workspace-shortcuts'
 import CollapsiblePanel from './CollapsiblePanel'
 import './upgrade-ui.css'
 import { playAttentionAudio } from './attention-audio'
+import TerminalSettingsDialog from './TerminalSettingsDialog'
 import AttentionSoundSettingsDialog from './AttentionSoundSettingsDialog'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
@@ -67,7 +68,7 @@ interface OverviewPreferences {
   statusFilter?: SessionDisplayStatus[]
 }
 
-type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'attention-sound' | 'dingtalk' | 'llm-review' | 'full-auto' | 'continuation'
+type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'attention-sound' | 'terminal-settings' | 'dingtalk' | 'llm-review' | 'full-auto' | 'continuation'
 
 function readOverviewPreferences(): OverviewPreferences {
   const fallback: OverviewPreferences = { overviewMode: 'wall', groupByWorkspace: false }
@@ -825,6 +826,7 @@ export default function App(): JSX.Element {
   const [showApprovalRules, setShowApprovalRules] = useState(false)
   const [showContinueKeywords, setShowContinueKeywords] = useState(false)
   const [showSessionSafety, setShowSessionSafety] = useState(false)
+  const [showTerminalSettings, setShowTerminalSettings] = useState(false)
   const [showAttentionSoundSettings, setShowAttentionSoundSettings] = useState(false)
   const [showDingTalkSettings, setShowDingTalkSettings] = useState(false)
   const [showLlmReviewSettings, setShowLlmReviewSettings] = useState(false)
@@ -860,11 +862,11 @@ export default function App(): JSX.Element {
     if (recoveryChoiceId && !sessions.some(session => session.sessionId === recoveryChoiceId && session.startupRecoveryRequired)) setRecoveryChoiceId(undefined)
   }, [sessions, recoveryChoiceId])
   useEffect(() => {
-    if (bindingTarget || recoveryChoiceId || showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || fullAutoSessionId || continuationSource || navigationMenuOpen) return
+    if (bindingTarget || recoveryChoiceId || showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || showTerminalSettings || fullAutoSessionId || continuationSource || navigationMenuOpen) return
     const failed = sessions.find(session => session.startupRecoveryRequired && ['codex', 'claude'].includes(session.agentKind)
       && !dismissedRecoveryChoices.current.has(session.sessionId + ':' + session.activitySince))
     if (failed) setRecoveryChoiceId(failed.sessionId)
-  }, [sessions, bindingTarget, recoveryChoiceId, showForm, showEditor, showApprovalRules, showContinueKeywords, showSessionSafety, showDingTalkSettings, showLlmReviewSettings, showAttentionSoundSettings, fullAutoSessionId, continuationSource, navigationMenuOpen])
+  }, [sessions, bindingTarget, recoveryChoiceId, showForm, showEditor, showApprovalRules, showContinueKeywords, showSessionSafety, showDingTalkSettings, showLlmReviewSettings, showAttentionSoundSettings, showTerminalSettings, fullAutoSessionId, continuationSource, navigationMenuOpen])
   const dismissRecoveryChoice = (): void => {
     if (recoveryChoice) dismissedRecoveryChoices.current.add(recoveryChoice.sessionId + ':' + recoveryChoice.activitySince)
     setRecoveryChoiceId(undefined)
@@ -878,6 +880,7 @@ export default function App(): JSX.Element {
     if (except !== 'approval-rules') setShowApprovalRules(false)
     if (except !== 'continue-keywords') setShowContinueKeywords(false)
     if (except !== 'session-safety') setShowSessionSafety(false)
+    if (except !== 'terminal-settings') setShowTerminalSettings(false)
     if (except !== 'attention-sound') setShowAttentionSoundSettings(false)
     if (except !== 'dingtalk') setShowDingTalkSettings(false)
     if (except !== 'llm-review') setShowLlmReviewSettings(false)
@@ -1015,7 +1018,7 @@ export default function App(): JSX.Element {
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
   const hasAttentionOverlay = showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety
-    || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || Boolean(fullAutoSessionId || continuationSource) || navigationMenuOpen || Boolean(bindingTarget || recoveryChoice)
+    || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || showTerminalSettings || Boolean(fullAutoSessionId || continuationSource) || navigationMenuOpen || Boolean(bindingTarget || recoveryChoice)
   const candidateSoundSessionId = view !== 'overview' || hasAttentionOverlay ? undefined : selected?.sessionId
     ?? (overviewMode === 'list' ? activeListSessionId : wallActiveId && overviewSessionIds.has(wallActiveId) ? wallActiveId : undefined)
   const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
@@ -1051,6 +1054,7 @@ export default function App(): JSX.Element {
     if (action === 'approval-rules') setShowApprovalRules(true)
     else if (action === 'continue-keywords') setShowContinueKeywords(true)
     else if (action === 'session-safety') setShowSessionSafety(true)
+    else if (action === 'terminal-settings') setShowTerminalSettings(true)
     else if (action === 'attention-sound') setShowAttentionSoundSettings(true)
     else if (action === 'dingtalk') setShowDingTalkSettings(true)
     else if (action === 'llm-review') { setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }
@@ -1174,6 +1178,7 @@ export default function App(): JSX.Element {
       <MotionPresence open={Boolean(showContinueKeywords)}>{showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showSessionSafety)}>{showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showDingTalkSettings)}>{showDingTalkSettings && <DingTalkSettingsDialog onClose={() => setShowDingTalkSettings(false)} />}</MotionPresence>
+      <MotionPresence open={showTerminalSettings}>{showTerminalSettings && <TerminalSettingsDialog onClose={() => setShowTerminalSettings(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showAttentionSoundSettings)}>{showAttentionSoundSettings && <AttentionSoundSettingsDialog onClose={() => setShowAttentionSoundSettings(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showLlmReviewSettings)}>{showLlmReviewSettings && <LlmReviewSettingsDialog initialView={llmReviewInitialView} onClose={() => setShowLlmReviewSettings(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(fullAutoSession)}>{fullAutoSession && <ApprovalModeDialog onConfigureReviewer={() => { setFullAutoSessionId(undefined); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }} session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}</MotionPresence>

@@ -9,6 +9,7 @@ import * as pty from 'node-pty'
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import { approvalInputIssueFields } from '../src/shared/approval-input'
 import { environmentForAgent } from './agent-environment'
+import { codexTerminalModeArgs } from './codex-terminal-mode'
 import { codexTerminalCompatibilityArgs } from './codex-terminal-compat'
 import { ensureMacPtySpawnHelper } from './macos-pty-helper'
 import { TerminalReplayBuffer } from './terminal-replay-buffer'
@@ -194,13 +195,12 @@ function claudeArgs(args: string[], cwd: string): { args: string[]; permissionHo
   return { args: ['--settings', claudeSettingsPath, ...remaining], permissionHook: true }
 }
 
-function codexArgs(args: string[]): string[] {
+function codexArgs(args: string[], mode?: import('../src/shared/terminal-settings').CodexTerminalMode): string[] {
   const quote = String.fromCharCode(34)
   const hookConfig = '[{ matcher = "*", hooks = [{ type = "command", command = '
     + JSON.stringify(codexHookCommand())
     + ', timeout = 1800, statusMessage = "请稍后" }] }]'
-  return [
-    ...(args.includes('--no-alt-screen') ? [] : ['--no-alt-screen']),
+  return codexTerminalModeArgs([
     ...(args.includes('--enable') && args.includes('hooks') ? [] : ['--enable', 'hooks']),
     ...(args.includes('--dangerously-bypass-hook-trust') ? [] : ['--dangerously-bypass-hook-trust']),
     '-c', `hooks.PermissionRequest=${hookConfig}`,
@@ -208,7 +208,7 @@ function codexArgs(args: string[]): string[] {
     '-c', 'tui.notification_method=' + quote + 'osc9' + quote,
     '-c', 'tui.notification_condition=' + quote + 'always' + quote,
     ...codexTerminalCompatibilityArgs(args),
-  ]
+  ], mode)
 }
 
 // Codex builds its scrollback by scrolling a DECSTBM region above the inline composer
@@ -242,7 +242,7 @@ function startTerminal(socket: Socket, command: Extract<HostCommand, { type: 'st
     const pendingOutput: string[] = []
     let ready = false
     const claudeLaunch = command.agentKind === 'claude' ? claudeArgs(command.args, command.cwd) : undefined
-    const args = claudeLaunch?.args ?? (command.agentKind === 'codex' ? codexArgs(command.args) : command.args)
+    const args = claudeLaunch?.args ?? (command.agentKind === 'codex' ? codexArgs(command.args, command.codexTerminalMode) : command.args)
     const permissionHook = command.agentKind === 'codex'
       ? 'codex' as const
       : claudeLaunch?.permissionHook

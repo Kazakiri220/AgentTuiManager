@@ -2,6 +2,7 @@ export type HostCommand =
   | {
       type: 'start'
       initialPrompt?: string
+      codexTerminalMode?: import('./terminal-settings').CodexTerminalMode
       agentKind: import('./manager-api').AgentKind
       executable: string
       args: string[]
