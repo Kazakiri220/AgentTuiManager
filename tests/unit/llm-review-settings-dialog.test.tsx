@@ -72,7 +72,7 @@ describe('reviewer pool settings form', () => {
     await screen.findByText('连接正常 · connection-model')
     expect(api.testLlmReviewer).toHaveBeenCalledWith(expect.objectContaining({ reviewers: expect.any(Array) }), 'B')
   })
-  it('saves edited drafts before importing only the searched selected Provider ID', async () => {
+  it('imports only the searched Provider ID without saving or discarding other drafts', async () => {
     vi.mocked(api.listCCSwitchProviders).mockResolvedValue([
       { id: 'provider-selected', name: 'Chosen Gateway', agentKind: 'codex', isCurrent: false, hasApiKey: true, model: 'chosen-model' },
       { id: 'provider-other', name: 'Other Gateway', agentKind: 'codex', isCurrent: true, hasApiKey: true },
@@ -80,18 +80,24 @@ describe('reviewer pool settings form', () => {
     vi.mocked(api.importLlmReviewer).mockResolvedValue({ ...pool, reviewers: [...pool.reviewers!, { id: 'imported', name: 'Chosen Gateway', enabled: false, backend: 'api', protocol: 'openai-responses', baseUrl: 'https://chosen.example', model: 'chosen-model', hasApiKey: true }] })
     await open()
     fireEvent.change(screen.getByLabelText('审核器名称'), { target: { value: 'Keep this edit' } })
+    fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'fictional-unsaved-key' } })
     fireEvent.click(screen.getByRole('button', { name: '从 CC Switch 导入' }))
     await screen.findByRole('button', { name: /Chosen Gateway/ })
     fireEvent.change(screen.getByLabelText('搜索 CC Switch 配置'), { target: { value: 'chosen-model' } })
     expect(screen.queryByRole('button', { name: /Other Gateway/ })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Chosen Gateway/ }))
-    fireEvent.click(screen.getByRole('button', { name: '保存并导入所选配置' }))
+    fireEvent.click(screen.getByRole('button', { name: '导入所选配置' }))
     await waitFor(() => expect(api.importLlmReviewer).toHaveBeenCalledWith({ agentKind: 'codex', providerId: 'provider-selected' }))
-    expect(vi.mocked(api.updateLlmReviewSettings).mock.calls[0]?.[0].reviewers?.[0]?.name).toBe('Keep this edit')
-    expect(vi.mocked(api.updateLlmReviewSettings).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(api.importLlmReviewer).mock.invocationCallOrder[0]!)
+    expect(api.updateLlmReviewSettings).not.toHaveBeenCalled()
     await waitFor(() => expect(screen.getByLabelText('API 协议')).toHaveValue('openai-responses'))
     expect(screen.getByLabelText('API Key')).toHaveValue('')
     expect(screen.getByRole('checkbox', { name: '启用 Chosen Gateway' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: /1\. Keep this edit/ }))
+    expect(screen.getByLabelText('API Key')).toHaveValue('fictional-unsaved-key')
+    fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
+    await waitFor(() => expect(api.updateLlmReviewSettings).toHaveBeenCalledWith(expect.objectContaining({
+      reviewers: expect.arrayContaining([expect.objectContaining({ id: 'A', name: 'Keep this edit', apiKey: 'fictional-unsaved-key' })]),
+    })))
   })
 })
 afterEach(cleanup)

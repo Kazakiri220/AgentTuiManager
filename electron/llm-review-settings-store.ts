@@ -318,7 +318,13 @@ export class LlmReviewSettingsStore {
     if (input.reviewers && (input.enabled || input.scheduledRuleAuditEnabled)) {
       const enabled = resolved.reviewers!.filter(entry => entry.enabled)
       if (!enabled.length) throw new Error('请至少启用一个审核器')
-      if (enabled.some(entry => entry.backend === 'api' && (!entry.baseUrl || !entry.apiKey || !entry.model))) throw new Error('启用 API 审核器需要 Base URL、API Key 和 Model')
+      const incomplete = resolved.reviewers!.flatMap((entry, index) => {
+        if (!entry.enabled || entry.backend !== 'api') return []
+        const missing = [!entry.baseUrl && 'Base URL', !entry.apiKey && 'API Key', !entry.model && 'Model'].filter(Boolean)
+        // Identify by visible position, not user-supplied labels that might contain credentials.
+        return missing.length ? [`第 ${index + 1} 个审核器缺少 ${missing.join('、')}`] : []
+      })
+      if (incomplete.length) throw new Error(incomplete.join('；') + '。请补全这些字段，或取消勾选对应审核器后保存；其他已保存的密钥无需重新填写。')
     }
     if (input.baseUrl) {
       let parsed: URL

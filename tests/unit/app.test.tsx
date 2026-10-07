@@ -21,6 +21,18 @@ vi.mock('@xterm/xterm', () => ({ Terminal: vi.fn(() => terminalMocks) }))
 import { Terminal } from '@xterm/xterm'
 import App from '../../src/App'
 import { isTerminalProtocolResponse } from '../../src/TerminalTile'
+import { RECENT_WORKSPACES_KEY } from '../../src/workspace-shortcuts'
+
+function clickNavigationMenuItem(menu: '设置' | '统计', item: string): void {
+  fireEvent.click(screen.getByRole('button', { name: menu }))
+  fireEvent.click(screen.getByRole('menuitem', { name: item }))
+}
+
+function selectWorkspace(name: RegExp): void {
+  const picker = screen.getByRole('combobox', { name: '切换工作区' })
+  const option = within(picker).getByRole('option', { name }) as HTMLOptionElement
+  fireEvent.change(picker, { target: { value: option.value } })
+}
 
 const session: SessionSummary = {
   sessionId: 'session-1', displayName: 'Codex API 重构', agentKind: 'codex', workspace: 'B:\\projects\\api',
@@ -59,11 +71,14 @@ describe('App terminal wall', () => {
       setActiveSession: vi.fn(async () => undefined),
       onAttentionSound: vi.fn(() => () => undefined),
       testAttentionSound: vi.fn(async () => undefined),
+      getAttentionSoundSettings: vi.fn(async () => ({ sound: 'classic' as const, volume: 100 })),
+      updateAttentionSoundSettings: vi.fn(async settings => settings),
       platform: 'win32',
       listSessions: vi.fn(async () => [session]), startSession: vi.fn(async (request) => ({ ...session, displayName: request.displayName, agentKind: request.agentKind, workspace: request.workspace })), write: vi.fn(), resize: vi.fn(),
       terminalReplay: vi.fn(async () => ({ data: '', sequence: 0 })),
       openDeepSeekWeb: vi.fn(async () => undefined),
       openExternalWeb: vi.fn(async () => undefined),
+      openSessionWorkspace: vi.fn(async () => undefined),
       listAuditEntries: vi.fn(async () => []),
       exportAuditEntries: vi.fn(async () => undefined),
       listPendingApprovals: vi.fn(async () => []), approveRequest: vi.fn(), approveAndRememberRequest: vi.fn(), rejectRequest: vi.fn(),
@@ -151,7 +166,8 @@ describe('App terminal wall', () => {
     render(<App />)
     expect(await screen.findByText('Codex API 重构')).toBeInTheDocument()
     expect(screen.getByText('B:\\projects\\api')).toBeInTheDocument()
-    expect(document.querySelector('.app-title small')).toHaveTextContent('全部工作区')
+    expect(screen.getByRole('switch', { name: '按工作区划分' })).toHaveAttribute('aria-checked', 'false')
+    expect(screen.queryByRole('combobox', { name: '切换工作区' })).not.toBeInTheDocument()
     const tile = screen.getByTestId('terminal-tile-session-1')
     expect(within(tile).getByText('运行中')).toBeInTheDocument()
     await waitFor(() => expect(Terminal).toHaveBeenCalledTimes(1))
@@ -251,7 +267,7 @@ describe('App terminal wall', () => {
     render(<App />)
     await screen.findByTestId('terminal-tile-session-1')
     expect(api.terminalReplay).toHaveBeenCalledTimes(1)
-    fireEvent.click(within(document.querySelector('.sidebar') as HTMLElement).getByRole('button', { name: /docs/ }))
+    selectWorkspace(/docs/)
     expect(api.terminalReplay).toHaveBeenCalledTimes(2)
     act(() => listeners.forEach(listener => listener({ type: 'sessions-changed', sessionId: session.sessionId, session: null, approvals: [] })))
     expect(screen.queryByTestId('terminal-tile-session-1')).not.toBeInTheDocument()
@@ -296,11 +312,11 @@ describe('App terminal wall', () => {
     expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
     expect(first).not.toHaveClass('terminal-card-active')
     expect(second).toHaveClass('terminal-card-active')
-    fireEvent.click(screen.getByRole('button', { name: /会话安全$/ }))
+    clickNavigationMenuItem('设置', '会话安全')
     expect(api.setActiveSession).toHaveBeenLastCalledWith(null)
     fireEvent.click(screen.getByRole('button', { name: '关闭会话安全设置' }))
     expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
-    fireEvent.click(screen.getByRole('button', { name: '审计' }))
+    clickNavigationMenuItem('统计', '审计')
     expect(api.setActiveSession).toHaveBeenLastCalledWith(null)
     fireEvent.click(screen.getByRole('button', { name: /Agent 总览$/ }))
     expect(api.setActiveSession).toHaveBeenLastCalledWith('session-2')
@@ -324,7 +340,7 @@ describe('App terminal wall', () => {
     expect(Terminal).toHaveBeenCalledTimes(2)
     expect(firstTile).not.toHaveClass('terminal-card-hidden')
     expect(secondTile).not.toHaveClass('terminal-card-hidden')
-    expect(within(document.querySelector('.sidebar') as HTMLElement).queryByRole('button', { name: /api/ })).not.toBeInTheDocument()
+    expect(screen.queryByRole('combobox', { name: '切换工作区' })).not.toBeInTheDocument()
 
     const modeSwitch = screen.getByRole('group', { name: 'Agent 显示模式' })
     fireEvent.click(within(modeSwitch).getByRole('button', { name: /列表/ }))
@@ -346,7 +362,7 @@ describe('App terminal wall', () => {
     expect(firstTile).not.toHaveClass('terminal-card-hidden')
     expect(secondTile).toHaveClass('terminal-card-hidden')
     expect(api.setActiveSession).toHaveBeenLastCalledWith('session-1')
-    expect(within(document.querySelector('.sidebar') as HTMLElement).getByRole('button', { name: /api/ })).toBeInTheDocument()
+    expect(screen.getByRole('combobox', { name: '切换工作区' })).toHaveDisplayValue('api · 1')
     expect(Terminal).toHaveBeenCalledTimes(2)
 
     fireEvent.click(workspaceSwitch)
@@ -367,7 +383,7 @@ describe('App terminal wall', () => {
     terminalMocks.dispose.mockClear()
     terminalMocks.scrollToBottom.mockClear()
     for (let count = 0; count < 3; count += 1) {
-      fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+      clickNavigationMenuItem('统计', '审计')
       await screen.findByRole('heading', { name: '活动审计' })
       expect(tile.isConnected).toBe(true)
       expect(terminalMocks.dispose).not.toHaveBeenCalled()
@@ -489,7 +505,7 @@ describe('App terminal wall', () => {
 
     fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /列表/ }))
     fireEvent.click(screen.getByRole('switch', { name: '按工作区划分' }))
-    fireEvent.click(within(document.querySelector('.sidebar') as HTMLElement).getByRole('button', { name: /docs/ }))
+    selectWorkspace(/docs/)
     await waitFor(() => expect(window.localStorage.getItem('agent-tui-manager:overview-preferences:v1')).toContain('B:/projects/docs/'))
 
     cleanup()
@@ -497,7 +513,8 @@ describe('App terminal wall', () => {
     await screen.findByRole('button', { name: '切换到 Claude 文档整理' })
     expect(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /列表/ })).toHaveAttribute('aria-pressed', 'true')
     expect(screen.getByRole('switch', { name: '按工作区划分' })).toHaveAttribute('aria-checked', 'true')
-    expect(document.querySelector('.app-title small')).toHaveTextContent('B:/projects/docs/')
+    expect(screen.getByRole('combobox', { name: '切换工作区' })).toHaveDisplayValue('docs · 1')
+    expect(screen.getByRole('combobox', { name: '切换工作区' })).toHaveAttribute('title', 'B:/projects/docs/')
     expect(screen.getByLabelText('Agent 列表')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '切换到 Codex API 重构' })).not.toBeInTheDocument()
   })
@@ -570,7 +587,7 @@ describe('App terminal wall', () => {
     }))
   })
 
-  it('opens a notification popover without leaving the current view and approves one request', async () => {
+  it('shows a pending count in top navigation and approves the request from the handling center', async () => {
     vi.mocked(api.listPendingApprovals).mockResolvedValue([{
       requestId: 'approval-1',
       sessionId: session.sessionId,
@@ -586,35 +603,43 @@ describe('App terminal wall', () => {
       createdAt: 1,
       canBulkApprove: true,
     }])
+    vi.mocked(api.approveRequest).mockImplementation(async () => { vi.mocked(api.listPendingApprovals).mockResolvedValue([]) })
     render(<App />)
-    await screen.findByText('Codex API 重构')
-
-    fireEvent.mouseEnter(screen.getByRole('button', { name: '通知' }))
-    const popover = await screen.findByRole('dialog', { name: '通知' })
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    const navigation = screen.getByRole('button', { name: '处理中心' })
+    expect(within(navigation).getByLabelText('1 个待处理项')).toHaveTextContent('1')
+    expect(screen.queryByRole('button', { name: '通知' })).not.toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Agent 总览' })).toBeInTheDocument()
-    expect(within(popover).getByText('Edit · B:/projects/api/src/App.tsx')).toBeInTheDocument()
-    expect(within(popover).queryByRole('button', { name: '关闭通知' })).not.toBeInTheDocument()
-    fireEvent.pointerDown(document.body)
-    expect(popover).not.toHaveClass('is-visible')
-    fireEvent.focus(screen.getByRole('button', { name: '通知' }))
-    expect(popover).toHaveClass('is-visible')
-    fireEvent.click(within(popover).getByRole('button', { name: '批准' }))
+    fireEvent.click(navigation)
+    expect(screen.getByRole('heading', { name: '处理中心' })).toBeInTheDocument()
+    expect(navigation).toHaveAttribute('aria-current', 'page')
+    expect(screen.getByText('Edit · B:/projects/api/src/App.tsx')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '批准这一次' }))
     await waitFor(() => expect(api.approveRequest).toHaveBeenCalledWith('approval-1'))
+    await screen.findByText('当前没有待处理项')
+    expect(within(navigation).queryByLabelText('1 个待处理项')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Agent 总览' }))
+    expect(screen.getByTestId('terminal-tile-session-1')).toBe(tile)
+    expect(terminalMocks.dispose).not.toHaveBeenCalled()
   })
 
-  it('rejects a request directly from the notification popover', async () => {
+  it('rejects a request from the handling center and clears the navigation pending count', async () => {
     vi.mocked(api.listPendingApprovals).mockResolvedValue([{
       requestId: 'approval-reject', sessionId: session.sessionId, displayName: session.displayName,
       agentKind: session.agentKind, workspace: session.workspace, source: 'claude-hook',
       risk: 'write', toolName: 'Edit', command: 'tool:Edit', reason: '需要人工确认',
       createdAt: 1, canBulkApprove: true,
     }])
+    vi.mocked(api.rejectRequest).mockImplementation(async () => { vi.mocked(api.listPendingApprovals).mockResolvedValue([]) })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.mouseEnter(screen.getByRole('button', { name: '通知' }))
-    const popover = await screen.findByRole('dialog', { name: '通知' })
-    fireEvent.click(within(popover).getByRole('button', { name: '拒绝' }))
+    const navigation = screen.getByRole('button', { name: '处理中心' })
+    expect(within(navigation).getByLabelText('1 个待处理项')).toBeInTheDocument()
+    fireEvent.click(navigation)
+    fireEvent.click(screen.getByRole('button', { name: '拒绝' }))
     await waitFor(() => expect(api.rejectRequest).toHaveBeenCalledWith('approval-reject'))
+    await screen.findByText('当前没有待处理项')
+    expect(within(navigation).queryByLabelText('1 个待处理项')).not.toBeInTheDocument()
   })
 
   it('switches a running session through the four approval modes', async () => {
@@ -694,6 +719,55 @@ describe('App terminal wall', () => {
         extraArgs: ['--reasoning', 'high'],
       },
     })))
+  })
+
+  it.each([{ name: 'new', resume: false }, { name: 'resumed', resume: true }])('records the workspace only after a $name Agent starts successfully', async ({ resume }) => {
+    const previous = [{ path: 'B:\\projects\\previous', lastUsedAt: 1 }]
+    localStorage.setItem(RECENT_WORKSPACES_KEY, JSON.stringify(previous))
+    const workspace = resume ? 'B:\\resumed\\workspace' : 'B:\\chosen\\workspace'
+    vi.mocked(api.discoverRecentCodexSessions).mockResolvedValue([
+      { id: 'recent-fixture', title: '最近工作区恢复测试', workspace, updatedAt: Date.now() },
+    ])
+    let finishStart!: (created: SessionSummary) => void
+    vi.mocked(api.startSession).mockImplementation(() => new Promise(resolve => { finishStart = resolve }))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    if (resume) {
+      fireEvent.click(screen.getByRole('button', { name: '恢复历史' }))
+      fireEvent.click(await screen.findByRole('button', { name: /最近工作区恢复测试/ }))
+    } else {
+      fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+      await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue(workspace))
+    }
+    expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)).toEqual(previous)
+    const start = screen.getByRole('button', { name: resume ? '恢复会话' : '启动 Agent' })
+    await waitFor(() => expect(start).toBeEnabled())
+    fireEvent.click(start)
+    await waitFor(() => expect(api.startSession).toHaveBeenCalledTimes(1))
+    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ workspace, ...(resume ? { nativeSessionId: 'recent-fixture' } : {}) }))
+    expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)).toEqual(previous)
+    const created = { ...session, sessionId: 'recent-created', workspace }
+    vi.mocked(api.listSessions).mockResolvedValue([session, created])
+    await act(async () => { finishStart(created) })
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)).toEqual([
+      { path: workspace, lastUsedAt: expect.any(Number) }, ...previous,
+    ]))
+    expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)[0].lastUsedAt).toBeGreaterThan(previous[0]!.lastUsedAt)
+  })
+
+  it('leaves recent workspaces unchanged when a new Agent fails to start', async () => {
+    const previous = [{ path: 'B:\\projects\\previous', lastUsedAt: 1 }]
+    localStorage.setItem(RECENT_WORKSPACES_KEY, JSON.stringify(previous))
+    vi.mocked(api.startSession).mockRejectedValue(new Error('测试启动失败'))
+    render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: /新建 Agent/ }))
+    fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
+    await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
+    fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
+    await screen.findByText('测试启动失败')
+    expect(api.startSession).toHaveBeenCalledTimes(1)
+    expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)).toEqual(previous)
+    expect(screen.getByRole('button', { name: '启动 Agent' })).toBeEnabled()
   })
 
   it('offers one-click installation for a missing Agent CLI and rechecks the environment', async () => {
@@ -888,7 +962,7 @@ describe('App terminal wall', () => {
   it('opens and saves disabled-by-default Continue keyword rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getAllByRole('button', { name: '关键词续跑' })[0]!)
+    clickNavigationMenuItem('设置', '关键词续跑')
     expect(await screen.findByRole('heading', { name: '关键词续跑' })).toBeInTheDocument()
     expect(screen.getByRole('switch', { name: '启用关键词 Continue' })).not.toBeChecked()
     fireEvent.click(screen.getByRole('switch', { name: '启用关键词 Continue' }))
@@ -1239,7 +1313,8 @@ describe('App terminal wall', () => {
     })
 
     render(<App />)
-    fireEvent.click(await screen.findByRole('button', { name: /钉钉远程/ }))
+    await screen.findByRole('button', { name: '设置' })
+    clickNavigationMenuItem('设置', '钉钉远程')
     expect(screen.queryByText('允许远程访问的工作区')).not.toBeInTheDocument()
     await waitFor(() => expect(screen.getByRole('switch', { name: '启用钉钉远程开发' })).toBeChecked())
     fireEvent.click(screen.getByRole('button', { name: '保存并连接' }))
@@ -1267,7 +1342,7 @@ describe('App terminal wall', () => {
   it('manages exact approval rules from the overview', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
+    clickNavigationMenuItem('设置', '安全规则')
     expect(await screen.findByText('git log --oneline')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('新增批准命令'), { target: { value: 'git show --stat' } })
     fireEvent.click(screen.getByRole('button', { name: '添加' }))
@@ -1281,7 +1356,7 @@ describe('App terminal wall', () => {
   it('closes the approval rules drawer only on a real double-click of the backdrop', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
+    clickNavigationMenuItem('设置', '安全规则')
     const backdrop = document.querySelector('.modal-backdrop')
     expect(backdrop).not.toBeNull()
     fireEvent.mouseDown(backdrop!)
@@ -1294,7 +1369,7 @@ describe('App terminal wall', () => {
   it('shows, maintains, and tests high-risk command rules', async () => {
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: '安全规则' }))
+    clickNavigationMenuItem('设置', '安全规则')
     fireEvent.click(await screen.findByRole('button', { name: /高危命令/ }))
 
     expect(await screen.findByText('递归或强制删除')).toBeInTheDocument()
@@ -1465,7 +1540,7 @@ describe('App terminal wall', () => {
     ])
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+    clickNavigationMenuItem('统计', '审计')
     expect(await screen.findByRole('heading', { name: '活动审计' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Agent 总览' })).not.toBeInTheDocument()
     expect(screen.getAllByText('Codex API 重构 已启动')).toHaveLength(2)
@@ -1490,12 +1565,14 @@ describe('App terminal wall', () => {
     })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
+    clickNavigationMenuItem('设置', '审核器设置')
     expect(await screen.findByText('审查正在后台进行')).toBeInTheDocument()
     expect(screen.getByDisplayValue('45')).toHaveValue(45)
 
     fireEvent.click(screen.getByRole('button', { name: '取消' }))
-    expect(screen.queryByText('审查正在后台进行')).not.toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.getByText('审查正在后台进行').closest('.motion-presence')).toHaveAttribute('inert')
+    await waitFor(() => expect(screen.queryByText('审查正在后台进行')).not.toBeInTheDocument())
 
     vi.mocked(api.getLlmReviewSettings).mockResolvedValue({
       enabled: true, level: 'high', hasApiKey: true, retryCount: 3, timeoutSeconds: 45,
@@ -1504,7 +1581,7 @@ describe('App terminal wall', () => {
       ruleAuditState: { status: 'completed', source: 'manual', completedAt: Date.now() },
       lastRuleAudit: { reviewedAt: Date.now(), model: 'security-model', ruleCount: 1, summary: '后台审查已经完成', findings: [] },
     })
-    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
+    clickNavigationMenuItem('设置', '审核器设置')
     expect(await screen.findByText('后台审查已经完成')).toBeInTheDocument()
   })
 
@@ -1523,7 +1600,7 @@ describe('App terminal wall', () => {
     })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /审核器设置/ }))
+    clickNavigationMenuItem('设置', '审核器设置')
     fireEvent.click(await screen.findByRole('button', { name: '查看审查结果' }))
 
     expect(await screen.findByRole('heading', { name: '批准规则审查结果' })).toBeInTheDocument()
@@ -1551,7 +1628,7 @@ describe('App terminal wall', () => {
     })
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+    clickNavigationMenuItem('统计', '审计')
     fireEvent.change(await screen.findByRole('combobox', { name: '审计类别' }), { target: { value: 'review' } })
 
     expect(screen.getByRole('combobox', { name: '审计类别' })).toHaveValue('review')
@@ -1615,38 +1692,51 @@ describe('App terminal wall', () => {
     fireEvent.click(await screen.findByRole('button', { name: /目录已移动/ }))
     fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
     await screen.findByText(/工作区目录不存在或无法访问/)
+    expect(localStorage.getItem(RECENT_WORKSPACES_KEY)).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: '选择文件夹' }))
     await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
     fireEvent.click(screen.getByRole('button', { name: '恢复会话' }))
     await waitFor(() => expect(api.startSession).toHaveBeenLastCalledWith(expect.objectContaining({ workspace: 'B:\\chosen\\workspace', nativeSessionId: 'moved-native' })))
+    await waitFor(() => expect(JSON.parse(localStorage.getItem(RECENT_WORKSPACES_KEY)!)).toEqual([{ path: 'B:\\chosen\\workspace', lastUsedAt: expect.any(Number) }]))
   })
 
-  it('preserves terminal mounts and active Agent while hovering, hiding and pinning independent panels', async () => {
+  it('preserves terminal mounts and active Agent while hovering, hiding and pinning the Agent list panel', async () => {
     window.localStorage.setItem('agent-tui-manager:overview-preferences:v1', JSON.stringify({ overviewMode: 'list', groupByWorkspace: false }))
     const view = render(<App />)
     await screen.findByRole('button', { name: '切换到 Codex API 重构' })
     await waitFor(() => expect(Terminal).toHaveBeenCalledTimes(1))
     const activeCalls = vi.mocked(api.setActiveSession).mock.calls.length
-    const navigation = view.container.querySelector('[data-panel="navigation"]')!
     const agents = view.container.querySelector('[data-panel="agents"]')!
-    fireEvent.mouseEnter(navigation)
-    await waitFor(() => expect(navigation).toHaveClass('panel-expanded'))
-    fireEvent.click(screen.getByRole('button', { name: '固定导航' }))
-    expect(navigation).toHaveAttribute('data-mode', 'pinned')
+    expect(view.container.querySelector('[data-panel="navigation"]')).toBeNull()
     expect(agents).toHaveAttribute('data-mode', 'rail')
+    fireEvent.mouseEnter(agents)
+    await waitFor(() => expect(agents).toHaveClass('panel-expanded'))
+    fireEvent.click(screen.getByRole('button', { name: '固定Agent 列表' }))
+    expect(agents).toHaveAttribute('data-mode', 'pinned')
     fireEvent.click(screen.getByRole('button', { name: '隐藏Agent 列表' }))
     expect(agents).toHaveAttribute('data-mode', 'hidden')
     expect(Terminal).toHaveBeenCalledTimes(1)
     expect(terminalMocks.dispose).not.toHaveBeenCalled()
     expect(vi.mocked(api.setActiveSession).mock.calls.length).toBe(activeCalls)
-    expect(view.container.querySelector('.workspace-scope-label')).toBeNull()
+    expect(screen.queryByRole('combobox', { name: '切换工作区' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('switch', { name: '按工作区划分' }))
-    expect(view.container.querySelector('.workspace-scope-label')).toHaveTextContent('api')
+    expect(screen.getByRole('combobox', { name: '切换工作区' })).toHaveDisplayValue('api · 1')
     fireEvent.click(screen.getByRole('button', { name: '统计' }))
-    expect(screen.queryByRole('button', { name: '审计' })).not.toBeInTheDocument()
+    expect(screen.getByRole('menuitem', { name: '审计' })).toBeInTheDocument()
+    fireEvent.keyDown(screen.getByRole('menuitem', { name: '审计' }), { key: 'Escape' })
     view.unmount()
+    const reopened = render(<App />)
+    await screen.findByTestId('terminal-tile-session-1')
+    const restoredAgents = reopened.container.querySelector('[data-panel="agents"]')!
+    expect(restoredAgents).toHaveAttribute('data-mode', 'hidden')
+    fireEvent.mouseEnter(restoredAgents)
+    fireEvent.click(screen.getByRole('button', { name: '显示Agent 列表图标栏' }))
+    expect(restoredAgents).toHaveAttribute('data-mode', 'rail')
+    fireEvent.click(screen.getByRole('button', { name: '固定Agent 列表' }))
+    expect(restoredAgents).toHaveAttribute('data-mode', 'pinned')
+    reopened.unmount()
     render(<App />)
-    await screen.findByRole('button', { name: '收起导航' })
+    await screen.findByRole('button', { name: '收起Agent 列表' })
     expect(screen.getByRole('button', { name: '统计' })).toHaveAttribute('aria-expanded', 'false')
   })
 
@@ -1660,8 +1750,94 @@ describe('App terminal wall', () => {
     expect(screen.queryByRole('button', { name: '批准这一次' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '批准全部' })).toBeDisabled()
     expect(screen.getByText('系统将自动批准或拒绝，无需人工操作')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: '通知' }))
-    expect(screen.getByText('当前没有待处理项')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '通知' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '处理中心' })).toHaveTextContent(/^处理中心$/)
+    expect(screen.getByText('0 个待处理项')).toBeInTheDocument()
+  })
+
+  it('opens the workspace from the path and toolbar without opening Agent detail or remounting the terminal', async () => {
+    const nativeId = '01a10a4a-391a-7190-abb6-7ade66501660'
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, nativeSessionId: nativeId }])
+    render(<App />)
+    const tile = await screen.findByTestId('terminal-tile-session-1')
+    const terminal = tile.querySelector('.terminal-live-host')
+    const path = within(tile).getByRole('button', { name: `打开工作区：${session.workspace}` })
+    fireEvent.keyDown(path, { key: 'Enter' })
+    fireEvent.click(path)
+    expect(api.openSessionWorkspace).toHaveBeenLastCalledWith(session.sessionId)
+    const folder = within(tile).getByRole('button', { name: `打开 ${session.displayName} 的工作区文件夹` })
+    const approvalMode = within(tile).getByRole('button', { name: '审批模式：普通模式' })
+    expect(approvalMode.nextElementSibling).toBe(folder)
+    fireEvent.click(folder)
+    expect(api.openSessionWorkspace).toHaveBeenCalledTimes(2)
+    const id = within(tile).getByRole('button', { name: '复制原生会话 ID' })
+    expect(id).toHaveTextContent('ID: ' + nativeId)
+    fireEvent.keyDown(id, { key: ' ' })
+    fireEvent.click(id)
+    expect(api.writeClipboardText).toHaveBeenCalledWith(nativeId)
+    expect(tile).not.toHaveClass('terminal-card-detail')
+    expect(tile.querySelector('.terminal-live-host')).toBe(terminal)
+  })
+
+  it('shows a failed workspace open and still allows opening a stopped Agent workspace', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, status: 'stopped' }])
+    vi.mocked(api.openSessionWorkspace).mockRejectedValue(new Error('工作区文件夹不存在或无法访问。'))
+    render(<App />)
+    const button = await screen.findByRole('button', { name: `打开 ${session.displayName} 的工作区文件夹` })
+    fireEvent.click(button)
+    expect(await screen.findByText('工作区文件夹不存在或无法访问。')).toBeInTheDocument()
+  })
+
+  it('clears active Agent attention while sound settings cover it and restores it on close', async () => {
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.focus(screen.getByTestId('terminal-tile-session-1'))
+    await waitFor(() => expect(api.setActiveSession).toHaveBeenLastCalledWith(session.sessionId))
+    clickNavigationMenuItem('设置', '提示音设置')
+    await waitFor(() => expect(api.setActiveSession).toHaveBeenLastCalledWith(null))
+    fireEvent.click(await screen.findByRole('button', { name: '关闭提示音设置' }))
+    await waitFor(() => expect(api.setActiveSession).toHaveBeenLastCalledWith(session.sessionId))
+  })
+
+  it('freely moves and independently resizes windows, preserving terminals and geometry across views', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([session, { ...session, sessionId: 'session-2', displayName: 'Second' }])
+    render(<App />)
+    const first = await screen.findByTestId('terminal-tile-session-1')
+    const host = first.querySelector('.terminal-live-host')
+    const mounts = vi.mocked(Terminal).mock.calls.length
+    const replays = vi.mocked(api.terminalReplay).mock.calls.length
+    fireEvent.change(screen.getByRole('combobox', { name: '总览排列方式' }), { target: { value: 'free' } })
+    await waitFor(() => expect(first).toHaveClass('terminal-card-floating'))
+    expect(first.querySelector('header')).toHaveAttribute('draggable', 'false')
+    const originalWidth = parseFloat(first.style.width), originalHeight = first.style.height, originalX = parseFloat(first.style.left)
+    fireEvent.keyDown(within(first).getByRole('button', { name: `调整 ${session.displayName} 的右边` }), { key: 'ArrowRight' })
+    expect(parseFloat(first.style.width)).toBe(originalWidth + 8)
+    expect(first.style.height).toBe(originalHeight)
+    fireEvent.keyDown(within(first).getByRole('button', { name: `移动 ${session.displayName}` }), { key: 'ArrowRight', shiftKey: true })
+    expect(parseFloat(first.style.left)).toBe(originalX + 32)
+    expect(first).not.toHaveClass('terminal-card-detail')
+    const expected = { left: first.style.left, width: first.style.width, height: first.style.height }
+    expect(JSON.parse(localStorage.getItem('agent-tui-manager:overview-preferences:v1')!).arrangement).toBe('free')
+    expect(JSON.parse(localStorage.getItem('agent-tui-manager:free-overview-layout:v1')!).windows[session.sessionId].width).toBe(originalWidth + 8)
+    fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /列表/ }))
+    expect(screen.queryByRole('combobox', { name: '总览排列方式' })).not.toBeInTheDocument()
+    expect(first).not.toHaveClass('terminal-card-floating')
+    fireEvent.click(within(screen.getByRole('group', { name: 'Agent 显示模式' })).getByRole('button', { name: /总览/ }))
+    expect(first.style.left).toBe(expected.left)
+    expect(first.style.width).toBe(expected.width)
+    fireEvent.click(within(first).getByRole('button', { name: `查看 ${session.displayName}` }))
+    expect(first).toHaveClass('terminal-card-detail')
+    fireEvent.click(screen.getByRole('button', { name: /返回总览/ }))
+    expect(first).toHaveClass('terminal-card-floating')
+    expect(first.style.height).toBe(expected.height)
+    expect(first.querySelector('.terminal-live-host')).toBe(host)
+    expect(Terminal).toHaveBeenCalledTimes(mounts)
+    expect(api.terminalReplay).toHaveBeenCalledTimes(replays)
+    fireEvent.click(screen.getByRole('button', { name: '整理窗口' }))
+    expect(parseFloat(first.style.left)).toBe(16)
+    fireEvent.change(screen.getByRole('combobox', { name: '总览排列方式' }), { target: { value: 'grid' } })
+    expect(first).not.toHaveClass('terminal-card-floating')
+    expect(first.style.width).toBe('')
   })
 
   it('renders large audit histories in pages of fifty rows', async () => {
@@ -1671,7 +1847,7 @@ describe('App terminal wall', () => {
     })))
     render(<App />)
     await screen.findByText('Codex API 重构')
-    fireEvent.click(screen.getByRole('button', { name: /审计$/ }))
+    clickNavigationMenuItem('统计', '审计')
     expect(await screen.findByText('共 120 条 · 第 1/3 页')).toBeInTheDocument()
     expect(screen.getAllByText('审计事件 0')).toHaveLength(2)
     expect(screen.queryByText('审计事件 50')).not.toBeInTheDocument()

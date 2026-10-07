@@ -9,7 +9,9 @@
 
 Windows / macOS · MIT Open Source
 
-当前代码版本：**0.4.12-local.3**（基于 0.4.11 的本地四模式与提示音修改版）。上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
+当前代码版本：**0.4.12-local.9**（本地四模式、提示音、自由布局及顶部导航修改版）。上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
+
+界面开发请遵循 [统一动效规范](UI_MOTION_STANDARD.md)；本批升级验收见 [导航与工作区验证记录](NAVIGATION_WORKSPACE_VERIFICATION.md)。
 
 ---
 

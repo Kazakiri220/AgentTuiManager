@@ -4,6 +4,9 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net,
 import { AttentionSound } from './attention-sound'
 import { isAttentionSessionActive } from './attention-focus'
 import { AttentionAudioDelivery } from './attention-audio-delivery'
+import { AttentionAudioSettingsStore } from './attention-audio-settings-store'
+import { NativeAttentionAudio } from './native-attention-audio'
+import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings, type AttentionAudioSettings } from '../src/shared/attention-audio-settings'
 import { TerminalQuestionSignal } from './terminal-question-signal'
 import { statSync } from 'node:fs'
 import { parseNetworkRetry } from '../src/shared/network-retry'
@@ -17,6 +20,7 @@ import { NativeResumeCoordinator } from './native-resume-coordinator'
 import { parseUnattendedSettings } from '../src/shared/unattended-settings'
 import { DeepSeekWebWindows } from './deepseek-web-window'
 import { openExternalWeb, routeExternalLinks } from './external-links'
+import { openSessionWorkspace } from './open-session-workspace'
 import { SessionHostManager } from './session-host-manager'
 import { discoverNativeSessions, discoverRecentNativeSessions, discoverGlobalCodexSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
@@ -72,17 +76,30 @@ const attentionSound = new AttentionSound({
       message: labels[event.outcome], sessionId: event.sessionId, details: { kind: event.kind, outcome } })
   },
 })
+const nativeAttentionAudio = new NativeAttentionAudio()
 const attentionAudioDelivery = new AttentionAudioDelivery({
-  send: id => {
+  getSettings: () => attentionAudioSettingsStore?.getSettings() ?? { ...DEFAULT_ATTENTION_AUDIO_SETTINGS },
+  send: (id, settings) => {
     if (!mainWindow || mainWindow.isDestroyed() || mainWindow.webContents.isDestroyed()
       || mainWindow.webContents.isLoadingMainFrame()) throw new Error('Audio renderer unavailable')
-    mainWindow.webContents.send(IPC_CHANNELS.attentionSound, id)
+    mainWindow.webContents.send(IPC_CHANNELS.attentionSound, id, settings)
   },
-  fallback: () => { try { shell.beep() } catch { /* Sound must never interrupt sessions. */ } },
+  fallback: (settings, isAllowed) => {
+    void nativeAttentionAudio.play(settings, isAllowed).catch(() => {
+      const current = attentionAudioSettingsStore?.getSettings() ?? DEFAULT_ATTENTION_AUDIO_SETTINGS
+      // The emergency system beep has no volume control: retain it only at the original defaults.
+      if (isAllowed() && settings.sound === 'classic' && settings.volume === 100 && current.sound === 'classic' && current.volume === 100) {
+        try { shell.beep() } catch { /* Sound must never interrupt sessions. */ }
+      } else {
+        recordAttentionAudit({ level: 'warning', category: 'session', action: 'attention_audio_unavailable', message: '提示音输出不可用，请检查系统音量和输出设备' })
+      }
+    })
+  },
   onDelivery: outcome => recordAttentionAudit({ level: 'info', category: 'session', action: 'attention_audio_' + outcome,
-    message: outcome === 'renderer_completed' ? '音频通道已完成提示音播放' : '提示音已调用系统声音兜底', details: { outcome } }),
+    message: outcome === 'renderer_completed' ? '音频通道已完成提示音播放' : outcome === 'muted' ? '提示音音量为 0%，已静音' : '提示音已调用备用音频播放', details: { outcome } }),
 })
-function playAttentionChime(): void { attentionAudioDelivery.play() }
+function playAttentionChime(preview?: AttentionAudioSettings): void { attentionAudioDelivery.play(preview) }
+let attentionAudioSettingsStore: AttentionAudioSettingsStore
 let auditStore: ActivityAuditStore
 let tokenUsageStore: TokenUsageStore
 let nativeActivityMonitor: NativeSessionActivityMonitor | undefined
@@ -809,9 +826,20 @@ async function restoreNativeSessionProvider(session: SessionSummary | undefined)
 }
 
 function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
-  ipcMain.handle(IPC_CHANNELS.testAttentionSound, (event) => {
+  ipcMain.handle(IPC_CHANNELS.getAttentionSoundSettings, event => {
     trustedRenderer(event)
-    playAttentionChime()
+    return attentionAudioSettingsStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.updateAttentionSoundSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const settings = await attentionAudioSettingsStore.update(parseAttentionAudioSettings(value))
+    attentionAudioDelivery.settingsChanged()
+    nativeAttentionAudio.stop()
+    return settings
+  })
+  ipcMain.handle(IPC_CHANNELS.testAttentionSound, (event, value: unknown) => {
+    trustedRenderer(event)
+    playAttentionChime(value === undefined ? undefined : parseAttentionAudioSettings(value))
   })
   ipcMain.on(IPC_CHANNELS.attentionSoundReady, (event, ready: unknown) => {
     try { trustedRenderer(event); if (typeof ready === 'boolean') attentionAudioDelivery.setReady(ready) } catch { /* Untrusted renderer. */ }
@@ -837,6 +865,11 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.listSessions, (event) => {
     trustedRenderer(event)
     return controller.listSessions()
+  })
+  ipcMain.handle(IPC_CHANNELS.openSessionWorkspace, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const target = sessionId(id)
+    await openSessionWorkspace(controller.listSessions().find(item => item.sessionId === target))
   })
   ipcMain.handle(IPC_CHANNELS.terminalReplay, (event, id: unknown) => {
     trustedRenderer(event)
@@ -1605,6 +1638,7 @@ void app.whenReady().then(async () => {
   continueKeywordStore = await ContinueKeywordStore.load(join(app.getPath('userData'), 'continue-keywords.json'))
   sessionSafetyStore = await SessionSafetyStore.load(join(app.getPath('userData'), 'session-safety.json'))
   sessionCatalog = await ManagedSessionCatalog.load(join(app.getPath('userData'), 'managed-sessions.json'))
+  attentionAudioSettingsStore = await AttentionAudioSettingsStore.load(join(app.getPath('userData'), 'attention-sound-settings.json'))
   dingTalkSettingsStore = await DingTalkSettingsStore.load(join(app.getPath('userData'), 'dingtalk-settings.json'), safeStorage)
   llmReviewSettingsStore = await LlmReviewSettingsStore.load(join(app.getPath('userData'), 'llm-review-settings.json'), safeStorage)
   const lastLlmRuleAudit = llmReviewSettingsStore.getRuntimeSettings().lastRuleAudit
@@ -1917,5 +1951,5 @@ app.on('before-quit', (event) => {
   if (quitting) nativeDragBridge?.stop()
 })
 
-app.on('will-quit', () => { attentionSound.dispose(); attentionAudioDelivery.dispose(); questionSignals.clear(); nativeActivityMonitor?.stop() })
+app.on('will-quit', () => { attentionSound.dispose(); attentionAudioDelivery.dispose(); nativeAttentionAudio.stop(); questionSignals.clear(); nativeActivityMonitor?.stop() })
 }

@@ -58,4 +58,42 @@ describe('attention chime', () => {
     expect(vi.getTimerCount()).toBe(0)
     for (const osc of oscillators) expect(osc.disconnect).toHaveBeenCalledOnce()
   })
+  it('preserves the original default gain and exact tone timing', async () => {
+    const { ctx, oscillators } = fixture()
+    const { playAttentionAudio } = await import('../../src/attention-audio')
+    const playback = playAttentionAudio()
+    expect(oscillators.map(osc => osc.frequency.value)).toEqual([660, 880])
+    for (const [index, at] of [10.02, 10.16].entries()) {
+      const gain = ctx.createGain.mock.results[index]!.value.gain
+      expect(gain.setValueAtTime).toHaveBeenCalledWith(0, at)
+      expect(gain.linearRampToValueAtTime).toHaveBeenCalledWith(0.12, at + 0.012)
+      expect(gain.exponentialRampToValueAtTime).toHaveBeenCalledWith(0.001, at + 0.16)
+      expect(oscillators[index]!.start).toHaveBeenCalledWith(at)
+      expect(oscillators[index]!.stop).toHaveBeenCalledWith(at + 0.18)
+      oscillators[index]!.onended?.()
+    }
+    await playback
+  })
+  it('scales both ends of the envelope and waits for all selected notes', async () => {
+    const { ctx, oscillators } = fixture()
+    const { playAttentionAudio } = await import('../../src/attention-audio')
+    const finished = vi.fn()
+    const playback = playAttentionAudio({ sound: 'bell', volume: 25 }).then(finished)
+    expect(oscillators).toHaveLength(3)
+    expect(ctx.createGain.mock.results[0]!.value.gain.linearRampToValueAtTime).toHaveBeenCalledWith(0.03, 10.032)
+    expect(ctx.createGain.mock.results[0]!.value.gain.exponentialRampToValueAtTime).toHaveBeenCalledWith(0.00025, 10.18)
+    oscillators[0]!.onended?.(); oscillators[1]!.onended?.()
+    await Promise.resolve()
+    expect(finished).not.toHaveBeenCalled()
+    oscillators[2]!.onended?.()
+    await playback
+  })
+  it('treats volume zero as a successful silent playback without opening an output device', async () => {
+    const { ctx } = fixture()
+    const { playAttentionAudio } = await import('../../src/attention-audio')
+    await playAttentionAudio({ sound: 'classic', volume: 0 })
+    expect(AudioContext).not.toHaveBeenCalled()
+    expect(ctx.createOscillator).not.toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+  })
 })

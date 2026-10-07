@@ -8,7 +8,6 @@ const { pathToFileURL } = require('node:url')
 const http = require('node:http')
 const root = mkdtempSync(join(tmpdir(), 'agent-tui-upgrade-smoke-'))
 process.env.AGENT_TUI_USER_DATA_DIR = root
-process.env.CODEX_HOME = join(root, 'empty-codex')
 const screenshots = resolve('.tmp/upgrade-screenshots')
 mkdirSync(screenshots, { recursive: true })
 let launches = 0
@@ -74,23 +73,20 @@ app.on('browser-window-created', (_event, win) => {
       while (!port) await new Promise(resolve => setTimeout(resolve, 20))
       const result = await win.webContents.executeJavaScript(`(async () => {
         const wait = (ms=180) => new Promise(resolve => setTimeout(resolve, ms));
-        const click = text => { const element = [...document.querySelectorAll('button')].find(item => item.textContent.trim() === text || item.getAttribute('aria-label') === text); if (!element || element.disabled) throw Error('Missing enabled button: '+text); element.click(); };
+        const click = text => { const element = [...document.querySelectorAll('button')].find(item => {const clone=item.cloneNode(true);clone.querySelectorAll('[aria-hidden="true"]').forEach(node=>node.remove());return clone.textContent.trim() === text || item.getAttribute('aria-label') === text}); if (!element || element.disabled) throw Error('Missing enabled button: '+text); element.click(); };
         const input = (element, value) => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(element, value); element.dispatchEvent(new Event('input', { bubbles: true })); };
         await wait(350);
-        const nav=document.querySelector('[data-panel="navigation"]');
+        const nav=document.querySelector('[aria-label="主导航"]');
         const main=document.querySelector('.workspace-main');
-        const railLeft=main.getBoundingClientRect().left;
-        if(nav.getBoundingClientRect().width!==54)throw Error('Default compact rail missing');
-        if(document.querySelector('.workspace-scope-label'))throw Error('Inactive workspace scope is visible');
+        const initialLeft=main.getBoundingClientRect().left;
+        if(!nav||document.querySelector('[data-panel="navigation"]'))throw Error('Top navigation missing or old sidebar remains');
+        if(document.querySelector('[aria-label="切换工作区"]'))throw Error('Inactive workspace scope is visible');
         const terminal=document.querySelector('.xterm');
-        nav.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));await wait();
-        if(!nav.classList.contains('panel-expanded'))throw Error('Hover did not reveal navigation');
-        if(main.getBoundingClientRect().left!==railLeft||document.querySelector('.xterm')!==terminal)throw Error('Hover moved/remounted terminal');
-        click('固定导航');await wait();
-        if(main.getBoundingClientRect().left<=railLeft)throw Error('Pin did not reserve panel width');
         click('统计');await wait();
-        if(document.querySelector('[aria-label="审计"]').offsetParent!==null)throw Error('Statistics group failed to collapse');
-        click('统计');click('收起导航');await wait();
+        if(!document.querySelector('[role="menu"][aria-label="统计"]'))throw Error('Statistics menu failed to open');
+        if(main.getBoundingClientRect().left!==initialLeft||document.querySelector('.xterm')!==terminal)throw Error('Menu moved/remounted terminal');
+        click('统计');await wait();
+        if(document.querySelector('[role="menu"][aria-label="统计"]'))throw Error('Statistics menu failed to close');
         click('＋ 新建 Agent');await wait();click('管理列表');await wait();
         input([...document.querySelectorAll('.favorite-workspace-manager label')].find(item=>item.textContent.startsWith('工作区名称')).querySelector('input'),'常用分析项目');
         input([...document.querySelectorAll('.favorite-workspace-manager label')].find(item=>item.textContent.startsWith('工作区路径')).querySelector('input'),${JSON.stringify(root)});
@@ -111,14 +107,14 @@ app.on('browser-window-created', (_event, win) => {
         let saved=await api.updateLlmReviewSettings({...before,enabled:true,reviewers});
         if(JSON.stringify(saved).includes('fixture-key-'))throw Error('Credential leaked in settings summary');
         for(const reviewer of saved.reviewers){const models=await api.listLlmReviewModels(saved,reviewer.id);if(models.length!==1)throw Error('Model catalog failed');const tested=await api.testLlmReviewer(saved,reviewer.id);if(tested.model!==reviewer.model)throw Error('Selected connection target mismatch');}
-        click('审核器设置');await wait();
+        click('设置');await wait();click('审核器设置');await wait();
         if(document.querySelectorAll('.reviewer-pool-select').length!==3)throw Error('Reviewer pool UI missing entries');
-        return {compactHover:true,pin:true,terminalStable:true,scopeHidden:true,navigationGroups:true,favorites:true,providerSearch:true,globalHistory:50,historyDirectResume:true,protocols:3,modelCatalogs:3,connectionChecks:3,secretSummarySafe:true};
+        return {topNavigation:true,terminalStable:true,scopeHidden:true,navigationGroups:true,favorites:true,providerSearch:true,globalHistory:50,historyDirectResume:true,protocols:3,modelCatalogs:3,connectionChecks:3,secretSummarySafe:true};
       })()`)
       await new Promise(resolve => setTimeout(resolve, 200))
       await captureVerifiedDom(win, 'reviewer-pool')
       await win.webContents.executeJavaScript(`[...document.querySelectorAll('.llm-review-dialog footer button')].find(button=>button.textContent==='取消')?.click()`)
-      await win.webContents.executeJavaScript(`(()=>{document.activeElement?.blur();document.querySelector('[data-panel="navigation"]').dispatchEvent(new MouseEvent('mouseout',{bubbles:true,relatedTarget:document.body}))})()`)
+      await win.webContents.executeJavaScript(`document.activeElement?.blur()`)
       await new Promise(resolve => setTimeout(resolve, 350))
       await captureVerifiedDom(win, 'overview')
       await win.webContents.executeJavaScript(`[...document.querySelectorAll('button')].find(button=>button.textContent.trim()==='☰ 列表').click()`)

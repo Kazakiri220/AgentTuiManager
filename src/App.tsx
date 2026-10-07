@@ -2,12 +2,21 @@ import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } fro
 
 import TerminalTile from './TerminalTile'
 import { useTerminalRetention } from './use-terminal-retention'
+import { useFreeOverviewLayout } from './use-free-overview-layout'
+import { useVisibleFreeSession } from './use-visible-free-session'
+import OverviewLayoutControls, { type OverviewArrangement } from './OverviewLayoutControls'
+import './free-overview-layout.css'
 import CCSwitchProviderList from './CCSwitchProviderList'
 import FavoriteWorkspaces from './FavoriteWorkspaces'
+import TopNavigation, { type NavigationAction } from './TopNavigation'
+import AnimatedDetails from './AnimatedDetails'
+import MotionPresence from './MotionPresence'
+import { motionVariables } from './ui-motion'
+import { rememberRecentWorkspace } from './workspace-shortcuts'
 import CollapsiblePanel from './CollapsiblePanel'
-import { isBoolean, usePreference } from './ui-preferences'
 import './upgrade-ui.css'
 import { playAttentionAudio } from './attention-audio'
+import AttentionSoundSettingsDialog from './AttentionSoundSettingsDialog'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
 import SessionContinuationDialog from './SessionContinuationDialog'
@@ -21,6 +30,7 @@ import ContinueKeywordDialog from './ContinueKeywordDialog'
 import SessionSafetyDialog from './SessionSafetyDialog'
 import DingTalkSettingsDialog from './DingTalkSettingsDialog'
 import LlmReviewSettingsDialog from './LlmReviewSettingsDialog'
+import './ui-motion.css'
 import AuditPage from './AuditPage'
 import TokenUsagePage from './TokenUsagePage'
 import AttentionCenter from './AttentionCenter'
@@ -47,13 +57,14 @@ const OVERVIEW_PREFERENCES_KEY = 'agent-tui-manager:overview-preferences:v1'
 
 interface OverviewPreferences {
   overviewMode: 'wall' | 'list'
+  arrangement?: OverviewArrangement
   groupByWorkspace: boolean
   activeWorkspace?: string
   sessionOrder?: string[]
   statusFilter?: SessionDisplayStatus[]
 }
 
-type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review' | 'full-auto' | 'continuation'
+type OverlayKind = 'agent-form' | 'agent-editor' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'attention-sound' | 'dingtalk' | 'llm-review' | 'full-auto' | 'continuation'
 
 function readOverviewPreferences(): OverviewPreferences {
   const fallback: OverviewPreferences = { overviewMode: 'wall', groupByWorkspace: false }
@@ -63,6 +74,7 @@ function readOverviewPreferences(): OverviewPreferences {
     const value = JSON.parse(stored) as Partial<OverviewPreferences>
     return {
       overviewMode: value.overviewMode === 'list' ? 'list' : 'wall',
+      arrangement: value.arrangement === 'free' ? 'free' : 'grid',
       groupByWorkspace: value.groupByWorkspace === true,
       statusFilter: normalizeStatusFilter(value.statusFilter),
       ...(typeof value.activeWorkspace === 'string' && value.activeWorkspace ? { activeWorkspace: value.activeWorkspace } : {}),
@@ -498,7 +510,11 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     }
     if (resumeArgs) request.recovery = { executable, args: resumeArgs }
     else if (agentKind === 'deepseek') request.recovery = { executable, args: parsedArgs }
-    try { const created = await window.agentManager.startSession(request); onCreated(created.workspace, created.sessionId) }
+    try {
+      const created = await window.agentManager.startSession(request)
+      if (agentKind !== 'deepseek') rememberRecentWorkspace(created.workspace, window.agentManager.platform)
+      onCreated(created.workspace, created.sessionId)
+    }
     catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); setBusy(false) }
   }
 
@@ -538,6 +554,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
     className={'launcher-scrim' + (open ? '' : ' launcher-scrim-hidden')}
     role='presentation'
     aria-hidden={!open}
+    {...(!open ? { inert: '' } : {})}
     onMouseDown={(event) => {
       if (event.target !== event.currentTarget) return
         armBackdropClose()
@@ -577,7 +594,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
              {environmentState === 'ready' && environment?.nodeAvailable && environment.npmAvailable && environment.agentInstalled && <p className='launcher-state success'>环境已就绪，可以创建 Agent。</p>}
            </div>}
           <div className='launcher-form-grid'><label htmlFor='session-name'>显示名称</label><input id='session-name' className='launcher-field' required value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label htmlFor='approval-mode'>审批策略</label><select id='approval-mode' className='launcher-field' defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option><option value='manual'>全部手动确认</option><option value='builtin'>仅使用内置安全规则</option></select></div><div className='launcher-command-preview'>{executable || '<custom-command>'}<small>cwd: {workspace || '请选择工作区'}</small></div>
-           <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<div className='workspace-picker'><input required value={executable} onChange={(event) => setExecutable(event.target.value)} /><button type='button' className='button-secondary' onClick={() => { void chooseExecutable() }}>选择文件</button></div></label><small>如果 CLI 没有加入 PATH，可选择完整的可执行文件路径；修改后会自动重新检测。</small><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></details></section>}
+           <AnimatedDetails title='高级设置' className='advanced-settings'><div><label>Executable<div className='workspace-picker'><input required value={executable} onChange={(event) => setExecutable(event.target.value)} /><button type='button' className='button-secondary' onClick={() => { void chooseExecutable() }}>选择文件</button></div></label><small>如果 CLI 没有加入 PATH，可选择完整的可执行文件路径；修改后会自动重新检测。</small><label>参数（每行一个）<textarea rows={3} value={args} onChange={(event) => setArgs(event.target.value)} /></label><label>自动 continue 最大次数<input type='number' min={1} max={10} required value={maxContinueRetries} onChange={(event) => setMaxContinueRetries(Number(event.target.value))} /></label><small>遇到明确的临时错误时，每隔 3 秒重试一次。正常结束或手动中断不会重试。</small></div></AnimatedDetails></section>}
         {launcherTab === 'history' && <section className='launcher-panel'><div className='launcher-filter-row'><input className='launcher-field' value={historyQuery} onChange={(event) => setHistoryQuery(event.target.value)} placeholder='搜索标题、工作区或会话 ID' aria-label='搜索历史会话' /><select className='launcher-field' value={agentKind} onChange={(event) => changeKind(event.target.value as AgentKind)}><option value='codex'>Codex</option><option value='claude'>Claude Code</option><option value='deepseek'>DeepSeek Harness</option><option value='pi'>Pi</option><option value='generic'>通用终端</option></select></div><div className='launcher-section-title'><h2>{agentKind === 'codex' && historyScope === 'global' ? '最近 50 个会话 · 全部工作区' : '该工作区的历史会话'}</h2><button type='button' disabled={discoveryState === 'loading'} onClick={() => { void loadNativeSessions(agentKind, workspace, agentKind === 'codex' && historyScope === 'global') }}>刷新历史</button></div>{agentKind === 'codex' && <label className='history-scope'>历史范围<select aria-label='历史范围' value={historyScope} onChange={event => setHistoryScope(event.target.value as 'global' | 'workspace')}><option value='global'>全部工作区 · 最近 50 个</option><option value='workspace'>当前工作区</option></select></label>}
           {discoveryState === 'idle' && <p className='launcher-state'>请选择工作区以读取历史会话</p>}{discoveryState === 'loading' && <p className='launcher-state'>正在读取历史会话…</p>}{discoveryState === 'unsupported' && <p className='launcher-state'>该 Agent 暂不支持自动读取历史会话</p>}{discoveryState === 'error' && <p className='launcher-state error'>读取失败：{discoveryError}，仍可新建会话。</p>}{discoveryState === 'ready' && filteredSessions.length === 0 && <p className='launcher-state'>没有找到可恢复的历史会话</p>}<div className='launcher-session-list'>{filteredSessions.map((item) => <button type='button' aria-pressed={nativeSessionId === item.id} key={item.id} className={`launcher-session-item${nativeSessionId === item.id ? ' active' : ''}`} onClick={() => selectHistory(nativeSessionId === item.id ? '' : item.id)}><AgentLogo kind={agentKind} className={`launcher-option-logo option-${agentKind}`} label={agentKind} /><span><strong>{item.title}</strong><span title={item.workspace}>{item.workspace}</span>{item.managedSessionId && <em>已在 Manager 中运行</em>}<small>{agentKind === 'claude' ? 'Claude Code' : agentKind.toUpperCase()} · {item.id}</small></span><time>{new Date(item.updatedAt).toLocaleString()}</time></button>)}</div></section>}
         {launcherTab === 'external' && <section className='launcher-panel'><div className='launcher-external-note'>{initialImport?.issue ?? '先在外部终端正常退出当前 Agent，再从下方选择原生会话。Manager 会通过 Agent 自带的 resume 接管；不会复制终端画面或改变原生会话数据。'}</div><div className='launcher-section-title'><h2>可迁入的原生会话</h2><span>{discoveryState === 'ready' ? filteredSessions.length + ' 个' : '请先选择工作区'}</span></div>
@@ -744,7 +761,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
     }
   }
 
-  return <div className={'launcher-scrim' + (open ? '' : ' launcher-scrim-hidden')} role='presentation' aria-hidden={!open}
+  return <div className={'launcher-scrim' + (open ? '' : ' launcher-scrim-hidden')} role='presentation' aria-hidden={!open} {...(!open ? { inert: '' } : {})}
     onMouseDown={(event) => { if (event.target === event.currentTarget) armClose() }}
     onDoubleClick={(event) => { if (event.target === event.currentTarget) { resetClose(); onClose() } }}>
     <form className='agent-launcher agent-editor' onMouseDown={resetClose} onSubmit={(event) => { void submit(event) }}>
@@ -755,7 +772,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
         {editTab === 'basic' && <section className='launcher-panel'><div className='launcher-section-title'><h2>Agent 类型</h2><span>类型和工作区暂不可修改</span></div><div className='launcher-agent-options'>{options.map((option) => <button type='button' disabled key={option.kind} className={`launcher-agent-option${session.agentKind === option.kind ? ' active' : ''}`}><AgentLogo kind={option.kind} className={`launcher-option-logo option-${option.kind}`} label={option.title} /><span><strong>{option.title}</strong><span>{session.agentKind === option.kind ? '当前类型' : '不可修改'}</span></span></button>)}</div>
           <div className='launcher-form-grid'><label htmlFor='edit-session-name'>显示名称</label><input id='edit-session-name' className='launcher-field' required maxLength={120} value={displayName} onChange={(event) => setDisplayName(event.target.value)} /><label>审批策略</label><select className='launcher-field' disabled defaultValue='workspace'><option value='workspace'>使用工作区默认策略</option></select></div>
           <div className='launcher-command-preview'>{defaultExecutable(session.agentKind)}<small>session: {session.nativeSessionId ?? session.sessionId}</small></div>
-          <details className='advanced-settings'><summary>高级设置</summary><div><label>Executable<input disabled value={defaultExecutable(session.agentKind)} readOnly /></label><label>Model<input disabled value='跟随本机配置' readOnly /></label><label>参数<textarea disabled rows={3} value='当前版本不可修改' readOnly /></label></div></details>
+          <AnimatedDetails title='高级设置' className='advanced-settings'><div><label>Executable<input disabled value={defaultExecutable(session.agentKind)} readOnly /></label><label>Model<input disabled value='跟随本机配置' readOnly /></label><label>参数<textarea disabled rows={3} value='当前版本不可修改' readOnly /></label></div></AnimatedDetails>
         </section>}
         {editTab === 'config' && <section className='launcher-panel launcher-config-panel'>
           <div className='launcher-config-intro'><strong>{session.agentConfig?.enabled ? '当前使用独立配置' : '当前继承本机配置'}</strong><span>保存不会重启正在运行的 Agent；新配置会在下次重新启动或恢复会话时生效。</span></div>
@@ -805,22 +822,19 @@ export default function App(): JSX.Element {
   const [showApprovalRules, setShowApprovalRules] = useState(false)
   const [showContinueKeywords, setShowContinueKeywords] = useState(false)
   const [showSessionSafety, setShowSessionSafety] = useState(false)
+  const [showAttentionSoundSettings, setShowAttentionSoundSettings] = useState(false)
   const [showDingTalkSettings, setShowDingTalkSettings] = useState(false)
   const [showLlmReviewSettings, setShowLlmReviewSettings] = useState(false)
   const [llmReviewInitialView, setLlmReviewInitialView] = useState<'settings' | 'results'>('settings')
   const [showEditor, setShowEditor] = useState(false)
   const [continuationSource, setContinuationSource] = useState<SessionSummary>()
   const [editingSessionId, setEditingSessionId] = useState<string>()
-  const [showNotifications, setShowNotifications] = useState(false)
-  const [notificationMounted, setNotificationMounted] = useState(false)
-  const [notificationBusyId, setNotificationBusyId] = useState<string>()
-  const [notificationError, setNotificationError] = useState('')
+  const [navigationMenuOpen, setNavigationMenuOpen] = useState(false)
   const [fullAutoSessionId, setFullAutoSessionId] = useState<string>()
   const [view, setView] = useState<'overview' | 'attention' | 'audit' | 'tokens'>('overview')
   const [overviewMode, setOverviewMode] = useState<'wall' | 'list'>(initialOverviewPreferences.current.overviewMode)
+  const [arrangement, setArrangement] = useState<OverviewArrangement>(initialOverviewPreferences.current.arrangement ?? 'grid')
   const [groupByWorkspace, setGroupByWorkspace] = useState(initialOverviewPreferences.current.groupByWorkspace)
-  const [statisticsOpen, setStatisticsOpen] = usePreference('agent-tui-manager:statistics-open:v1', true, isBoolean)
-  const [settingsOpen, setSettingsOpen] = usePreference('agent-tui-manager:settings-open:v1', true, isBoolean)
   const [listActiveId, setListActiveId] = useState<string>()
   const [wallActiveId, setWallActiveId] = useState<string>()
   const [statusFilter, setStatusFilter] = useState<SessionDisplayStatus[]>(initialOverviewPreferences.current.statusFilter ?? [])
@@ -832,22 +846,20 @@ export default function App(): JSX.Element {
   const [handoffError, setHandoffError] = useState('')
   const [externalDrag, setExternalDrag] = useState<ExternalTerminalDragProjection | null>(null)
   const [externalImport, setExternalImport] = useState<ExternalImportIntent>()
-  const notificationRef = useRef<HTMLDivElement>(null)
-  const notificationHideTimer = useRef<ReturnType<typeof setTimeout>>()
   useEffect(() => {
-    writeOverviewPreferences({ overviewMode, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
-  }, [activeWorkspace, groupByWorkspace, overviewMode, sessionOrder, statusFilter])
-  const closeOtherOverlays = useCallback((except: OverlayKind): void => {
+    writeOverviewPreferences({ overviewMode, arrangement, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
+  }, [activeWorkspace, groupByWorkspace, overviewMode, arrangement, sessionOrder, statusFilter])
+  const closeOtherOverlays = useCallback((except: OverlayKind | 'navigation'): void => {
     if (except !== 'continuation') setContinuationSource(undefined)
     if (except !== 'agent-form') setShowForm(false)
     if (except !== 'agent-editor') setShowEditor(false)
     if (except !== 'approval-rules') setShowApprovalRules(false)
     if (except !== 'continue-keywords') setShowContinueKeywords(false)
     if (except !== 'session-safety') setShowSessionSafety(false)
+    if (except !== 'attention-sound') setShowAttentionSoundSettings(false)
     if (except !== 'dingtalk') setShowDingTalkSettings(false)
     if (except !== 'llm-review') setShowLlmReviewSettings(false)
     if (except !== 'full-auto') setFullAutoSessionId(undefined)
-    setShowNotifications(false)
   }, [])
   const openAgentForm = (): void => {
     closeOtherOverlays('agent-form')
@@ -940,28 +952,6 @@ export default function App(): JSX.Element {
     })
   }, [reload])
 
-  useEffect(() => {
-    if (!showNotifications) return
-    const closeOnOutsideClick = (event: PointerEvent): void => {
-      if (!notificationRef.current?.contains(event.target as Node)) setShowNotifications(false)
-    }
-    document.addEventListener('pointerdown', closeOnOutsideClick)
-    return () => document.removeEventListener('pointerdown', closeOnOutsideClick)
-  }, [showNotifications])
-
-  useEffect(() => () => { if (notificationHideTimer.current) clearTimeout(notificationHideTimer.current) }, [])
-
-  const revealNotifications = (): void => {
-    if (notificationHideTimer.current) { clearTimeout(notificationHideTimer.current); notificationHideTimer.current = undefined }
-    setNotificationMounted(true)
-    setShowNotifications(true)
-  }
-  const hideNotifications = (): void => {
-    setShowNotifications(false)
-    if (notificationHideTimer.current) clearTimeout(notificationHideTimer.current)
-    notificationHideTimer.current = setTimeout(() => { setNotificationMounted(false); notificationHideTimer.current = undefined }, 160)
-  }
-
   const selected = sessions.find((session) => session.sessionId === selectedId)
   const editingSession = sessions.find((session) => session.sessionId === editingSessionId)
   const orderedSessions = useMemo(() => {
@@ -1003,20 +993,15 @@ export default function App(): JSX.Element {
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
   const hasAttentionOverlay = showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety
-    || showDingTalkSettings || showLlmReviewSettings || Boolean(fullAutoSessionId || continuationSource) || showNotifications
-  const activeSoundSessionId = view !== 'overview' || hasAttentionOverlay ? undefined : selected?.sessionId
+    || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || Boolean(fullAutoSessionId || continuationSource) || navigationMenuOpen
+  const candidateSoundSessionId = view !== 'overview' || hasAttentionOverlay ? undefined : selected?.sessionId
     ?? (overviewMode === 'list' ? activeListSessionId : wallActiveId && overviewSessionIds.has(wallActiveId) ? wallActiveId : undefined)
-  useEffect(() => {
-    void window.agentManager.setActiveSession?.(activeSoundSessionId ?? null)?.catch(() => undefined)
-  }, [activeSoundSessionId])
   const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
   const manualApprovals = useMemo(() => approvals.filter(request => { const owner = sessions.find(session => session.sessionId === request.sessionId); return !owner || approvalModeOf(owner) === 'manual' }), [approvals, sessions])
   const pendingCount = useMemo(() => manualApprovals.filter((request) => currentWorkspace && workspaceKey(request.workspace) === workspaceKey(currentWorkspace)).length
     + visibleSessions.filter((session) => session.status === 'needs_attention').length, [manualApprovals, currentWorkspace, visibleSessions])
   const totalPendingCount = useMemo(() => manualApprovals.length + sessions.filter((session) => session.status === 'needs_attention').length, [manualApprovals, sessions])
   const overviewPendingCount = groupByWorkspace ? pendingCount : totalPendingCount
-  const attentionSessions = useMemo(() => sessions.filter((session) => session.status === 'needs_attention'), [sessions])
-  const activeWorkspaceName = currentWorkspace?.split(/[\\/]/).filter(Boolean).at(-1) ?? '尚未选择工作区'
   const terminalSessionIds = useMemo(() => orderedSessions.map(session => session.sessionId), [orderedSessions])
   const visibleTerminalIds = useMemo(() => [
     // Only Codex has a Host-side terminal protocol responder. Other TUIs still
@@ -1026,25 +1011,27 @@ export default function App(): JSX.Element {
       : overviewSessions.map(session => session.sessionId)),
   ], [orderedSessions, selected?.sessionId, overviewMode, activeListSessionId, overviewSessions])
   const retainedTerminals = useTerminalRetention(terminalSessionIds, visibleTerminalIds)
+  const freeMode = view === 'overview' && overviewMode === 'wall' && !selected && arrangement === 'free'
+  const freeVisibleIds = useMemo(() => overviewSessions.map(session => session.sessionId), [overviewSessions])
+  const freeLayout = useFreeOverviewLayout(terminalSessionIds, freeVisibleIds, freeMode)
+  const visibleFreeActiveId = useVisibleFreeSession(freeLayout.containerRef, candidateSoundSessionId, freeMode)
+  const activeSoundSessionId = freeMode ? visibleFreeActiveId : candidateSoundSessionId
+  useEffect(() => {
+    if (freeMode && candidateSoundSessionId) freeLayout.bringToFront(candidateSoundSessionId)
+  }, [freeMode, candidateSoundSessionId, freeLayout.bringToFront])
+  useEffect(() => {
+    void window.agentManager.setActiveSession?.(activeSoundSessionId ?? null)?.catch(() => undefined)
+  }, [activeSoundSessionId])
 
-  const approveNotification = async (request: ApprovalRequest): Promise<void> => {
-    setNotificationBusyId(request.requestId)
-    setNotificationError('')
-    try {
-      if (typeof window.agentManager.approveRequest === 'function') await window.agentManager.approveRequest(request.requestId)
-      else await window.agentManager.approveSession(request.sessionId)
-      await reload()
-    } catch (reason) {
-      setNotificationError(reason instanceof Error ? reason.message : String(reason))
-    } finally {
-      setNotificationBusyId(undefined)
-    }
-  }
-  const rejectNotification = async (request: ApprovalRequest): Promise<void> => {
-    setNotificationBusyId(request.requestId); setNotificationError('')
-    try { await window.agentManager.rejectRequest(request.requestId); await reload() }
-    catch (reason) { setNotificationError(reason instanceof Error ? reason.message : String(reason)) }
-    finally { setNotificationBusyId(undefined) }
+  const navigate = (action: NavigationAction): void => {
+    closeOtherOverlays('navigation')
+    if (action === 'overview' || action === 'attention' || action === 'audit' || action === 'tokens') { setSelectedId(undefined); setView(action); return }
+    if (action === 'approval-rules') setShowApprovalRules(true)
+    else if (action === 'continue-keywords') setShowContinueKeywords(true)
+    else if (action === 'session-safety') setShowSessionSafety(true)
+    else if (action === 'attention-sound') setShowAttentionSoundSettings(true)
+    else if (action === 'dingtalk') setShowDingTalkSettings(true)
+    else if (action === 'llm-review') { setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }
   }
   const fullAutoSession = sessions.find((session) => session.sessionId === fullAutoSessionId)
   const moveDraggedBefore = (targetId: string, draggedId = draggingSessionId, after = false): void => {
@@ -1079,7 +1066,7 @@ export default function App(): JSX.Element {
   }
 
   return (
-    <main className={`app-shell platform-${window.agentManager.platform}${selected ? ' detail-shell' : ''}`}>
+    <main className={`app-shell platform-${window.agentManager.platform}${selected ? ' detail-shell' : ''}`} style={motionVariables}>
       {selected ? <div className='detail-toolbar'>
         <button type='button' className='button-secondary' onClick={() => setSelectedId(undefined)} aria-label='返回总览'>← 返回总览</button>
         <strong>{selected.displayName}</strong>
@@ -1087,56 +1074,16 @@ export default function App(): JSX.Element {
         <div className='topbar-spacer' /><button type='button' className={'full-auto-toolbar-button' + (selected.fullAutoEnabled || selected.unattended?.enabled ? ' active' : '')} onClick={() => openFullAuto(selected.sessionId)}>{APPROVAL_MODE_LABEL[approvalModeOf(selected)]}</button><button type='button' className='button-secondary button-compact' onClick={() => openAgentEditor(selected.sessionId)}>编辑 Agent</button>
       </div> : <header className='topbar'>
         <div className='brand-block'><img src={managerLogoUrl} alt='Agent TUI Manager' /></div>
-        <div className='app-title'><strong>Agent TUI Manager</strong><small title={groupByWorkspace ? currentWorkspace : '全部工作区'}>{groupByWorkspace ? currentWorkspace ?? '尚未选择工作区' : '全部工作区'}</small></div>
-        <div className='topbar-spacer' />
-        <div className='notification-wrap' ref={notificationRef} onMouseEnter={revealNotifications} onFocusCapture={revealNotifications} onBlurCapture={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) hideNotifications() }}>
-          <button className='icon-button notification-button' type='button' title='待处理通知' aria-label='通知' aria-expanded={showNotifications} onClick={revealNotifications}>!{totalPendingCount > 0 && <i>{totalPendingCount}</i>}</button>
-          {notificationMounted && <aside className={'notification-popover' + (showNotifications ? ' is-visible' : '')} role='dialog' aria-label='通知' aria-hidden={!showNotifications}>
-            <header><div><strong>待处理通知</strong><span>{totalPendingCount} 项</span></div></header>
-            <div className='notification-list'>
-              {totalPendingCount === 0 && <p className='notification-empty'>当前没有待处理项</p>}
-              {manualApprovals.slice(0, 5).map((request) => <div className={'notification-item risk-' + request.risk} key={request.requestId}>
-                <i />
-                <div><strong>{request.displayName}</strong><span>{request.toolName ?? request.agentKind.toUpperCase()} · {request.inputSummary ?? request.command ?? '参数待确认'}</span><small title={request.workspace}>{request.workspace}</small></div>
-                <div className='notification-actions'><button className='button-secondary button-compact' type='button' disabled={notificationBusyId === request.requestId} onClick={() => { void rejectNotification(request) }}>拒绝</button><button className='button-approve' type='button' disabled={notificationBusyId === request.requestId} onClick={() => { void approveNotification(request) }}>{notificationBusyId === request.requestId ? '请稍后…' : '批准'}</button></div>
-              </div>)}
-              {attentionSessions.slice(0, Math.max(0, 5 - manualApprovals.length)).map((session) => <div className='notification-item recovery' key={session.sessionId}>
-                <i />
-                <div><strong>{session.displayName}</strong><span>{session.lastError ?? '检测到异常退出'}</span><small title={session.workspace}>{session.workspace}</small></div>
-              </div>)}
-            </div>
-            {notificationError && <p className='notification-error'>{notificationError}</p>}
-            <footer><span>仅展示最近 5 项</span><button className='button-secondary button-compact' type='button' onClick={() => { hideNotifications(); setView('attention') }}>打开处理中心</button></footer>
-          </aside>}
-        </div>
-        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}>安全规则</button>
-        <button className='button-secondary' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}>关键词续跑</button>
-        <button className='button-primary' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
+        <TopNavigation view={view} pendingCount={totalPendingCount} onNavigate={navigate} onMenuOpenChange={setNavigationMenuOpen} />
+        <button className='button-primary topbar-new-agent' type='button' onClick={openAgentForm}>＋ 新建 Agent</button>
       </header>}
       <div className={`workspace-layout${selected ? ' workspace-layout-detail' : ''}`}>
-        <CollapsiblePanel name='导航' storageId='navigation' badge={totalPendingCount}><nav className='sidebar' aria-label='主导航'>
-          {groupByWorkspace && <><p className='nav-label'>工作区</p>{workspaceGroups.map((group) => <button className={`nav-item${currentWorkspace && workspaceKey(group.workspace) === workspaceKey(currentWorkspace) ? ' active' : ''}`} type='button' key={workspaceKey(group.workspace)} onClick={() => setActiveWorkspace(group.workspace)}><span>▣</span><span title={group.workspace}>{group.workspace.split(/[\\/]/).filter(Boolean).at(-1)}</span><i className='nav-count neutral'>{group.sessions.length}</i></button>)}</>}
-          <p className={`nav-label${groupByWorkspace ? ' nav-section' : ''}`}>视图</p>
-          <button className={`nav-item${view === 'overview' ? ' active' : ''}`} type='button' aria-label='Agent 总览' title='Agent 总览' onClick={() => setView('overview')}><span>▦</span><span>Agent 总览</span></button>
-          <button className={`nav-item${view === 'attention' ? ' active' : ''}`} type='button' aria-label='处理中心' title='处理中心' onClick={() => setView('attention')}><span>!</span><span>处理中心</span>{totalPendingCount > 0 && <i className='nav-count'>{totalPendingCount}</i>}</button>
-          <button type='button' className='nav-item nav-group-toggle' aria-label='统计' aria-expanded={statisticsOpen} onClick={() => setStatisticsOpen(!statisticsOpen)}><span>◷</span><span>统计</span><i>{statisticsOpen ? '⌃' : '⌄'}</i></button>
-          <div className='nav-group-items' hidden={!statisticsOpen}>
-          <button className={`nav-item${view === 'audit' ? ' active' : ''}`} type='button' aria-label='审计' onClick={() => setView('audit')}><span>↺</span><span>审计</span></button><button className={`nav-item${view === 'tokens' ? ' active' : ''}`} type='button' aria-label='Token 用量' onClick={() => setView('tokens')}><span>∑</span><span>Token 用量</span></button>
-          </div><button type='button' className='nav-item nav-group-toggle' aria-label='设置' aria-expanded={settingsOpen} onClick={() => setSettingsOpen(!settingsOpen)}><span>⚙</span><span>设置</span><i>{settingsOpen ? '⌃' : '⌄'}</i></button>
-          <div className='nav-group-items' hidden={!settingsOpen}>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('approval-rules'); setShowApprovalRules(true) }}><span>✓</span><span>安全规则</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('continue-keywords'); setShowContinueKeywords(true) }}><span>↻</span><span>关键词续跑</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('session-safety'); setShowSessionSafety(true) }}><span>⚙</span><span>会话安全</span></button>
-          <button className='nav-item' type='button' onClick={() => { closeOtherOverlays('dingtalk'); setShowDingTalkSettings(true) }}><span>↗</span><span>钉钉远程</span></button>
-          <button className='nav-item' type='button' aria-label='审核器设置' onClick={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }}><span>◇</span><span>审核器设置</span></button>
-          </div>
-        </nav></CollapsiblePanel>
         <section className='workspace-main'>
-          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}{view === 'overview' && groupByWorkspace && <span className='workspace-scope-label'>{activeWorkspaceName}</span>}</>}</div>
+          <div className='sectionbar'>{selected ? <span aria-hidden='true' /> : <><h1>{view === 'overview' ? 'Agent 总览' : view === 'attention' ? '处理中心' : view === 'audit' ? '活动审计' : 'Token 用量'}</h1><span>{view === 'overview' ? `${runningCount} 运行 · ${overviewPendingCount} 待处理 · ${overviewSessions.length} 总计` : view === 'attention' ? `${totalPendingCount} 个待处理项` : view === 'audit' ? '所有会话活动记录' : '按窗口、配置和模型统计原生 usage'}</span><div className='topbar-spacer' />{view === 'overview' && <SessionStatusFilter value={statusFilter} onChange={setStatusFilter} />}{view === 'overview' && <div className='overview-mode-switch' role='group' aria-label='Agent 显示模式'><button type='button' aria-pressed={overviewMode === 'wall'} title='总览模式' onClick={() => setOverviewMode('wall')}>▦ 总览</button><button type='button' aria-pressed={overviewMode === 'list'} title='列表模式' onClick={() => setOverviewMode('list')}>☰ 列表</button></div>}{view === 'overview' && overviewMode === 'wall' && <OverviewLayoutControls value={arrangement} onChange={setArrangement} onArrange={freeLayout.arrange} />}{view === 'overview' && <button className='workspace-scope-toggle' type='button' role='switch' aria-checked={groupByWorkspace} onClick={() => setGroupByWorkspace((enabled) => !enabled)}><i />按工作区划分</button>}{view === 'overview' && groupByWorkspace && <label className='workspace-scope-picker'><span className='sr-only'>切换工作区</span><select aria-label='切换工作区' title={currentWorkspace} value={currentWorkspace ? workspaceKey(currentWorkspace) : ''} onChange={event => { const group = workspaceGroups.find(item => workspaceKey(item.workspace) === event.target.value); if (group) setActiveWorkspace(group.workspace) }}>{!workspaceGroups.length && <option value=''>尚未选择工作区</option>}{workspaceGroups.map(group => <option key={workspaceKey(group.workspace)} value={workspaceKey(group.workspace)}>{group.workspace.split(/[\\/]/).filter(Boolean).at(-1)} · {group.sessions.length}</option>)}</select></label>}</>}</div>
           <div className={`workspace-overview-shell${view === 'overview' ? '' : ' workspace-view-hidden'}`}>{sessions.length === 0 && externalDrag?.phase !== 'hovering'
             ? <section className='empty-state'><div className='empty-icon'>›_</div><h2>还没有受管 Agent</h2><p>选择工作区并启动你的第一个终端 Agent。</p><button className='button-primary' type='button' onClick={openAgentForm}>新增 Agent</button></section>
             : <section className={`agent-overview-workbench${overviewMode === 'list' && !selected ? ' agent-overview-workbench-list' : ''}${selected ? ' agent-overview-workbench-detail' : ''}`}>
-              {overviewMode === 'list' && !selected && <CollapsiblePanel name='Agent 列表' storageId='agents' keepOpen={Boolean(listDraggingId)} badge={overviewPendingCount}><aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId}
+              {overviewMode === 'list' && !selected && <CollapsiblePanel name='Agent 列表' storageId='agents' anchorVersion={activeListSessionId} keepOpen={Boolean(listDraggingId)} badge={overviewPendingCount}><aside className='agent-session-list' aria-label='Agent 列表'>{listSessions.map((session) => <button type='button' className={session.sessionId === activeListSessionId ? 'active' : ''} aria-pressed={session.sessionId === activeListSessionId} aria-label={`切换到 ${session.displayName}`} key={session.sessionId}
                 draggable title='拖动调整顺序'
                 onDragStart={(event) => {
                   setListActiveId(activeListSessionId)
@@ -1155,26 +1102,27 @@ export default function App(): JSX.Element {
                 }}
                 onDragEnd={() => setListDraggingId(undefined)}
                 onClick={() => setListActiveId(session.sessionId)}><AgentLogo kind={session.agentKind} className={`agent-dot agent-${session.agentKind}`} label={session.agentKind} /><span><strong>{session.displayName}</strong><small title={session.workspace}>{session.workspace}</small></span><em className={`status-${sessionDisplayStatus(session)}`}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</em></button>)}</aside></CollapsiblePanel>}
-              <section key='terminal-grid' className={`terminal-grid terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{orderedSessions.map((session) => <TerminalTile
+              <section ref={freeLayout.containerRef} key='terminal-grid' className={`terminal-grid${freeMode ? ' terminal-grid-free' : ''} terminal-grid-count-${Math.min(selected ? 1 : overviewSessions.length + (externalDrag?.phase === 'hovering' ? 1 : 0), 6)}${overviewMode === 'list' && !selected ? ' terminal-grid-list' : ''}${selected ? ' terminal-grid-detail' : ''}`}>{orderedSessions.map((session) => <TerminalTile
                 key={session.sessionId}
                 session={session}
                 approval={approvals.find((request) => request.sessionId === session.sessionId)}
                 active={activeSoundSessionId === session.sessionId}
-                onActivate={() => setWallActiveId(session.sessionId)}
+                onActivate={() => { setWallActiveId(session.sessionId); if (freeMode) freeLayout.bringToFront(session.sessionId) }}
                 detail={Boolean(selected)}
                 embedded={overviewMode === 'list' && !selected}
                 hidden={selected ? session.sessionId !== selected.sessionId : !overviewSessionIds.has(session.sessionId) || overviewMode === 'list' && session.sessionId !== activeListSessionId}
                 retained={retainedTerminals.has(session.sessionId)}
+                freeLayout={freeMode && freeLayout.windows[session.sessionId] ? { rect: freeLayout.windows[session.sessionId]!, start: (edge, event) => freeLayout.start(session.sessionId, edge, event), keyAdjust: (edge, event) => freeLayout.keyAdjust(session.sessionId, edge, event) } : undefined}
                 onOpen={() => setSelectedId(session.sessionId)}
                 onEdit={() => openAgentEditor(session.sessionId)}
                 onContinuation={() => { closeOtherOverlays('continuation'); setContinuationSource(session) }}
                 onFullAuto={() => openFullAuto(session.sessionId)}
-                draggable={!selected && overviewMode === 'wall'}
+                draggable={!selected && overviewMode === 'wall' && !freeMode}
                 dragging={draggingSessionId === session.sessionId}
                 onDragStart={() => { setDraggingSessionId(session.sessionId); setHandoffError('') }}
                 onDragEnd={() => { if (!detachBusy) setDraggingSessionId(undefined) }}
                 onDragOver={() => moveDraggedBefore(session.sessionId)}
-              />)}{!selected && overviewSessions.length === 0 && <div className='overview-filter-empty' role='status'>没有符合当前状态的 Agent</div>}{externalDrag?.phase === 'hovering' && view === 'overview' && !selected && <div className='external-handoff-placeholder' data-testid='handoff-placeholder' aria-live='polite'>请稍后…</div>}</section>
+              />)}{freeMode && <div className='free-layout-spacer' data-free-layout-spacer aria-hidden='true' style={freeLayout.extent} />}{!selected && overviewSessions.length === 0 && <div className='overview-filter-empty' role='status'>没有符合当前状态的 Agent</div>}{externalDrag?.phase === 'hovering' && view === 'overview' && !selected && <div className='external-handoff-placeholder' data-testid='handoff-placeholder' aria-live='polite'>请稍后…</div>}</section>
               {draggingSessionId && <div
                 className={'native-terminal-dropzone' + (detachBusy ? ' busy' : '')}
                 onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move' }}
@@ -1187,15 +1135,16 @@ export default function App(): JSX.Element {
           {view === 'audit' && <AuditPage sessions={sessions} onOpenLlmReviewResults={() => { closeOtherOverlays('llm-review'); setLlmReviewInitialView('results'); setShowLlmReviewSettings(true) }} />}
         </section>
       </div>
-      {formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace, sessionId) => { setActiveWorkspace(workspace); if (sessionId) { setListActiveId(sessionId); setWallActiveId(sessionId); setSelectedId(sessionId); setView('overview') } setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}
-      {editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}
-      {continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}
-      {showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}
-      {showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}
-      {showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}
-      {showDingTalkSettings && <DingTalkSettingsDialog onClose={() => setShowDingTalkSettings(false)} />}
-      {showLlmReviewSettings && <LlmReviewSettingsDialog initialView={llmReviewInitialView} onClose={() => setShowLlmReviewSettings(false)} />}
-      {fullAutoSession && <ApprovalModeDialog onConfigureReviewer={() => { setFullAutoSessionId(undefined); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }} session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}
+      <MotionPresence open={Boolean(formMounted)}>{formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace, sessionId) => { setActiveWorkspace(workspace); if (sessionId) { setListActiveId(sessionId); setWallActiveId(sessionId); setSelectedId(sessionId); setView('overview') } setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}</MotionPresence>
+      <MotionPresence open={Boolean(editingSession)}>{editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}</MotionPresence>
+      <MotionPresence open={Boolean(continuationSource)}>{continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}</MotionPresence>
+      <MotionPresence open={Boolean(showApprovalRules)}>{showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(showContinueKeywords)}>{showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(showSessionSafety)}>{showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(showDingTalkSettings)}>{showDingTalkSettings && <DingTalkSettingsDialog onClose={() => setShowDingTalkSettings(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(showAttentionSoundSettings)}>{showAttentionSoundSettings && <AttentionSoundSettingsDialog onClose={() => setShowAttentionSoundSettings(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(showLlmReviewSettings)}>{showLlmReviewSettings && <LlmReviewSettingsDialog initialView={llmReviewInitialView} onClose={() => setShowLlmReviewSettings(false)} />}</MotionPresence>
+      <MotionPresence open={Boolean(fullAutoSession)}>{fullAutoSession && <ApprovalModeDialog onConfigureReviewer={() => { setFullAutoSessionId(undefined); setLlmReviewInitialView('settings'); setShowLlmReviewSettings(true) }} session={fullAutoSession} onClose={() => setFullAutoSessionId(undefined)} onChanged={() => { void reload() }} />}</MotionPresence>
     </main>
   )
 }

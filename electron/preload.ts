@@ -1,15 +1,18 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { preventExternalFileDrop } from '../src/shared/prevent-file-drop'
+import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings } from '../src/shared/attention-audio-settings'
 
 import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessionRequest } from '../src/shared/manager-api'
 
 const api: AgentManagerApi = {
   setActiveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.setActiveSession, sessionId),
-  testAttentionSound: () => ipcRenderer.invoke(IPC_CHANNELS.testAttentionSound),
+  testAttentionSound: (settings) => ipcRenderer.invoke(IPC_CHANNELS.testAttentionSound, settings),
+  getAttentionSoundSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAttentionSoundSettings),
+  updateAttentionSoundSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAttentionSoundSettings, settings),
   onAttentionSound: (listener) => {
-    const handle = (_event: unknown, id: unknown): void => {
+    const handle = (_event: unknown, id: unknown, settings: unknown): void => {
       if (typeof id !== 'string' || id.length > 64) return
-      Promise.resolve().then(listener).then(
+      Promise.resolve().then(() => listener(parseAttentionAudioSettings(settings ?? DEFAULT_ATTENTION_AUDIO_SETTINGS))).then(
         () => ipcRenderer.send(IPC_CHANNELS.attentionSoundResult, id, true),
         () => ipcRenderer.send(IPC_CHANNELS.attentionSoundResult, id, false),
       )
@@ -26,6 +29,7 @@ const api: AgentManagerApi = {
   terminalReplay: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.terminalReplay, sessionId),
   openDeepSeekWeb: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openDeepSeekWeb, sessionId),
   openExternalWeb: (url) => ipcRenderer.invoke(IPC_CHANNELS.openExternalWeb, url),
+  openSessionWorkspace: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.openSessionWorkspace, sessionId),
   listAuditEntries: () => ipcRenderer.invoke(IPC_CHANNELS.listAuditEntries),
   listTokenUsageSummary: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageSummary, query),
   listTokenUsageDetails: (query) => ipcRenderer.invoke(IPC_CHANNELS.listTokenUsageDetails, query),

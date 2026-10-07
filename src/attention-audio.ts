@@ -1,13 +1,19 @@
+import { attentionAudioTones, ATTENTION_ENVELOPE, DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings, type AttentionAudioSettings } from './shared/attention-audio-settings'
+
 let context: AudioContext | undefined
 
 /** A short two-tone chime independent of the Windows system sound scheme. */
-export async function playAttentionAudio(): Promise<void> {
+export async function playAttentionAudio(value: AttentionAudioSettings = DEFAULT_ATTENTION_AUDIO_SETTINGS): Promise<void> {
+  const settings = parseAttentionAudioSettings(value)
+  if (settings.volume === 0) return
+  const tones = attentionAudioTones(settings.sound)
+  const scale = settings.volume / 100
   if (!context || context.state === 'closed') context = new AudioContext()
   const audio = context
   await new Promise<void>((resolve, reject) => {
     const nodes: Array<{ oscillator: OscillatorNode; gain: GainNode; ended: boolean }> = []
     let settled = false
-    let remaining = 2
+    let remaining = tones.length
     const finish = (error?: Error): void => {
       if (settled) return
       settled = true
@@ -30,17 +36,17 @@ export async function playAttentionAudio(): Promise<void> {
       if (settled) return
       if (audio.state !== 'running') throw new Error('Audio output unavailable')
       const start = audio.currentTime + 0.02
-      for (const [offset, frequency] of [[0, 660], [0.14, 880]]) {
+      for (const { offset, frequency } of tones) {
         const oscillator = audio.createOscillator()
         const gain = audio.createGain()
         const node = { oscillator, gain, ended: false }
         nodes.push(node)
         oscillator.type = 'sine'
-        oscillator.frequency.value = frequency!
-        const at = start + offset!
+        oscillator.frequency.value = frequency
+        const at = start + offset
         gain.gain.setValueAtTime(0, at)
-        gain.gain.linearRampToValueAtTime(0.12, at + 0.012)
-        gain.gain.exponentialRampToValueAtTime(0.001, at + 0.16)
+        gain.gain.linearRampToValueAtTime(ATTENTION_ENVELOPE.peak * scale, at + ATTENTION_ENVELOPE.attack)
+        gain.gain.exponentialRampToValueAtTime(ATTENTION_ENVELOPE.floor * scale, at + ATTENTION_ENVELOPE.decay)
         oscillator.connect(gain); gain.connect(audio.destination)
         oscillator.onended = () => {
           if (settled || node.ended) return
@@ -49,7 +55,7 @@ export async function playAttentionAudio(): Promise<void> {
           if (audio.state !== 'running') finish(new Error('Audio output unavailable'))
           else if (--remaining === 0) finish()
         }
-        oscillator.start(at); oscillator.stop(at + 0.18)
+        oscillator.start(at); oscillator.stop(at + ATTENTION_ENVELOPE.duration)
       }
     })().catch(error => finish(error instanceof Error ? error : new Error('Audio output unavailable')))
   })

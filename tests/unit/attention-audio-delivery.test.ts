@@ -56,4 +56,46 @@ describe('attention audio delivery', () => {
     vi.advanceTimersByTime(3000)
     expect(port.fallback).toHaveBeenCalledOnce()
   })
+  it('does not dispatch or fall back when saved settings are muted', () => {
+    const port = { getSettings: () => ({ sound: 'bell' as const, volume: 0 }), send: vi.fn(), fallback: vi.fn(), onDelivery: vi.fn() }
+    const delivery = new AttentionAudioDelivery(port)
+    delivery.play(); delivery.setReady(true); delivery.play()
+    vi.advanceTimersByTime(3000)
+    expect(port.send).not.toHaveBeenCalled()
+    expect(port.fallback).not.toHaveBeenCalled()
+    expect(port.onDelivery.mock.calls).toEqual([['muted'], ['muted']])
+  })
+  it('honors settings saved while waiting for an audio receipt and keeps previews independent', () => {
+    let volume = 30
+    const port = { getSettings: () => ({ sound: 'soft' as const, volume }), send: vi.fn(), fallback: vi.fn() }
+    const delivery = new AttentionAudioDelivery(port)
+    delivery.setReady(true); delivery.play()
+    expect(port.send).toHaveBeenCalledWith('1', { sound: 'soft', volume: 30 })
+    volume = 0
+    vi.advanceTimersByTime(2000)
+    expect(port.fallback).not.toHaveBeenCalled()
+    delivery.play({ sound: 'pulse', volume: 20 })
+    vi.advanceTimersByTime(2000)
+    expect(port.fallback).toHaveBeenCalledWith({ sound: 'pulse', volume: 20 }, expect.any(Function))
+  })
+  it('rechecks saved mute before an asynchronous native fallback can start', () => {
+    let volume = 30
+    const port = { getSettings: () => ({ sound: 'soft' as const, volume }), send: vi.fn(), fallback: vi.fn() }
+    const delivery = new AttentionAudioDelivery(port)
+    delivery.play()
+    const isAllowed = port.fallback.mock.calls[0]![1]
+    expect(isAllowed()).toBe(true)
+    volume = 0
+    expect(isAllowed()).toBe(false)
+  })
+  it('cancels stale preview retries on save while preserving pending reminder delivery', () => {
+    const { port, delivery } = fixture()
+    delivery.setReady(true)
+    delivery.play({ sound: 'bell', volume: 100 })
+    delivery.play()
+    delivery.settingsChanged()
+    vi.advanceTimersByTime(2000)
+    expect(port.fallback).toHaveBeenCalledOnce()
+    expect(port.fallback).toHaveBeenCalledWith({ sound: 'classic', volume: 100 }, expect.any(Function))
+  })
 })

@@ -1,8 +1,25 @@
 // Boot the actual built main/preload/renderer with empty isolated app data.
 const { app, shell } = require('electron')
 let soundCalls = 0
+let nativeAudioCalls = 0
 const nativeSoundAvailable = typeof shell.beep === 'function'
 shell.beep = () => { soundCalls += 1 }
+// Exercise the real fallback selection without playing sound or launching helpers.
+const childProcess = require('node:child_process')
+const { EventEmitter } = require('node:events')
+const { PassThrough } = require('node:stream')
+const originalExecFile = childProcess.execFile
+childProcess.execFile = function (file, args, options, callback) {
+  if (args?.some(arg => typeof arg === 'string' && arg.includes('[System.Media.SoundPlayer]')) || file === '/usr/bin/afplay' || file === 'aplay') {
+    nativeAudioCalls++
+    const child = new EventEmitter()
+    child.stdin = new PassThrough()
+    child.kill = () => true
+    process.nextTick(() => callback(null, '', ''))
+    return child
+  }
+  return originalExecFile.apply(this, arguments)
+}
 const { mkdtempSync } = require('node:fs')
 const { join, resolve } = require('node:path')
 const { tmpdir } = require('node:os')
@@ -34,6 +51,16 @@ app.on('browser-window-created', (_event, win) => {
         const audioAudit=await api.listAuditEntries();
         if(!audioAudit.some(entry=>entry.action==='attention_audio_renderer_completed'))throw Error('Missing completed playback receipt');
         if(!audioAudit.some(entry=>entry.action==='attention_audio_native_fallback'))throw Error('Missing fallback diagnostic');
+        const soundSettings=await api.getAttentionSoundSettings();
+        if(soundSettings.sound!=='classic'||soundSettings.volume!==100)throw Error('Incorrect default sound');
+        await api.updateAttentionSoundSettings({sound:'bell',volume:0});
+        const muted=await api.getAttentionSoundSettings();
+        if(muted.sound!=='bell'||muted.volume!==0)throw Error('Sound settings did not roundtrip');
+        await api.testAttentionSound();
+        await new Promise(resolve=>setTimeout(resolve,100));
+        if(!(await api.listAuditEntries()).some(entry=>entry.action==='attention_audio_muted'))throw Error('Missing mute diagnostic');
+        const invalidSound=await api.updateAttentionSoundSettings({sound:'bell',volume:101}).then(()=>false,()=>true);
+        if(!invalidSound)throw Error('Invalid sound volume accepted');
         await api.setActiveSession(null);
         await api.setActiveSession('missing-session');
         const invalidActive=await api.setActiveSession({id:'bad'}).then(()=>false,()=>true);
@@ -49,8 +76,8 @@ app.on('browser-window-created', (_event, win) => {
         if(!invalid)throw Error('Invalid mode accepted');
         return {sessions:sessions.length,modeIpc:true,activeAgentIpc:true,backend:updated.backend,audioTones:tones,modelCatalogIpc:true};
       })()`)
-      if (!nativeSoundAvailable || soundCalls!==1) throw Error('Audio fallback did not run exactly once')
-      console.log(JSON.stringify({ok:true,userData:app.getPath('userData'),nativeSoundAvailable,soundCalls,...result}))
+      if (!nativeSoundAvailable || nativeAudioCalls!==1 || soundCalls!==0) throw Error('Audio fallback did not run exactly once or mute was bypassed')
+      console.log(JSON.stringify({ok:true,userData:app.getPath('userData'),nativeSoundAvailable,soundCalls,nativeAudioCalls,...result}))
       clearTimeout(timer); app.exit(0)
     } catch(error) { console.error(error); clearTimeout(timer); app.exit(1) }
   })

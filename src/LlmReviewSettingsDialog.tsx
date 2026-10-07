@@ -2,6 +2,7 @@ import { type FormEvent, useEffect, useRef, useState } from 'react'
 
 import type { CCSwitchProviderSummary, LlmReviewerInput, LlmReviewerSummary, LlmReviewSettingsInput, LlmReviewSettingsSummary, LlmRuleAuditFinding, LlmRuleAuditResult } from './shared/manager-api'
 import CCSwitchProviderList from './CCSwitchProviderList'
+import AnimatedCollapse from './AnimatedCollapse'
 import './llm-reviewer-pool.css'
 
 type ReviewerDraft = LlmReviewerInput & { hasApiKey: boolean }
@@ -9,6 +10,10 @@ function fromLegacy(value: LlmReviewSettingsSummary): ReviewerDraft {
   return { id: 'legacy-reviewer', name: '默认审核器', enabled: true, backend: value.backend ?? 'api',
     protocol: value.protocol ?? 'openai-chat', anthropicAuth: value.anthropicAuth, baseUrl: value.baseUrl, model: value.model,
     cliExecutable: value.cliExecutable, cliModel: value.cliModel, hasApiKey: value.hasApiKey }
+}
+
+function hasConnectionDraft(entry: ReviewerDraft): boolean {
+  return entry.backend !== 'api' || Boolean(entry.baseUrl || entry.model || entry.apiKey || entry.hasApiKey)
 }
 
 const DEFAULTS: LlmReviewSettingsSummary = {
@@ -175,8 +180,8 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     if (next) showReviewer(next)
   }
   const addReviewer = (): void => {
-    const entry: ReviewerDraft = { id: crypto.randomUUID(), name: `审核器 ${reviewers.length + 1}`, enabled: true, backend: 'api', protocol: 'openai-chat', hasApiKey: false }
-    setReviewers([...(poolActive ? draftPool() : [currentDraft()]), entry]); setPoolActive(true); showReviewer(entry)
+    const entry: ReviewerDraft = { id: crypto.randomUUID(), name: `审核器 ${reviewers.length + 1}`, enabled: false, backend: 'api', protocol: 'openai-chat', hasApiKey: false }
+    setReviewers([...(poolActive ? draftPool() : [currentDraft()].filter(hasConnectionDraft)), entry]); setPoolActive(true); showReviewer(entry)
   }
   const moveReviewer = (id: string, direction: number): void => {
     const entries = draftPool(); const index = entries.findIndex(entry => entry.id === id)
@@ -294,12 +299,15 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     if (saving.current || !providerId) return
     saving.current = true; setBusy(true); setError('')
     try {
-      // The button explicitly saves first, preserving edited entries and their secret drafts.
-      await persistSettings()
+      // Import commits only the selected credential in main. Keep other form drafts
+      // locally: validating/saving the whole pool first prevents incomplete setups
+      // from importing the very connection they need to finish configuration.
+      const drafts = poolActive ? draftPool() : [currentDraft()].filter(hasConnectionDraft)
       const saved = await window.agentManager.importLlmReviewer({ agentKind: importKind, providerId })
-      loadSummary(saved, saved.reviewers?.at(-1)?.id)
+      const imported = saved.reviewers?.at(-1)
+      if (!imported) throw new Error('导入未返回审核器，请重新打开设置后检查')
+      setReviewers([...drafts, imported]); setPoolActive(true); showReviewer(imported)
       setImportOpen(false)
-      setModelMessage('已导入为停用项，请检查协议和模型后启用并保存。')
     } catch (reason) { setError(readableError(reason)) }
     finally { saving.current = false; setBusy(false) }
   }
@@ -389,6 +397,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     onDoubleClick={(event) => { if (event.target === event.currentTarget) { resetBackdropClose(); onClose() } }}>
     <form className='rules-dialog llm-review-dialog' role='dialog' aria-modal='true' aria-labelledby='llm-review-title' onMouseDown={resetBackdropClose} onSubmit={(event) => { void save(event) }}>
       <header><div><span className='eyebrow'>SECURITY REVIEW</span><h2 id='llm-review-title'>审核器设置</h2></div><span className={'llm-review-state ' + (settings.enabled ? 'enabled' : '')}><i />{settings.enabled ? '审核器已启用' : '审核器已关闭'}</span></header>
+      <div className='llm-review-scroll'>
       <p className='rules-help'>仅在 Agent 审核模式命中高危规则时调用。按实际影响批准或拒绝；拒绝会反馈给 Agent 修改请求。失败和不确定结论也拒绝，不转人工。</p>
       <fieldset className='llm-settings-fields' disabled={busy || modelsLoading || testing}>
 
@@ -396,6 +405,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
       <section className='reviewer-pool' aria-label='审核器池'>
         <div className='reviewer-pool-toolbar'><strong>按顺序尝试审核服务</strong><button type='button' className='button-secondary' onClick={addReviewer}>添加审核器</button><button type='button' className='button-secondary' onClick={() => setImportOpen(value => !value)}>从 CC Switch 导入</button></div>
         <p>连接、超时或响应格式错误时尝试下一项。有效拒绝和不确定结论均立即拒绝，不继续尝试。</p>
+        <p>新建和导入的审核器默认停用，配置完成后勾选启用。保存时会检查所有已勾选的审核器。</p>
         {poolActive && <ol>{draftPool().map((entry, index) => <li key={entry.id} className={entry.id === selectedId ? 'selected' : ''}>
           <input type='checkbox' aria-label={`启用 ${entry.name}`} checked={entry.enabled} onChange={event => setReviewers(current => current.map(item => item.id === entry.id ? { ...item, enabled: event.target.checked } : item))} />
           <button type='button' className='reviewer-pool-select' aria-pressed={entry.id === selectedId} onClick={() => selectReviewer(entry.id)}>{index + 1}. {entry.name}<small>{entry.backend === 'api' ? entry.protocol ?? 'openai-chat' : entry.backend}</small></button>
@@ -403,12 +413,12 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
           <button type='button' aria-label={`下移 ${entry.name}`} disabled={index === reviewers.length - 1} onClick={() => moveReviewer(entry.id, 1)}>↓</button>
           <button type='button' aria-label={`移除 ${entry.name}`} onClick={() => removeReviewer(entry.id)}>移除</button>
         </li>)}</ol>}
-        {importOpen && <div className='reviewer-pool-import'>
+        <AnimatedCollapse open={importOpen}><div className='reviewer-pool-import'>
           <label>CC Switch 类型<select className='launcher-field' value={importKind} onChange={event => setImportKind(event.target.value as 'codex' | 'claude')}><option value='codex'>Codex</option><option value='claude'>Claude</option></select></label>
           <CCSwitchProviderList providers={providers} selectedId={providerId} loading={providersLoading} error={providerError} disabled={busy} onSelect={provider => setProviderId(provider.id)} onRefresh={() => { void refreshProviders() }} />
-          <p>先保存当前修改，再导入独立的加密配置副本。导入项默认停用，请核对协议和模型。</p>
-          <button type='button' className='button-secondary' disabled={!providerId || providersLoading} onClick={() => { void importReviewer() }}>保存并导入所选配置</button>
-        </div>}
+          <p>导入所选配置并加密保存密钥，其他未保存的修改会保留。导入项默认停用；请选择模型，再勾选该项并保存设置。</p>
+          <button type='button' className='button-secondary' disabled={!providerId || providersLoading} onClick={() => { void importReviewer() }}>导入所选配置</button>
+        </div></AnimatedCollapse>
         {poolActive && reviewers.length > 0 && <label>审核器名称<input className='launcher-field' value={reviewers.find(entry => entry.id === selectedId)?.name ?? ''} onChange={event => setReviewers(current => current.map(entry => entry.id === selectedId ? { ...entry, name: event.target.value } : entry))} /></label>}
         {poolActive && !reviewers.length && <p>尚未配置审核服务，请添加审核器或从 CC Switch 导入。</p>}
       </section>
@@ -421,6 +431,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
         {settings.protocol === 'anthropic-messages' && <label>Anthropic 身份验证<select className='launcher-field' value={settings.anthropicAuth ?? 'api-key'} onChange={event => setSettings(current => ({ ...current, anthropicAuth: event.target.value as 'api-key' | 'bearer' }))}><option value='api-key'>API Key（x-api-key）</option><option value='bearer'>Bearer Token</option></select></label>}
         <label>Base URL<input className='launcher-field' value={settings.baseUrl ?? ''} onChange={event => setSettings(current => ({ ...current, baseUrl: event.target.value }))} placeholder='https://api.example.com/v1' /></label>
         <label>API Key<input className='launcher-field' type='password' autoComplete='off' disabled={clearApiKey} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? '已安全保存，留空保持不变' : '请输入 API Key'} /></label>
+        {settings.hasApiKey && !clearApiKey && !apiKey && <p role='status'>API Key 已安全保存，无需重新填写。</p>}
         {settings.hasApiKey && <label className='dingtalk-clear-secret'><input type='checkbox' checked={clearApiKey} onChange={event => setClearApiKey(event.target.checked)} />清除已保存的 API Key</label>}
         <div className='llm-model-picker'><label>Model{manualModel
           ? <input className='launcher-field' value={settings.model ?? ''} onChange={event => setSettings(current => ({ ...current, model: event.target.value }))} />
@@ -462,7 +473,10 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
       <div className='launcher-config-security'><strong>高危请求的处理</strong><span>Agent 审核模式允许审核器作出批准或拒绝；规则自动模式直接拒绝。普通请求不会调用审核器。</span></div>
       <div className='launcher-config-security'><strong>凭据保护</strong><span>API Key 和代理密码使用 Electron 安全存储加密，不返回页面、不写入审计。</span></div>
       </fieldset>
+      </div>
+      <div className='llm-review-save-status' aria-live='polite'>
       {error && <p className='form-error'>{error}</p>}{closeArmed && <p className='launcher-dismiss-hint rules-dismiss-hint'>再点击一次空白处关闭</p>}
+      </div>
       <footer><button type='button' className='button-secondary' onClick={onClose}>取消</button><button type='submit' className='button-primary' disabled={busy || modelsLoading || testing || !apiAvailable}>{busy ? '请稍后…' : '保存设置'}</button></footer>
     </form>
   </div>

@@ -26,12 +26,17 @@ describe('preload agentManager contract', () => {
     const unsubscribe = api.onAttentionSound(play)
     expect(electron.send).toHaveBeenCalledWith(IPC_CHANNELS.attentionSoundReady, true)
     const listener = electron.on.mock.calls.filter(call => call[0] === IPC_CHANNELS.attentionSound).at(-1)![1]
-    listener({}, 'sound-1')
+    listener({}, 'sound-1', { sound: 'bell', volume: 25 })
     await vi.waitFor(() => expect(electron.send).toHaveBeenCalledWith(IPC_CHANNELS.attentionSoundResult, 'sound-1', true))
+    expect(play).toHaveBeenCalledWith({ sound: 'bell', volume: 25 })
     play.mockRejectedValueOnce(new Error('private diagnostic'))
     listener({}, 'sound-2')
     await vi.waitFor(() => expect(electron.send).toHaveBeenCalledWith(IPC_CHANNELS.attentionSoundResult, 'sound-2', false))
     expect(electron.send.mock.calls.flat()).not.toContain('private diagnostic')
+    play.mockClear()
+    listener({}, 'sound-invalid', { sound: 'classic', volume: -1 })
+    await vi.waitFor(() => expect(electron.send).toHaveBeenCalledWith(IPC_CHANNELS.attentionSoundResult, 'sound-invalid', false))
+    expect(play).not.toHaveBeenCalled()
     unsubscribe()
     expect(electron.send).toHaveBeenCalledWith(IPC_CHANNELS.attentionSoundReady, false)
   })
@@ -39,10 +44,17 @@ describe('preload agentManager contract', () => {
   it('exposes only the narrow manager API including native session discovery', async () => {
     await import('../../electron/preload')
     const api = electron.exposeInMainWorld.mock.calls.at(-1)?.[1] as Record<string, (...args: unknown[]) => unknown>
-    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'createContinuation', 'detachSession', 'detectAgentEnvironment', 'discoverRecentCodexSessions', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'importLlmReviewer', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listLlmReviewModels', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'onAttentionSound', 'openDeepSeekWeb', 'openExternalWeb', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'saveUnattendedSettings', 'setActiveSession', 'setApprovalMode', 'setDangerRuleEnabled', 'setFullAutoMode', 'setUnattendedMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testAttentionSound', 'testDangerCommand', 'testLlmReviewer', 'tryRecoveryOnce', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
+    expect(Object.keys(api).sort()).toEqual(['acceptApprovalSuggestion', 'acceptRecoverySuggestion', 'addApprovalRule', 'addDangerRule', 'approveAllPending', 'approveAndRememberRequest', 'approveRequest', 'approveSession', 'chooseExecutable', 'chooseWorkspace', 'continueSession', 'createContinuation', 'detachSession', 'detectAgentEnvironment', 'discoverRecentCodexSessions', 'discoverSessions', 'dismissApprovalSuggestion', 'dismissRecoverySuggestion', 'exportAuditEntries', 'getAttentionSoundSettings', 'getContinueKeywordSettings', 'getDingTalkSettings', 'getLlmReviewSettings', 'getSessionSafetySettings', 'importLlmReviewer', 'installAgent', 'installNodeAndNpm', 'installRipgrep', 'listApprovalRules', 'listAuditEntries', 'listCCSwitchProviders', 'listDangerRules', 'listLlmReviewModels', 'listPendingApprovals', 'listSessions', 'listTokenUsageDetails', 'listTokenUsageSummary', 'onAttentionSound', 'openDeepSeekWeb', 'openExternalWeb', 'openSessionWorkspace', 'platform', 'readClipboardText', 'rejectRequest', 'removeApprovalRule', 'removeDangerRule', 'removeSession', 'renameSession', 'resetDingTalkBinding', 'resize', 'restartSession', 'reviewApprovalRules', 'saveUnattendedSettings', 'setActiveSession', 'setApprovalMode', 'setDangerRuleEnabled', 'setFullAutoMode', 'setUnattendedMode', 'startSession', 'stopSession', 'subscribe', 'terminalReplay', 'testAttentionSound', 'testDangerCommand', 'testLlmReviewer', 'tryRecoveryOnce', 'updateAttentionSoundSettings', 'updateContinueKeywordSettings', 'updateDingTalkSettings', 'updateLlmReviewSettings', 'updateSessionConfig', 'updateSessionProxy', 'updateSessionSafetySettings', 'write', 'writeClipboardText'])
     expect(api.platform).toBe(process.platform)
     await api.setActiveSession?.(null)
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.setActiveSession, null)
+    await api.getAttentionSoundSettings?.()
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.getAttentionSoundSettings)
+    const audioSettings = { sound: 'pulse', volume: 0 }
+    await api.updateAttentionSoundSettings?.(audioSettings)
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.updateAttentionSoundSettings, audioSettings)
+    await api.testAttentionSound?.(audioSettings)
+    expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.testAttentionSound, audioSettings)
     const saved = { enabled: false, endWord: 'DONE', recoveryWord: 'continue', approvalEnterDelaySeconds: 7, approvalEnterCount: 3 }
     await api.saveUnattendedSettings?.('session-1', saved)
     expect(electron.invoke).toHaveBeenCalledWith(IPC_CHANNELS.saveUnattendedSettings, 'session-1', saved)

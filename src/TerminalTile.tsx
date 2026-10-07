@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPointerEvent, useEffect, useRef, useState } from 'react'
+import type { FreeWindowRect, ResizeEdge } from './free-overview-layout'
 import { APPROVAL_MODE_LABEL, approvalModeOf } from './shared/approval-mode'
 import { Terminal } from '@xterm/xterm'
 
@@ -89,6 +90,11 @@ function isClosedPreviousHostError(message: string): boolean {
 
 
 interface TerminalTileProps {
+  freeLayout?: {
+    rect: FreeWindowRect
+    start: (edge: 'move' | ResizeEdge, event: ReactPointerEvent<HTMLElement>) => void
+    keyAdjust: (edge: 'move' | ResizeEdge, event: ReactKeyboardEvent<HTMLElement>) => void
+  }
   session: SessionSummary
   approval?: ApprovalRequest
   detail?: boolean
@@ -108,7 +114,7 @@ interface TerminalTileProps {
   onDragOver?: () => void
 }
 
-export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver, freeLayout }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
@@ -690,24 +696,32 @@ export default function TerminalTile({ session, approval, detail = false, embedd
 
   return (
     <article
-      className={`terminal-card${active ? ' terminal-card-active' : ''}${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
+      className={`terminal-card${freeLayout ? ' terminal-card-floating' : ''}${active ? ' terminal-card-active' : ''}${detail ? ' terminal-card-detail' : ''}${embedded ? ' terminal-card-embedded' : ''}${hidden ? ' terminal-card-hidden' : ''}${dragging ? ' terminal-card-dragging' : ''}`}
+      style={freeLayout ? { left: freeLayout.rect.x, top: freeLayout.rect.y, width: freeLayout.rect.width, height: freeLayout.rect.height, zIndex: freeLayout.rect.zIndex } : undefined}
       onPointerDownCapture={() => { if (!hidden) onActivate?.() }}
       onFocusCapture={() => { if (!hidden) onActivate?.() }}
       onDragOver={(event) => { if (!draggable) return; event.preventDefault(); onDragOver?.() }}
       data-testid={`terminal-tile-${session.sessionId}`}
-      onClick={openDetail}
-      onKeyDown={(event) => { if ((event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
+      onClick={freeLayout ? undefined : openDetail}
+      onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ') && !detail && !embedded) openDetail() }}
       tabIndex={detail || embedded || hidden || terminalEnded ? -1 : 0}
       aria-hidden={hidden || undefined}
     >
-      <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}>
+      <header className="terminal-card-header" draggable={draggable} onDragStart={() => onDragStart?.()} onDragEnd={() => onDragEnd?.()}
+        onPointerDown={event => { if (!(event.target as HTMLElement).closest('button, a, input, select, textarea')) freeLayout?.start('move', event) }}
+        onDoubleClick={event => { if (freeLayout && !(event.target as HTMLElement).closest('button, a, input, select, textarea')) openDetail() }}>
         <div className="agent-identity">
+          {freeLayout && <button className='free-window-move' type='button' aria-label={`移动 ${session.displayName}`} title='拖动移动窗口；方向键微调，Shift 加速' onPointerDown={event => freeLayout.start('move', event)} onKeyDown={event => freeLayout.keyAdjust('move', event)} onClick={event => event.stopPropagation()}>⠿</button>}
           <AgentLogo kind={session.agentKind} className={'agent-dot agent-' + session.agentKind} />
-          <div><h2>{session.displayName}</h2><div className="terminal-session-meta"><p title={session.workspace}>{session.workspace}</p>{session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}</div></div>
+          <div><h2>{session.displayName}</h2><div className="terminal-session-meta">
+            <button type="button" className="workspace-path-link" title={`打开工作区文件夹：${session.workspace}`} aria-label={`打开工作区：${session.workspace}`} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.openSessionWorkspace(session.sessionId)) }}>{session.workspace}</button>
+            {session.nativeSessionId && <button type="button" className="native-session-id" title={`原生会话 ID：${session.nativeSessionId}（点击复制）`} aria-label="复制原生会话 ID" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.writeClipboardText(session.nativeSessionId!)) }}>ID: {session.nativeSessionId}</button>}
+          </div></div>
         </div>
         <div className="terminal-actions">
           <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
           {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (approvalModeOf(session) !== 'manual' ? ' active' : '')} type="button" title="随时切换审批模式" aria-label={'审批模式：' + APPROVAL_MODE_LABEL[approvalModeOf(session)]} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{APPROVAL_MODE_LABEL[approvalModeOf(session)]}</button>}
+          <button className="button-ghost workspace-folder-button" type="button" title="打开工作区文件夹" aria-label={`打开 ${session.displayName} 的工作区文件夹`} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.openSessionWorkspace(session.sessionId)) }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v2M3 7v12a1 1 0 0 0 1 1h15l3-10H7L4 20" /></svg></button>
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
           {onContinuation && (session.agentKind === 'codex' || session.agentKind === 'claude') && <button className="button-ghost" type="button" disabled={!session.nativeSessionId} title={session.nativeSessionId ? '新窗口清洗续写，继承配置' : '等待原生会话 ID 后可续写'} aria-label={`新窗口续写 ${session.displayName}`} onClick={event => { event.stopPropagation(); onContinuation() }}>↗</button>}
           {!detail && !embedded && !terminalEnded && <button className="button-ghost" type="button" onClick={(event) => { event.stopPropagation(); onOpen?.() }} aria-label={`查看 ${session.displayName}`}>⛶</button>}
@@ -749,6 +763,9 @@ export default function TerminalTile({ session, approval, detail = false, embedd
                 : session.approvalSuggestion ? <div className="approval-suggestion"><span className="approval-suggestion-summary" tabIndex={0} data-tooltip={`已手动批准 ${session.approvalSuggestion.approvalCount} 次\n命令：${session.approvalSuggestion.command}\n加入后，相同命令将按安全规则自动批准。`}>已手动批准 {session.approvalSuggestion.approvalCount} 次 · {session.approvalSuggestion.command}</span><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.acceptApprovalSuggestion(session.sessionId) }}>加入</button><button type="button" onClick={(event) => { event.stopPropagation(); void window.agentManager.dismissApprovalSuggestion(session.sessionId) }}>暂不</button></div>
                   : null}
       </div>}
+      {freeLayout && (['n', 'ne', 'e', 'se', 's', 'sw', 'w', 'nw'] as ResizeEdge[]).map(edge => <button key={edge} type='button' className={'free-window-resize free-window-resize-' + edge} data-resize-edge={edge}
+        aria-label={`调整 ${session.displayName} 的${({ n: '上边', ne: '右上角', e: '右边', se: '右下角', s: '下边', sw: '左下角', w: '左边', nw: '左上角' })[edge]}`}
+        title='拖动调整窗口宽高；方向键微调，Shift 加速' onPointerDown={event => freeLayout.start(edge, event)} onKeyDown={event => freeLayout.keyAdjust(edge, event)} onClick={event => event.stopPropagation()} />)}
     </article>
   )
 }

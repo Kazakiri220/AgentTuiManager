@@ -1,5 +1,6 @@
 import type { HostEvent } from './protocol'
 import type { NetworkRetrySettings } from './network-retry'
+import type { AttentionAudioSettings } from './attention-audio-settings'
 import type { SessionState } from './session-state'
 
 export type AgentKind = 'generic' | 'codex' | 'claude' | 'pi' | 'deepseek'
@@ -528,10 +529,13 @@ export const IPC_CHANNELS = {
   attentionSoundReady: 'agent-manager:attention-sound-ready',
   attentionSoundResult: 'agent-manager:attention-sound-result',
   testAttentionSound: 'agent-manager:test-attention-sound',
+  getAttentionSoundSettings: 'agent-manager:get-attention-sound-settings',
+  updateAttentionSoundSettings: 'agent-manager:update-attention-sound-settings',
   listSessions: 'agent-manager:list-sessions',
   terminalReplay: 'agent-manager:terminal-replay',
   openDeepSeekWeb: 'agent-manager:open-deepseek-web',
   openExternalWeb: 'agent-manager:open-external-web',
+  openSessionWorkspace: 'agent-manager:open-session-workspace',
   listAuditEntries: 'agent-manager:list-audit-entries',
   listTokenUsageSummary: 'agent-manager:list-token-usage-summary',
   listTokenUsageDetails: 'agent-manager:list-token-usage-details',
@@ -600,13 +604,16 @@ export const IPC_CHANNELS = {
 
 export interface AgentManagerApi {
   setActiveSession(sessionId: string | null): Promise<void>
-  onAttentionSound(listener: () => Promise<void>): () => void
-  testAttentionSound(): Promise<void>
+  onAttentionSound(listener: (settings: AttentionAudioSettings) => Promise<void>): () => void
+  testAttentionSound(settings?: AttentionAudioSettings): Promise<void>
+  getAttentionSoundSettings(): Promise<AttentionAudioSettings>
+  updateAttentionSoundSettings(settings: AttentionAudioSettings): Promise<AttentionAudioSettings>
   readonly platform: NodeJS.Platform
   listSessions(): Promise<SessionSummary[]>
   terminalReplay(sessionId: string): Promise<TerminalReplaySnapshot>
   openDeepSeekWeb(sessionId: string): Promise<void>
   openExternalWeb(url: string): Promise<void>
+  openSessionWorkspace(sessionId: string): Promise<void>
   listAuditEntries(): Promise<AuditEntry[]>
   listTokenUsageSummary?(query?: TokenUsageQuery): Promise<TokenUsageSummary[]>
   listTokenUsageDetails?(query?: TokenUsageQuery): Promise<TokenUsagePage>
