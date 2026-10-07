@@ -5,6 +5,7 @@ import net, { type Socket } from 'node:net'
 import { join } from 'node:path'
 import { resolveNetworkRetry } from './agent-network-retry'
 import { autoCompactArgs } from '../src/shared/auto-compact'
+import { DEFAULT_TERMINAL_SETTINGS } from '../src/shared/terminal-settings'
 
 import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protocol'
 import type { ApprovalMode, AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
@@ -395,7 +396,7 @@ export class SessionHostManager {
   }
 
   async start(options: StartHostOptions): Promise<HostHandle> {
-    const codexTerminalMode = this.getCodexTerminalMode?.() ?? 'scrollback'
+    const codexTerminalMode = this.getCodexTerminalMode?.() ?? DEFAULT_TERMINAL_SETTINGS.codexMode
     await mkdir(this.runtimeDir, { recursive: true })
     if (this.socketDir !== this.runtimeDir) await mkdir(this.socketDir, { recursive: true, mode: 0o700 })
     const hostId = randomUUID()

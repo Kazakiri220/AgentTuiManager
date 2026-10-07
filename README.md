@@ -9,11 +9,11 @@
 
 Windows / macOS · MIT Open Source
 
-当前代码版本：**0.4.13-local.2**（已整合上游会话恢复与模型获取功能，保留本地四模式、提示音、自由布局及顶部导航）。合并范围及验证见 [上游整合记录](UPSTREAM_INTEGRATION.md)；上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
+当前代码版本：**0.4.13-local.3**（已整合上游会话恢复与模型获取功能，保留本地四模式、提示音、自由布局及顶部导航）。合并范围及验证见 [上游整合记录](UPSTREAM_INTEGRATION.md)；上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
 
 界面开发请遵循 [统一动效规范](UI_MOTION_STANDARD.md)；本批升级验收见 [导航与工作区验证记录](NAVIGATION_WORKSPACE_VERIFICATION.md)。
 
-设置 → **终端显示模式** 可切换 Codex 显示方式。默认保留滚动历史模式；原生全屏模式在当前 Agent 面板内启用 Codex 的鼠标输入编辑。保存只影响之后新建、重启及恢复启动的会话，不会重启正在运行的 Agent。已在 Codex 0.159.2 验证点击定位、拖选替换、删除和粘贴；该 CLI 版本不支持 Ctrl+X 剪切鼠标选区。实现范围与测试见 [终端模式验证记录](TERMINAL_MODE_VERIFICATION.md)。
+设置 → **终端显示模式** 默认使用 Codex 原生全屏，在当前 Agent 面板内启用鼠标输入编辑。旧模式已收进“高级设置 → 启用兼容模式”，供旧版 CLI 或显示异常时使用；升级保留已有明确保存的模式选择。保存只影响之后新建、重启及恢复启动的会话，不会重启正在运行的 Agent。已在 Codex 0.159.2 验证点击定位、拖选替换、删除和粘贴；该 CLI 版本不支持 Ctrl+X 剪切鼠标选区。实现范围与测试见 [终端模式验证记录](TERMINAL_MODE_VERIFICATION.md)。
 
 ---
 

@@ -8,7 +8,8 @@ const DISPLAY_CONFIG = /^\s*tui\.(?:alternate_screen|fullscreen_transcript)\s*=/
 const FULLSCREEN_CONFIG = ['-c', 'tui.alternate_screen="always"', '-c', 'tui.fullscreen_transcript=true']
 
 /** Rewrite display options only, at the final PTY launch boundary. Canonical
- * recovery commands remain stable and contain no global UI preferences. */
+ * recovery commands remain stable and contain no global UI preferences.
+ * Missing mode denotes a legacy HostCommand, not a new Manager's preference. */
 export function codexTerminalModeArgs(args: string[], mode: CodexTerminalMode = 'scrollback'): string[] {
   const result: string[] = []
   let subcommand = -1

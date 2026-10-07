@@ -10,7 +10,7 @@ export class TerminalSettingsStore {
   static async load(path: string): Promise<TerminalSettingsStore> {
     let settings = { ...DEFAULT_TERMINAL_SETTINGS }
     try { settings = parseTerminalSettings(JSON.parse(await readFile(path, 'utf8'))) }
-    catch { /* Missing or damaged settings preserve the existing scrollback mode. */ }
+    catch { /* Missing or damaged settings use the default; valid saved choices are retained. */ }
     return new TerminalSettingsStore(path, settings)
   }
 

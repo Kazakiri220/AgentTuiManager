@@ -837,4 +837,6 @@ button:disabled { cursor: default; opacity: .55; }
 .terminal-settings-body { flex: 1; overflow-y: auto; min-height: 0; padding-right: 3px; }
 .terminal-settings-dialog fieldset { display: grid; gap: 12px; min-width: 0; margin: 22px 0; padding: 0; border: 0; }
 .terminal-settings-dialog label { font-size: 12px; }
-.terminal-settings-dialog select { width: 100%; min-height: 38px; padding: 7px 10px; color: var(--text); background: #0e1517; border: 1px solid #39474b; border-radius: 5px; }
+.terminal-mode-summary { margin: 22px 0 12px; font-size: 13px; font-weight: 600; }
+.terminal-compatibility-option { display: flex; align-items: center; gap: 8px; }
+.terminal-compatibility-option input { margin: 0; accent-color: var(--green); }

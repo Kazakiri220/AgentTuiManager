@@ -4,7 +4,7 @@ export interface TerminalSettings {
   codexMode: CodexTerminalMode
 }
 
-export const DEFAULT_TERMINAL_SETTINGS: Readonly<TerminalSettings> = { codexMode: 'scrollback' }
+export const DEFAULT_TERMINAL_SETTINGS: Readonly<TerminalSettings> = { codexMode: 'native-fullscreen' }
 
 export function parseTerminalSettings(value: unknown): TerminalSettings {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('终端设置格式不正确')

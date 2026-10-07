@@ -7,7 +7,7 @@ import type { AgentManagerApi } from '../../src/shared/manager-api'
 
 beforeEach(() => {
   window.agentManager = {
-    getTerminalSettings: vi.fn(async () => ({ codexMode: 'scrollback' })),
+    getTerminalSettings: vi.fn(async () => ({ codexMode: 'native-fullscreen' })),
     updateTerminalSettings: vi.fn(async settings => settings),
   } as unknown as AgentManagerApi
 })
@@ -17,18 +17,24 @@ describe('terminal settings dialog', () => {
     const close = vi.fn()
     render(<TerminalSettingsDialog onClose={close} />)
     await waitFor(() => expect(screen.getByRole('button', { name: '保存设置' })).toBeEnabled())
-    fireEvent.change(screen.getByLabelText('Codex 显示方式'), { target: { value: 'native-fullscreen' } })
+    expect(screen.getByRole('status')).toHaveTextContent('原生全屏（默认）')
+    expect(screen.getByRole('button', { name: '高级设置' })).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '高级设置' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: '启用兼容模式' }))
+    fireEvent.click(screen.getByRole('button', { name: '高级设置' }))
+    expect(screen.getByRole('status')).toHaveTextContent('当前设置：兼容模式')
     expect(window.agentManager.updateTerminalSettings).not.toHaveBeenCalled()
     expect(screen.getByText(/正在运行的会话保持当前模式/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
     await waitFor(() => expect(close).toHaveBeenCalledOnce())
-    expect(window.agentManager.updateTerminalSettings).toHaveBeenCalledWith({ codexMode: 'native-fullscreen' })
+    expect(window.agentManager.updateTerminalSettings).toHaveBeenCalledWith({ codexMode: 'scrollback' })
   })
   it('does not save on cancel and restores keyboard focus', async () => {
     const trigger = document.createElement('button'); document.body.appendChild(trigger); trigger.focus()
     const close = vi.fn()
     const view = render(<TerminalSettingsDialog onClose={close} />)
-    await waitFor(() => expect(screen.getByRole('combobox')).toBeEnabled())
+    await waitFor(() => expect(screen.getByRole('button', { name: '保存设置' })).toBeEnabled())
     expect(screen.getByRole('dialog')).toHaveFocus()
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Tab', shiftKey: true })
     expect(screen.getByRole('button', { name: '保存设置' })).toHaveFocus()

@@ -26,25 +26,29 @@ app.on('browser-window-created', (_event, win) => {
       const result = await win.webContents.executeJavaScript(`(async()=>{
         const wait=ms=>new Promise(r=>setTimeout(r,ms));
         const until=async test=>{for(let i=0;i<150;i++){if(test())return;await wait(30)}throw Error('UI state timed out')};
-        const button=name=>[...document.querySelectorAll('button')].find(e=>!e.closest('[inert]')&&(e.getAttribute('aria-label')===name||e.textContent.trim()===name));
+        const button=name=>[...document.querySelectorAll('button')].find(e=>!e.closest('[inert]')&&(e.getAttribute('aria-label')===name||e.textContent.trim().replace(/^›/,'').trim()===name));
         const click=name=>{const b=button(name);if(!b||b.disabled)throw Error('Missing '+name);b.click()};
         await until(()=>document.querySelector('.xterm'));const terminal=document.querySelector('.xterm');
         const open=async()=>{click('设置');await until(()=>button('终端显示模式'));click('终端显示模式');await until(()=>button('保存设置')&&!button('保存设置').disabled)};
-        await open();const select=document.querySelector('#codex-terminal-mode');if(select.value!=='scrollback')throw Error('Default changed');
-        Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(select,'native-fullscreen');select.dispatchEvent(new Event('change',{bubbles:true}));await wait(30);
+        await open();const toggle=document.querySelector('#codex-terminal-compatibility');
+        if(toggle.checked||!toggle.closest('[inert]'))throw Error('Compatibility must be off and collapsed by default');
+        if(!document.querySelector('.terminal-mode-summary').textContent.includes('原生全屏（默认）'))throw Error('Incorrect default summary');
+        click('高级设置');await until(()=>!toggle.closest('[inert]'));toggle.click();await wait(30);
         click('保存设置');await until(()=>!document.querySelector('.terminal-settings-dialog'));await open();await wait(180);
-        if(document.querySelector('#codex-terminal-mode').value!=='native-fullscreen')throw Error('Mode not persisted');
+        if(!document.querySelector('#codex-terminal-compatibility').checked)throw Error('Mode not persisted');
+        if(!document.querySelector('.terminal-mode-summary').textContent.includes('兼容模式'))throw Error('Saved compatibility choice hidden');
+        click('高级设置');await wait(180);
         if(!terminal.isConnected||document.querySelector('.xterm')!==terminal)throw Error('Settings remounted terminal');
         const footer=document.querySelector('.terminal-settings-dialog > footer'),dialog=document.querySelector('.terminal-settings-dialog');
         if(footer.getBoundingClientRect().bottom>dialog.getBoundingClientRect().bottom)throw Error('Footer outside dialog');
-        return {ok:true,persisted:true,terminalReused:true};
+        return {ok:true,persisted:true,terminalReused:true,defaultFullscreen:true,compatibilityInAdvanced:true};
       })()`)
       if (!result.ok || replays !== 1 || restarts !== 0) throw Error('Saving settings disturbed running sessions')
       const stored = JSON.parse(readFileSync(join(root, 'terminal-settings.json'), 'utf8'))
-      if (stored.codexMode !== 'native-fullscreen') throw Error('Settings file not persisted')
+      if (stored.codexMode !== 'scrollback') throw Error('Settings file not persisted')
       const snapshot = await win.webContents.executeJavaScript(`(()=>{
         const clone=document.documentElement.cloneNode(true);clone.querySelectorAll('script,link[rel="stylesheet"],meta[http-equiv]').forEach(e=>e.remove());
-        clone.querySelectorAll('option').forEach((e,i)=>{if(document.querySelectorAll('option')[i].selected)e.setAttribute('selected','');else e.removeAttribute('selected')});
+        clone.querySelectorAll('input[type="checkbox"]').forEach((e,i)=>{if(document.querySelectorAll('input[type="checkbox"]')[i].checked)e.setAttribute('checked','');else e.removeAttribute('checked')});
         return {html:clone.outerHTML,css:[...document.styleSheets].map(s=>[...s.cssRules].map(r=>r.cssText).join('\\n')).join('\\n'),width:innerWidth,height:innerHeight};
       })()`)
       const html = join(out, 'terminal-settings.html')
@@ -54,7 +58,7 @@ app.on('browser-window-created', (_event, win) => {
       capturing = false; await surface.loadFile(html)
       await new Promise(resolve => setTimeout(resolve, 200))
       writeFileSync(join(out, 'terminal-settings.png'), (await surface.webContents.capturePage()).toPNG()); surface.destroy()
-      await win.webContents.executeJavaScript(`(async()=>{await window.agentManager.updateTerminalSettings({codexMode:'scrollback'});if((await window.agentManager.getTerminalSettings()).codexMode!=='scrollback')throw Error('Could not restore mode')})()`)
+      await win.webContents.executeJavaScript(`(async()=>{document.querySelector('#codex-terminal-compatibility').click();await new Promise(r=>setTimeout(r,30));document.querySelector('.terminal-settings-dialog button[type="submit"]').click();for(let i=0;i<100;i++){if((await window.agentManager.getTerminalSettings()).codexMode==='native-fullscreen')return;await new Promise(r=>setTimeout(r,30))}throw Error('Could not restore fullscreen')})()`)
       const final = { ...result, realSettingsIPC: true, replayRequests: replays, runningSessionRestarts: restarts }
       writeFileSync(join(out, 'verification.json'), JSON.stringify(final, null, 2)); console.log(JSON.stringify(final)); clearTimeout(timeout); app.exit(0)
     } catch (error) { console.error(error.message); clearTimeout(timeout); app.exit(1) }
