@@ -1,6 +1,7 @@
 import type { HostEvent } from './protocol'
 import type { NetworkRetrySettings } from './network-retry'
 import type { TerminalSettings } from './terminal-settings'
+import type { AppearanceSettings } from './appearance-settings'
 import type { AttentionAudioSettings } from './attention-audio-settings'
 import type { SessionState } from './session-state'
 
@@ -533,6 +534,9 @@ export const IPC_CHANNELS = {
   attentionSoundResult: 'agent-manager:attention-sound-result',
   testAttentionSound: 'agent-manager:test-attention-sound',
   getTerminalSettings: 'agent-manager:get-terminal-settings',
+  getAppearanceSettings: 'agent-manager:get-appearance-settings',
+  updateAppearanceSettings: 'agent-manager:update-appearance-settings',
+  appearanceSettingsChanged: 'agent-manager:appearance-settings-changed',
   updateTerminalSettings: 'agent-manager:update-terminal-settings',
   getAttentionSoundSettings: 'agent-manager:get-attention-sound-settings',
   updateAttentionSoundSettings: 'agent-manager:update-attention-sound-settings',
@@ -615,6 +619,9 @@ export interface AgentManagerApi {
   onAttentionSound(listener: (settings: AttentionAudioSettings) => Promise<void>): () => void
   testAttentionSound(settings?: AttentionAudioSettings): Promise<void>
   getTerminalSettings(): Promise<TerminalSettings>
+  getAppearanceSettings(): Promise<AppearanceSettings>
+  updateAppearanceSettings(settings: AppearanceSettings): Promise<AppearanceSettings>
+  onAppearanceSettingsChanged(listener: (settings: AppearanceSettings) => void): () => void
   updateTerminalSettings(settings: TerminalSettings): Promise<TerminalSettings>
   getAttentionSoundSettings(): Promise<AttentionAudioSettings>
   updateAttentionSoundSettings(settings: AttentionAudioSettings): Promise<AttentionAudioSettings>

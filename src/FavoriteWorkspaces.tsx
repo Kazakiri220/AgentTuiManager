@@ -70,13 +70,13 @@ export default function FavoriteWorkspaces({ workspace, disabled, onSelect }: { 
           aria-pressed={workspaceIdentity(workspace, platform) === workspaceIdentity(item.path, platform)} onClick={() => onSelect(item.path)}><strong>{workspaceLabel(item.path)}</strong><small>{item.path}</small></button>
         <button type='button' className='workspace-keep-button' disabled={disabled} aria-label={`保留工作区 ${item.path}`} onClick={() => keep(item.path)}>保留</button>
       </div>)}</div>}
-      {items.length === 0 && recentOptions.length === 0 && <p className='workspace-shortcuts-empty'>成功启动 Agent 后自动保留最近 5 个工作区，也可手动添加常用项目。</p>}
+      {items.length === 0 && recentOptions.length === 0 && <p className='workspace-shortcuts-empty'>这里显示最近使用的 5 个工作区。常用项目可点击“保留”，或在“管理列表”中添加。</p>}
     <AnimatedCollapse open={managing}>
     <div className='favorite-workspace-manager' onKeyDown={event => { if (event.key === 'Enter' && event.target instanceof HTMLInputElement) { event.preventDefault(); if (!disabled) save() } }}>
       {items.map(item => <div className='favorite-workspace-row' key={item.id}><span title={item.path}><strong>{item.name}</strong><small>{item.path}</small></span><button type='button' disabled={disabled} aria-label={`编辑工作区 ${item.name}`} onClick={() => { setEditingId(item.id); setName(item.name); setPath(item.path); setError('') }}>编辑</button><button type='button' disabled={disabled} aria-label={`移除工作区 ${item.name}`} onClick={() => { if (persist(items.filter(old => old.id !== item.id)) && editingId === item.id) reset() }}>移除</button></div>)}
       <label>工作区名称<input className='launcher-field' maxLength={80} value={name} disabled={disabled} onChange={event => setName(event.target.value)} placeholder='例如：趋势分析' /></label>
       <label>工作区路径<div className='workspace-picker'><input className='launcher-field' value={path} disabled={disabled} onChange={event => setPath(event.target.value)} placeholder='完整目录路径' /><button type='button' disabled={disabled || choosing} onClick={() => { void choose() }}>浏览</button></div></label>
-      <div className='favorite-workspace-actions'><small>移除仅取消保留，近期使用过的目录仍会出现在最近列表。</small>{editingId && <button type='button' onClick={reset}>取消编辑</button>}<button type='button' disabled={disabled || !name.trim() || !path.trim()} onClick={save}>{editingId ? '保存工作区' : '添加工作区'}</button></div>
+      <div className='favorite-workspace-actions'><small>移除不会删除文件夹，最近使用的项目仍可在“最近”列表中找到。</small>{editingId && <button type='button' onClick={reset}>取消编辑</button>}<button type='button' disabled={disabled || !name.trim() || !path.trim()} onClick={save}>{editingId ? '保存工作区' : '添加工作区'}</button></div>
     </div>
     </AnimatedCollapse>
     </div>

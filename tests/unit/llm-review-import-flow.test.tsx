@@ -59,7 +59,7 @@ async function importConnection() {
 async function chooseModel() {
   fireEvent.click(screen.getByRole('button', { name: '获取模型' }))
   await screen.findByRole('option', { name: 'fixture-review-model' })
-  fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'fixture-review-model' } })
+  fireEvent.change(screen.getByLabelText('审核模型'), { target: { value: 'fixture-review-model' } })
 }
 
 describe('CC Switch import through the real encrypted settings store', () => {

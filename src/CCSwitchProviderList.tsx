@@ -25,7 +25,7 @@ export default function CCSwitchProviderList({
   return <div className='ccswitch-provider-section'>
     <div className='launcher-section-title'><h2>{title}</h2><button type='button' className='button-secondary mini-button' disabled={disabled || loading} onClick={onRefresh}>{loading ? '读取中…' : '刷新'}</button></div>
     {error && <p className='launcher-state error'>读取失败：{error}</p>}
-    {!error && !loading && providers.length === 0 && <p className='launcher-state'>没有找到匹配的 Provider</p>}
+    {!error && !loading && providers.length === 0 && <p className='launcher-state'>CC Switch 中没有找到此类 Agent 的配置</p>}
     {!error && !loading && providers.length > 0 && <p className='ccswitch-provider-count'>{providers[0]?.agentKind === 'codex' ? 'Codex' : 'Claude Code'} · 共 {providers.length} 个配置，{providers.filter(provider => !provider.issue).length} 个可导入。滚动查看完整列表。</p>}
     <input className='launcher-field ccswitch-provider-search' type='search' aria-label='搜索 CC Switch 配置' placeholder='搜索名称、地址或模型' disabled={disabled} value={query} onChange={event => setQuery(event.target.value)} />
     {normalized && <p className='ccswitch-provider-count' role='status'>找到 {visible.length} / {providers.length} 个配置{selected && !visible.includes(selected) ? ` · 已选择：${selected.name}` : ''}</p>}

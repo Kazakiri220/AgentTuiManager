@@ -2,6 +2,8 @@ import { type KeyboardEvent as ReactKeyboardEvent, type PointerEvent as ReactPoi
 import type { FreeWindowRect, ResizeEdge } from './free-overview-layout'
 import { APPROVAL_MODE_LABEL, approvalModeOf } from './shared/approval-mode'
 import { Terminal } from '@xterm/xterm'
+import { useAppearanceSettings } from './appearance-settings'
+import { TerminalFontSizer } from './terminal-font-size'
 
 import type { ApprovalRequest, SessionSummary } from './shared/manager-api'
 import { approvalReviewLabel } from './shared/approval-review-label'
@@ -29,8 +31,6 @@ const MIN_TERMINAL_COLS = 24
 const MAX_TERMINAL_COLS = 500
 const MIN_TERMINAL_ROWS = 8
 const MAX_TERMINAL_ROWS = 200
-const MIN_FONT_SIZE = 8
-const MAX_FONT_SIZE = 18
 // `.xterm-viewport` keeps a thin scrollbar gutter; reserve it so the last column
 // is never clipped and the grid still fills the surface.
 const TERMINAL_SCROLLBAR_WIDTH = 9
@@ -117,6 +117,13 @@ interface TerminalTileProps {
 
 export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onBinding, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver, freeLayout }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
+  const { settings: appearance } = useAppearanceSettings()
+  const fontSizeRef = useRef(appearance.terminalFontSize)
+  const uiSizeRef = useRef(appearance.uiSize)
+  const requestFit = useRef<() => void>()
+  fontSizeRef.current = appearance.terminalFontSize
+  uiSizeRef.current = appearance.uiSize
+  useEffect(() => { requestFit.current?.() }, [appearance.terminalFontSize, appearance.uiSize])
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
   const statusRef = useRef(session.status)
@@ -129,13 +136,14 @@ export default function TerminalTile({ session, approval, detail = false, embedd
     if (terminalEnded || deepSeekWeb || !retained) return
     const host = hostRef.current
     if (!host) return
+    const fontSizer = new TerminalFontSizer()
     const terminal = new Terminal({
       cols: STABLE_TERMINAL_COLS,
       rows: STABLE_TERMINAL_ROWS,
       cursorBlink: true,
       convertEol: true,
       fontFamily: 'Cascadia Code, Consolas, monospace',
-      fontSize: 12,
+      fontSize: fontSizeRef.current === 'auto' ? 12 : fontSizeRef.current,
       minimumContrastRatio: 1,
       drawBoldTextInBrightColors: true,
       // Counted in visual rows, not messages. Narrowing the tile re-wraps every long line,
@@ -588,7 +596,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       // agent screen wants, then let the column and row counts take up whatever space
       // is left. Scaling the font alone pinned the grid at 100x30, so any container
       // whose aspect ratio or size did not match that box was left with black margins.
-      const fontSize = clamp(Math.floor(availableWidth / (STABLE_TERMINAL_COLS * .62)), MIN_FONT_SIZE, MAX_FONT_SIZE)
+      const fontSize = fontSizer.measure(availableWidth, uiSizeRef.current, fontSizeRef.current)
       if (terminal.options.fontSize !== fontSize) {
         terminal.options.fontSize = fontSize
         // xterm re-measures its cell box after the font changes, so fit the grid on the
@@ -640,10 +648,12 @@ export default function TerminalTile({ session, approval, detail = false, embedd
         }, 180)
       })
     }
+    requestFit.current = scheduleResize
     scheduleResize()
     const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(() => scheduleResize())
     observer?.observe(host)
     return () => {
+      requestFit.current = undefined
       disposed = true
       pendingTerminalInput = ''
       if (inputFrame) cancelAnimationFrame(inputFrame)

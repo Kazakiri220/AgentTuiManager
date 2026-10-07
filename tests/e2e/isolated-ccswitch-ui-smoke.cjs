@@ -23,7 +23,7 @@ app.on('browser-window-created',(_event,win)=>{
         const click=text=>{const b=[...document.querySelectorAll('button')].find(b=>b.textContent.includes(text));if(!b)throw Error('Missing button '+text);b.click()};
         const wait=()=>new Promise(r=>setTimeout(r,150));
         await wait();click('新建 Agent');await wait();click('独立配置');await wait();
-        document.querySelector('[aria-label="启用独立配置"]').click();await wait();click('只读选择本机 Provider');await wait();
+        document.querySelector('[aria-label="启用独立配置"]').click();await wait();click('选择已保存的服务配置');await wait();
       })()`)
       const result=await win.webContents.executeJavaScript(`(()=>{
         const list=document.querySelector('.ccswitch-provider-list'), buttons=list?.querySelectorAll('button');

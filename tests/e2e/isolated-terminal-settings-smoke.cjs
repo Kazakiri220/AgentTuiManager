@@ -32,7 +32,7 @@ app.on('browser-window-created', (_event, win) => {
         const open=async()=>{click('设置');await until(()=>button('终端显示模式'));click('终端显示模式');await until(()=>button('保存设置')&&!button('保存设置').disabled)};
         await open();const toggle=document.querySelector('#codex-terminal-compatibility');
         if(toggle.checked||!toggle.closest('[inert]'))throw Error('Compatibility must be off and collapsed by default');
-        if(!document.querySelector('.terminal-mode-summary').textContent.includes('原生全屏（默认）'))throw Error('Incorrect default summary');
+        if(!document.querySelector('.terminal-mode-summary').textContent.includes('Codex 原生模式（默认）'))throw Error('Incorrect default summary');
         click('高级设置');await until(()=>!toggle.closest('[inert]'));toggle.click();await wait(30);
         click('保存设置');await until(()=>!document.querySelector('.terminal-settings-dialog'));await open();await wait(180);
         if(!document.querySelector('#codex-terminal-compatibility').checked)throw Error('Mode not persisted');

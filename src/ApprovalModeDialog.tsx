@@ -4,7 +4,7 @@ import { APPROVAL_MODES, APPROVAL_MODE_LABEL, approvalModeOf } from './shared/ap
 import UnattendedControls from './UnattendedControls'
 
 const DESCRIPTION: Record<ApprovalMode, string> = {
-  manual: '所有待审批请求由你决定，内置规则和历史白名单也不会自动批准。',
+  manual: '每个审批请求都由你手动批准或拒绝。',
   'agent-review': '普通请求直接批准；命中高危规则时，交给独立审核器决定批准或拒绝。',
   'rules-auto': '普通请求直接批准；命中高危规则时直接拒绝，不调用模型。',
   unattended: '全部请求自动批准，包括高危操作，并按配置自动续跑和恢复任务。',
@@ -41,7 +41,7 @@ export default function ApprovalModeDialog({ session, onClose, onChanged, onConf
           </label>)}
         </fieldset>
         {selected === 'agent-review' && <div className='full-auto-safe-note'>
-          <p>可选择独立模型 API 或 Codex／Claude 审核会话。审核失败或没有明确批准时，拒绝本次请求并要求 Agent 调整方案，不转人工。</p>
+          <p>先配置审核器，可使用模型 API 或本机 Codex／Claude。审核未获批准时，会拒绝请求并通知 Agent 修改，不会等待你手动审核。</p>
           {onConfigureReviewer && <button type='button' className='button-secondary' onClick={onConfigureReviewer}>配置审核器</button>}
         </div>}
         {selected === 'unattended' && <UnattendedControls session={session} onChanged={onChanged} />}

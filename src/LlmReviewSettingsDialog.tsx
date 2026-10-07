@@ -256,8 +256,8 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     try {
       if (!apiAvailable) throw new Error('LLM 审查需要重启 Manager 后启用')
       if (!poolActive && (settings.backend ?? 'api') === 'api') {
-        const missing = [!settings.baseUrl?.trim() && 'Base URL',
-          (clearApiKey || !apiKey.trim() && !settings.hasApiKey) && 'API Key', !settings.model?.trim() && 'Model'].filter(Boolean)
+        const missing = [!settings.baseUrl?.trim() && '服务地址',
+          (clearApiKey || !apiKey.trim() && !settings.hasApiKey) && 'API Key', !settings.model?.trim() && '审核模型'].filter(Boolean)
         if (missing.length) throw new Error('开始审查前，请填写或选择：' + missing.join('、'))
       }
       await persistSettings()
@@ -354,7 +354,7 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
         {settings.ruleAuditState.status === 'running' && <div className='llm-audit-progress' role='status'><i /><span><strong>新一轮审查正在后台进行</strong><small>当前先展示上一次结果；完成后这里会自动更新。</small></span></div>}
         {settings.ruleAuditState.status === 'failed' && <div className='llm-audit-progress failed' role='alert'><i /><span><strong>最近一次审查失败</strong><small>{settings.ruleAuditState.error ?? '未记录具体错误'}</small></span></div>}
 
-        {!auditResult ? <div className='llm-audit-result-empty'><strong>还没有可查看的审查结果</strong><span>返回设置并启动一次规则集合审查。</span></div> : <>
+        {!auditResult ? <div className='llm-audit-result-empty'><strong>还没有可查看的审查结果</strong><span>返回设置并启动一次规则检查。</span></div> : <>
           <section className='llm-audit-result-summary'>
             <div><span className='eyebrow'>LATEST RESULT</span><strong>{auditResult.summary}</strong></div>
             <dl>
@@ -398,17 +398,17 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
     <form className='rules-dialog llm-review-dialog' role='dialog' aria-modal='true' aria-labelledby='llm-review-title' onMouseDown={resetBackdropClose} onSubmit={(event) => { void save(event) }}>
       <header><div><span className='eyebrow'>SECURITY REVIEW</span><h2 id='llm-review-title'>审核器设置</h2></div><span className={'llm-review-state ' + (settings.enabled ? 'enabled' : '')}><i />{settings.enabled ? '审核器已启用' : '审核器已关闭'}</span></header>
       <div className='llm-review-scroll'>
-      <p className='rules-help'>仅在 Agent 审核模式命中高危规则时调用。按实际影响批准或拒绝；拒绝会反馈给 Agent 修改请求。失败和不确定结论也拒绝，不转人工。</p>
+      <p className='rules-help'>为“Agent 审核”模式配置审核器。命中高危规则的请求交给审核器判断，其余请求直接批准。未获批准的请求会被拒绝，并通知 Agent 修改，不会等待人工处理。</p>
       <fieldset className='llm-settings-fields' disabled={busy || modelsLoading || testing}>
 
-      <label className='launcher-config-toggle'><span><strong>启用审核器</strong><small>不影响普通、规则自动和无监管模式。</small></span><input type='checkbox' role='switch' checked={settings.enabled} onChange={(event) => setSettings((current) => ({ ...current, enabled: event.target.checked }))} /></label>
-      <section className='reviewer-pool' aria-label='审核器池'>
+      <label className='launcher-config-toggle'><span><strong>启用审核器</strong><small>配置并启用后，在 Agent 窗口中切换为“Agent 审核”模式。</small></span><input type='checkbox' role='switch' checked={settings.enabled} onChange={(event) => setSettings((current) => ({ ...current, enabled: event.target.checked }))} /></label>
+      <section className='reviewer-pool' aria-label='审核器列表'>
         <div className='reviewer-pool-toolbar'><strong>按顺序尝试审核服务</strong><button type='button' className='button-secondary' onClick={addReviewer}>添加审核器</button><button type='button' className='button-secondary' onClick={() => setImportOpen(value => !value)}>从 CC Switch 导入</button></div>
-        <p>连接、超时或响应格式错误时尝试下一项。有效拒绝和不确定结论均立即拒绝，不继续尝试。</p>
-        <p>新建和导入的审核器默认停用，配置完成后勾选启用。保存时会检查所有已勾选的审核器。</p>
+        <p>按列表顺序使用已启用的审核器。服务连接失败、超时或返回无法识别的结果时，尝试下一项；审核器明确拒绝或无法确认安全时，拒绝请求。</p>
+        <p>添加或导入后，选择模型、测试连接，再勾选该审核器并保存。</p>
         {poolActive && <ol>{draftPool().map((entry, index) => <li key={entry.id} className={entry.id === selectedId ? 'selected' : ''}>
           <input type='checkbox' aria-label={`启用 ${entry.name}`} checked={entry.enabled} onChange={event => setReviewers(current => current.map(item => item.id === entry.id ? { ...item, enabled: event.target.checked } : item))} />
-          <button type='button' className='reviewer-pool-select' aria-pressed={entry.id === selectedId} onClick={() => selectReviewer(entry.id)}>{index + 1}. {entry.name}<small>{entry.backend === 'api' ? entry.protocol ?? 'openai-chat' : entry.backend}</small></button>
+          <button type='button' className='reviewer-pool-select' aria-pressed={entry.id === selectedId} onClick={() => selectReviewer(entry.id)}>{index + 1}. {entry.name}<small>{entry.backend === 'api' ? '模型 API' : entry.backend === 'codex-cli' ? 'Codex' : 'Claude Code'}</small></button>
           <button type='button' aria-label={`上移 ${entry.name}`} disabled={index === 0} onClick={() => moveReviewer(entry.id, -1)}>↑</button>
           <button type='button' aria-label={`下移 ${entry.name}`} disabled={index === reviewers.length - 1} onClick={() => moveReviewer(entry.id, 1)}>↓</button>
           <button type='button' aria-label={`移除 ${entry.name}`} onClick={() => removeReviewer(entry.id)}>移除</button>
@@ -416,24 +416,24 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
         <AnimatedCollapse open={importOpen}><div className='reviewer-pool-import'>
           <label>CC Switch 类型<select className='launcher-field' value={importKind} onChange={event => setImportKind(event.target.value as 'codex' | 'claude')}><option value='codex'>Codex</option><option value='claude'>Claude</option></select></label>
           <CCSwitchProviderList providers={providers} selectedId={providerId} loading={providersLoading} error={providerError} disabled={busy} onSelect={provider => setProviderId(provider.id)} onRefresh={() => { void refreshProviders() }} />
-          <p>导入所选配置并加密保存密钥，其他未保存的修改会保留。导入项默认停用；请选择模型，再勾选该项并保存设置。</p>
+          <p>导入服务地址和 API Key 后，点击“获取模型”选择审核模型，再启用并保存。</p>
           <button type='button' className='button-secondary' disabled={!providerId || providersLoading} onClick={() => { void importReviewer() }}>导入所选配置</button>
         </div></AnimatedCollapse>
         {poolActive && reviewers.length > 0 && <label>审核器名称<input className='launcher-field' value={reviewers.find(entry => entry.id === selectedId)?.name ?? ''} onChange={event => setReviewers(current => current.map(entry => entry.id === selectedId ? { ...entry, name: event.target.value } : entry))} /></label>}
         {poolActive && !reviewers.length && <p>尚未配置审核服务，请添加审核器或从 CC Switch 导入。</p>}
       </section>
       {(!poolActive || reviewers.length > 0) && <>
-      <label>审核后端<select className='launcher-field' aria-label='审核后端' value={settings.backend ?? 'api'} onChange={event => setSettings(current => ({ ...current, backend: event.target.value as LlmReviewSettingsSummary['backend'] }))}>
+      <label>审核方式<select className='launcher-field' aria-label='审核方式' value={settings.backend ?? 'api'} onChange={event => setSettings(current => ({ ...current, backend: event.target.value as LlmReviewSettingsSummary['backend'] }))}>
         <option value='api'>独立模型 API</option><option value='codex-cli'>Codex 审核 Agent</option><option value='claude-cli'>Claude 审核 Agent</option>
       </select></label>
       {(settings.backend ?? 'api') === 'api' ? <div className='llm-review-fields'>
         <label>API 协议<select className='launcher-field' value={settings.protocol ?? 'openai-chat'} onChange={event => setSettings(current => ({ ...current, protocol: event.target.value as LlmReviewSettingsSummary['protocol'] }))}><option value='openai-chat'>OpenAI Chat Completions</option><option value='openai-responses'>OpenAI Responses</option><option value='anthropic-messages'>Anthropic Messages</option></select></label>
         {settings.protocol === 'anthropic-messages' && <label>Anthropic 身份验证<select className='launcher-field' value={settings.anthropicAuth ?? 'api-key'} onChange={event => setSettings(current => ({ ...current, anthropicAuth: event.target.value as 'api-key' | 'bearer' }))}><option value='api-key'>API Key（x-api-key）</option><option value='bearer'>Bearer Token</option></select></label>}
-        <label>Base URL<input className='launcher-field' value={settings.baseUrl ?? ''} onChange={event => setSettings(current => ({ ...current, baseUrl: event.target.value }))} placeholder='https://api.example.com/v1' /></label>
+        <label>服务地址（Base URL）<input className='launcher-field' value={settings.baseUrl ?? ''} onChange={event => setSettings(current => ({ ...current, baseUrl: event.target.value }))} placeholder='https://api.example.com/v1' /></label>
         <label>API Key<input className='launcher-field' type='password' autoComplete='off' disabled={clearApiKey} value={apiKey} onChange={event => setApiKey(event.target.value)} placeholder={settings.hasApiKey ? '已安全保存，留空保持不变' : '请输入 API Key'} /></label>
         {settings.hasApiKey && !clearApiKey && !apiKey && <p role='status'>API Key 已安全保存，无需重新填写。</p>}
         {settings.hasApiKey && <label className='dingtalk-clear-secret'><input type='checkbox' checked={clearApiKey} onChange={event => setClearApiKey(event.target.checked)} />清除已保存的 API Key</label>}
-        <div className='llm-model-picker'><label>Model{manualModel
+        <div className='llm-model-picker'><label>审核模型{manualModel
           ? <input className='launcher-field' value={settings.model ?? ''} onChange={event => setSettings(current => ({ ...current, model: event.target.value }))} />
           : <select className='launcher-field' value={settings.model ?? ''} onChange={event => setSettings(current => ({ ...current, model: event.target.value }))}>
             <option value=''>获取模型后选择</option>
@@ -445,33 +445,31 @@ export default function LlmReviewSettingsDialog({ onClose, initialView = 'settin
           {modelMessage && <p role='status'>{modelMessage}</p>}
         </div>
       </div> : <div className='llm-review-fields'>
-        <label>CLI 可执行文件<input className='launcher-field' value={settings.cliExecutable ?? ''} onChange={event => setSettings(current => ({ ...current, cliExecutable: event.target.value }))} placeholder='留空自动查找本机 Codex / Claude' /></label>
+        <label>程序路径（可选）<input className='launcher-field' value={settings.cliExecutable ?? ''} onChange={event => setSettings(current => ({ ...current, cliExecutable: event.target.value }))} placeholder='留空自动查找本机 Codex / Claude' /></label>
         <label>审核模型（可选）<input className='launcher-field' value={settings.cliModel ?? ''} onChange={event => setSettings(current => ({ ...current, cliModel: event.target.value }))} placeholder='留空使用 CLI 配置的模型' /></label>
-        <p>使用本机 CLI 的登录或服务商配置。审核 Agent 可只读检查当前项目，不执行待审命令；不兼容的 CLI 版本会报告错误并拒绝本次请求。</p>
+        <p>使用本机 Codex／Claude 的登录和服务商设置。审核时可以查看项目文件，但不会执行正在审核的命令。</p>
       </div>}
       <div className='reviewer-pool-test'><button type='button' className='button-secondary' onClick={() => { void testConnection() }}>{testing ? '测试中…' : '测试连接'}</button>{(settings.backend ?? 'api') !== 'api' && modelMessage && <p role='status'>{modelMessage}</p>}</div>
       </>}
       <label>单次审核超时（秒）<input className='launcher-field' type='number' min={5} max={600} value={settings.timeoutSeconds} onChange={event => setSettings(current => ({ ...current, timeoutSeconds: Number(event.target.value) }))} /></label>
       <label>整体审核时限（秒）<input className='launcher-field' type='number' min={5} max={600} value={settings.overallTimeoutSeconds ?? 120} onChange={event => setSettings(current => ({ ...current, overallTimeoutSeconds: Number(event.target.value) }))} /></label>
       <label>单个 API 审核器失败重试次数<input className='launcher-field' type='number' min={0} max={10} disabled={poolActive && reviewers.filter(entry => entry.enabled).length > 1} value={settings.retryCount} onChange={event => setSettings(current => ({ ...current, retryCount: Number(event.target.value) }))} /></label>
-      <p className='reviewer-deadline-help'>仅有一个启用的 API 审核器时重试服务故障，每次请求使用单次超时；多个启用项直接按顺序切换。所有重试仍受整体时限约束。</p>
-      <p className='reviewer-deadline-help'>整体时限包含并发等待和所有尝试；达到时限即拒绝，尚未尝试的服务不会继续调用。</p>
+      <p className='reviewer-deadline-help'>只启用一个 API 审核器时，服务故障按上述次数重试；启用多个时，改为尝试下一项。</p>
+      <p className='reviewer-deadline-help'>整体时限是一次审批最多允许等待的时间，包含排队和重试。超过时限仍未获批准，就拒绝请求。</p>
 
-      <label className='launcher-config-toggle llm-schedule-toggle'><span><strong>定时审查批准规则集合</strong><small>审查只报告问题，不会自动删除或修改规则。</small></span><input type='checkbox' role='switch' checked={settings.scheduledRuleAuditEnabled} onChange={(event) => setSettings((current) => ({ ...current, scheduledRuleAuditEnabled: event.target.checked }))} /></label>
+      <label className='launcher-config-toggle llm-schedule-toggle'><span><strong>定时检查批准规则</strong><small>审查只报告问题，不会自动删除或修改规则。</small></span><input type='checkbox' role='switch' checked={settings.scheduledRuleAuditEnabled} onChange={(event) => setSettings((current) => ({ ...current, scheduledRuleAuditEnabled: event.target.checked }))} /></label>
       <label className='llm-audit-interval'>审查周期（小时）<input className='launcher-field' type='number' min={1} max={720} disabled={!settings.scheduledRuleAuditEnabled} value={settings.scheduledRuleAuditHours} onChange={(event) => setSettings((current) => ({ ...current, scheduledRuleAuditHours: Number(event.target.value) }))} /></label>
 
-      <label className='launcher-config-toggle'><span><strong>模型 API 使用 HTTP 代理</strong><small>仅用于 LLM 审查请求，默认 127.0.0.1:7897。</small></span><input type='checkbox' role='switch' checked={settings.proxyEnabled} onChange={(event) => setSettings((current) => ({ ...current, proxyEnabled: event.target.checked }))} /></label>
+      <label className='launcher-config-toggle'><span><strong>模型 API 使用 HTTP 代理</strong><small>审核 API 请求通过下方代理连接。</small></span><input type='checkbox' role='switch' checked={settings.proxyEnabled} onChange={(event) => setSettings((current) => ({ ...current, proxyEnabled: event.target.checked }))} /></label>
       <div className={'llm-proxy-fields' + (settings.proxyEnabled ? '' : ' disabled')}><label>主机<input className='launcher-field' disabled={!settings.proxyEnabled} value={settings.proxyHost} onChange={(event) => setSettings((current) => ({ ...current, proxyHost: event.target.value }))} /></label><label>端口<input className='launcher-field' disabled={!settings.proxyEnabled} type='number' min={1} max={65535} value={settings.proxyPort} onChange={(event) => setSettings((current) => ({ ...current, proxyPort: Number(event.target.value) }))} /></label><label>用户名（可选）<input className='launcher-field' disabled={!settings.proxyEnabled} value={settings.proxyUsername ?? ''} onChange={(event) => setSettings((current) => ({ ...current, proxyUsername: event.target.value }))} /></label><label>密码（可选）<input className='launcher-field' disabled={!settings.proxyEnabled || clearProxyPassword} type='password' value={proxyPassword} onChange={(event) => setProxyPassword(event.target.value)} placeholder={settings.hasProxyPassword ? '已安全保存' : ''} /></label></div>
       {settings.hasProxyPassword && <label className='dingtalk-clear-secret'><input type='checkbox' checked={clearProxyPassword} onChange={(event) => setClearProxyPassword(event.target.checked)} />清除已保存的代理密码</label>}
 
-      <section className='llm-rule-audit-panel'><div><strong>批准规则集合审查</strong><span>{settings.ruleAuditState.status === 'running' ? `后台运行中${settings.ruleAuditState.startedAt ? ' · ' + auditTime(settings.ruleAuditState.startedAt) : ''}` : auditResult ? `${auditTime(auditResult.reviewedAt)} · ${auditResult.findings.length} 项问题` : '尚未审查'}</span></div><div className='llm-rule-audit-actions'><button type='button' className='button-secondary' disabled={busy || settings.ruleAuditState.status === 'running'} onClick={() => { void runAudit() }}>{settings.ruleAuditState.status === 'running' ? '后台审查中…' : '保存并立即审查'}</button><button type='button' className='button-secondary' disabled={!auditResult && settings.ruleAuditState.status === 'idle'} onClick={() => { void openResults() }}>查看审查结果</button></div>
-        {settings.ruleAuditState.status === 'running' && <div className='llm-audit-progress' role='status'><i /><span><strong>审查正在后台进行</strong><small>可以关闭此抽屉；重新打开后仍会显示进度和最终结果。</small></span></div>}
+      <section className='llm-rule-audit-panel'><div><strong>批准规则检查</strong><span>{settings.ruleAuditState.status === 'running' ? `后台运行中${settings.ruleAuditState.startedAt ? ' · ' + auditTime(settings.ruleAuditState.startedAt) : ''}` : auditResult ? `${auditTime(auditResult.reviewedAt)} · ${auditResult.findings.length} 项问题` : '尚未审查'}</span></div><div className='llm-rule-audit-actions'><button type='button' className='button-secondary' disabled={busy || settings.ruleAuditState.status === 'running'} onClick={() => { void runAudit() }}>{settings.ruleAuditState.status === 'running' ? '后台审查中…' : '保存并立即审查'}</button><button type='button' className='button-secondary' disabled={!auditResult && settings.ruleAuditState.status === 'idle'} onClick={() => { void openResults() }}>查看审查结果</button></div>
+        {settings.ruleAuditState.status === 'running' && <div className='llm-audit-progress' role='status'><i /><span><strong>审查正在后台进行</strong><small>可以关闭设置，稍后从“查看审查结果”查看。</small></span></div>}
         {settings.ruleAuditState.status === 'failed' && <div className='llm-audit-progress failed' role='alert'><i /><span><strong>最近一次审查失败</strong><small>{settings.ruleAuditState.error ?? '未记录具体错误'}</small></span></div>}
         {auditResult && <p>{auditResult.summary}</p>}
       </section>
 
-      <div className='launcher-config-security'><strong>高危请求的处理</strong><span>Agent 审核模式允许审核器作出批准或拒绝；规则自动模式直接拒绝。普通请求不会调用审核器。</span></div>
-      <div className='launcher-config-security'><strong>凭据保护</strong><span>API Key 和代理密码使用 Electron 安全存储加密，不返回页面、不写入审计。</span></div>
       </fieldset>
       </div>
       <div className='llm-review-save-status' aria-live='polite'>

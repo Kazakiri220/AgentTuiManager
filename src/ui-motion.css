@@ -13,7 +13,7 @@
 .animated-collapse[data-open='false'] { pointer-events: none; }
 .collapse-chevron { display: inline-block; transition: transform var(--motion-expand, 160ms) var(--motion-ease); }
 [aria-expanded='true'] > .collapse-chevron { transform: rotate(90deg); }
-.animated-details-trigger { display: flex; align-items: center; gap: 6px; width: 100%; min-height: 34px; padding: 10px 2px 4px; border: 0; background: transparent; color: inherit; text-align: left; font-size: 10px; font-weight: 800; }
+.animated-details-trigger { display: flex; align-items: center; gap: 0.375rem; width: 100%; min-height: 2.125rem; padding: 0.625rem 0.125rem 0.25rem; border: 0; background: transparent; color: inherit; text-align: left; font-size: var(--ui-font-note); font-weight: 800; }
 .collapsible-panel { transition: width var(--motion-expand, 160ms) var(--motion-ease); }
 .panel-surface { overflow: hidden; opacity: 1; transition: width var(--motion-expand, 160ms) var(--motion-ease), opacity var(--motion-exit, 100ms) ease-out, box-shadow var(--motion-enter, 120ms) ease-out, visibility 0s; }
 .panel-hidden:not(.panel-expanded) .panel-surface { opacity: 0; transition-delay: 0s, 0s, 0s, var(--motion-exit, 100ms); }

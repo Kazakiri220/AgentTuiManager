@@ -33,7 +33,7 @@ export default function AttentionSoundSettingsDialog({ onClose }: { onClose: () 
     setBusy(true); setError(''); setStatus('')
     try {
       await window.agentManager.testAttentionSound(settings)
-      setStatus(settings.volume === 0 ? '当前音量为 0%，试听已静音。' : '已发送试听；若没有听到，请检查应用音量和输出设备。')
+      setStatus(settings.volume === 0 ? '当前音量为 0%，试听已静音。' : '若未听到声音，请检查系统中的应用音量和输出设备。')
     } catch (reason) { setError(readableError(reason)) }
     finally { setBusy(false) }
   }
@@ -41,7 +41,7 @@ export default function AttentionSoundSettingsDialog({ onClose }: { onClose: () 
   return <div className='modal-backdrop' role='presentation' onDoubleClick={event => { if (event.target === event.currentTarget) onClose() }}>
     <form className='rules-dialog attention-sound-dialog' role='dialog' aria-modal='true' aria-labelledby='attention-sound-title' onSubmit={event => { void save(event) }}>
       <header><div><span className='eyebrow'>ATTENTION SOUND</span><h2 id='attention-sound-title'>提示音设置</h2></div><button type='button' className='icon-button' onClick={onClose} aria-label='关闭提示音设置'>×</button></header>
-      <p className='rules-help'>未在查看的 Agent 需要处理时播放提示音。试听立即使用下方选择；保存后应用于后续提醒。</p>
+      <p className='rules-help'>Agent 提问、完成任务或等待你审批时播放提示音；仅当 Manager 位于前台且你正在查看该 Agent 时不响。自动处理的审批不提醒。</p>
       <fieldset disabled={loading || busy || !loaded}>
         <label htmlFor='attention-sound-kind'>声音类型</label>
         <select id='attention-sound-kind' value={settings.sound} onChange={event => { setSettings({ ...settings, sound: event.target.value as AttentionSoundKind }); setStatus('') }}>
@@ -49,7 +49,7 @@ export default function AttentionSoundSettingsDialog({ onClose }: { onClose: () 
         </select>
         <label htmlFor='attention-sound-volume'>音量 <output htmlFor='attention-sound-volume'>{settings.volume}%</output></label>
         <input id='attention-sound-volume' type='range' min={0} max={100} step={1} value={settings.volume} aria-valuetext={`${settings.volume}%${settings.volume === 0 ? '，静音' : ''}`} onChange={event => { setSettings({ ...settings, volume: Number(event.target.value) }); setStatus('') }} />
-        <p className='field-note'>0% 为静音；100% 与原版提示音音量一致。实际响度还受系统音量和输出设备影响。</p>
+        <p className='field-note'>0% 为静音。可先试听，保存后用于后续提醒。响度也受系统音量影响。</p>
         <div className='attention-sound-actions'><button type='button' className='button-secondary' onClick={() => { void preview() }}>试听</button><button type='button' className='button-secondary' onClick={() => { setSettings({ ...DEFAULT_ATTENTION_AUDIO_SETTINGS }); setStatus('已恢复默认选项，保存后生效。') }}>恢复默认</button></div>
       </fieldset>
       {loading && <p role='status'>正在读取设置…</p>}

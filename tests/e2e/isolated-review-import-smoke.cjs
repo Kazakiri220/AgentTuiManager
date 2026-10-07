@@ -64,8 +64,8 @@ app.on('browser-window-created', (_event, win) => {
           await until(()=>checkbox('启用 Fixture '+kind));
           if(field('API Key').value)throw Error('Imported key reached renderer');
           if(!document.body.textContent.includes('API Key 已安全保存'))throw Error('Missing saved key indicator');
-          click('获取模型'); await until(()=>[...field('Model').options].some(option=>option.value==='fixture-model'));
-          select(field('Model'),'fixture-model'); await wait();
+          click('获取模型'); await until(()=>[...field('审核模型').options].some(option=>option.value==='fixture-model'));
+          select(field('审核模型'),'fixture-model'); await wait();
           click('测试连接'); await until(()=>document.body.textContent.includes('连接正常 · fixture-model'));
           checkbox('启用 Fixture '+kind).click(); await wait();
         }

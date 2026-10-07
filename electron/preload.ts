@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 import { preventExternalFileDrop } from '../src/shared/prevent-file-drop'
+import { parseAppearanceSettings } from '../src/shared/appearance-settings'
 import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings } from '../src/shared/attention-audio-settings'
 
 import { IPC_CHANNELS, type AgentManagerApi, type ManagerEvent, type StartSessionRequest } from '../src/shared/manager-api'
@@ -8,6 +9,13 @@ const api: AgentManagerApi = {
   setActiveSession: (sessionId) => ipcRenderer.invoke(IPC_CHANNELS.setActiveSession, sessionId),
   testAttentionSound: (settings) => ipcRenderer.invoke(IPC_CHANNELS.testAttentionSound, settings),
   getTerminalSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getTerminalSettings),
+  getAppearanceSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAppearanceSettings),
+  updateAppearanceSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAppearanceSettings, settings),
+  onAppearanceSettingsChanged: (listener) => {
+    const handle = (_event: unknown, value: unknown): void => { listener(parseAppearanceSettings(value)) }
+    ipcRenderer.on(IPC_CHANNELS.appearanceSettingsChanged, handle)
+    return () => { ipcRenderer.removeListener(IPC_CHANNELS.appearanceSettingsChanged, handle) }
+  },
   updateTerminalSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateTerminalSettings, settings),
   getAttentionSoundSettings: () => ipcRenderer.invoke(IPC_CHANNELS.getAttentionSoundSettings),
   updateAttentionSoundSettings: (settings) => ipcRenderer.invoke(IPC_CHANNELS.updateAttentionSoundSettings, settings),

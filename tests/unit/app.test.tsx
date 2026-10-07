@@ -73,6 +73,9 @@ describe('App terminal wall', () => {
       testAttentionSound: vi.fn(async () => undefined),
       getTerminalSettings: vi.fn(async () => ({ codexMode: 'scrollback' as const })),
       updateTerminalSettings: vi.fn(async settings => settings),
+      getAppearanceSettings: vi.fn(async () => ({ uiSize: 'standard' as const, terminalFontSize: 'auto' as const })),
+      updateAppearanceSettings: vi.fn(async settings => settings),
+      onAppearanceSettingsChanged: vi.fn(() => () => undefined),
       getAttentionSoundSettings: vi.fn(async () => ({ sound: 'classic' as const, volume: 100 })),
       updateAttentionSoundSettings: vi.fn(async settings => settings),
       platform: 'win32',
@@ -578,7 +581,7 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     expect(screen.getByLabelText('编辑独立配置')).toBeChecked()
     expect(screen.getByLabelText('API Key')).toHaveAttribute('placeholder', '已安全保存，留空保持不变')
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'model-new' } })
+    fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'model-new' } })
     fireEvent.click(screen.getByRole('button', { name: '保存修改' }))
     await waitFor(() => expect(api.updateSessionConfig).toHaveBeenCalledWith('session-1', {
       enabled: true,
@@ -706,9 +709,9 @@ describe('App terminal wall', () => {
     await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://gateway.example/v1' } })
+    fireEvent.change(screen.getByLabelText('服务地址（Base URL）'), { target: { value: 'https://gateway.example/v1' } })
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'secret-value' } })
-    fireEvent.change(screen.getByLabelText('Model'), { target: { value: 'model-x' } })
+    fireEvent.change(screen.getByLabelText('模型'), { target: { value: 'model-x' } })
     fireEvent.change(screen.getByLabelText('启动参数（每行一个）'), { target: { value: '--reasoning\nhigh' } })
     fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
     await waitFor(() => expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({
@@ -966,8 +969,8 @@ describe('App terminal wall', () => {
     await screen.findByText('Codex API 重构')
     clickNavigationMenuItem('设置', '关键词续跑')
     expect(await screen.findByRole('heading', { name: '关键词续跑' })).toBeInTheDocument()
-    expect(screen.getByRole('switch', { name: '启用关键词 Continue' })).not.toBeChecked()
-    fireEvent.click(screen.getByRole('switch', { name: '启用关键词 Continue' }))
+    expect(screen.getByRole('switch', { name: '启用关键词续跑' })).not.toBeChecked()
+    fireEvent.click(screen.getByRole('switch', { name: '启用关键词续跑' }))
     fireEvent.change(screen.getByLabelText('Continue 关键词列表'), { target: { value: 'model busy\nconnection lost' } })
     expect(screen.queryByLabelText('Continue 静默等待秒数')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '保存设置' }))
@@ -992,7 +995,7 @@ describe('App terminal wall', () => {
     await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 选择已保存的服务配置/ }))
     expect(await screen.findByText('Team Gateway')).toBeInTheDocument()
     expect(document.body.textContent).not.toContain('secret-value')
     fireEvent.click(screen.getByRole('button', { name: '启动 Agent' }))
@@ -1012,7 +1015,7 @@ describe('App terminal wall', () => {
     fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'deepseek' } })
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 选择已保存的服务配置/ }))
     expect(await screen.findByText(/CCSwitch 当前仅支持 Codex 和 Claude Code/)).toBeInTheDocument()
     expect(api.listCCSwitchProviders).not.toHaveBeenCalled()
   })
@@ -1024,7 +1027,7 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', {name:/新建 Agent/}))
     fireEvent.click(screen.getByRole('button', {name:'独立配置'}))
     fireEvent.click(screen.getByRole('switch', {name:'启用独立配置'}))
-    fireEvent.click(screen.getByRole('button', {name:/CCSwitch 只读选择本机 Provider/}))
+    fireEvent.click(screen.getByRole('button', {name:/CCSwitch 选择已保存的服务配置/}))
     await screen.findByText(/共 26 个配置，26 个可导入/)
     const list=screen.getByLabelText('CC Switch 配置列表')
     expect(within(list).getAllByRole('button')).toHaveLength(26)
@@ -1046,7 +1049,7 @@ describe('App terminal wall', () => {
     await waitFor(() => expect(screen.getByLabelText('工作区')).toHaveValue('B:\\chosen\\workspace'))
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 选择已保存的服务配置/ }))
     expect(await screen.findByText('Team Gateway')).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('流式断线重连次数（0–100）'), { target: { value: '100' } })
     fireEvent.change(screen.getByLabelText('HTTP 请求重试次数（0–100）'), { target: { value: '100' } })
@@ -1104,7 +1107,7 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: /新建 Agent/ }))
     fireEvent.click(screen.getByRole('button', { name: '独立配置' }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 只读选择本机 Provider/ }))
+    fireEvent.click(screen.getByRole('button', { name: /CCSwitch 选择已保存的服务配置/ }))
     fireEvent.change(screen.getByLabelText('Agent 类型'), { target: { value: 'claude' } })
     expect(await screen.findByText('Claude Gateway')).toBeInTheDocument()
     await act(async () => { finishCodex([{ id: 'codex-provider', name: 'Old Codex Gateway', agentKind: 'codex',
@@ -1890,11 +1893,11 @@ describe('App terminal wall', () => {
     fireEvent.click(screen.getByRole('button', { name: '＋ 新建 Agent' }))
     fireEvent.click(screen.getByRole('button', { name: /独立配置/ }))
     fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
-    fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://models.example/v1' } })
+    fireEvent.change(screen.getByLabelText('服务地址（Base URL）'), { target: { value: 'https://models.example/v1' } })
     fireEvent.click(screen.getByRole('button', { name: '获取模型列表' }))
     await screen.findByRole('option', { name: 'upstream-model' })
     fireEvent.change(screen.getByRole('combobox', { name: '选择模型' }), { target: { value: 'upstream-model' } })
-    expect(screen.getByLabelText('Model')).toHaveValue('upstream-model')
+    expect(screen.getByLabelText('模型')).toHaveValue('upstream-model')
   })
 
   it('renders large audit histories in pages of fifty rows', async () => {

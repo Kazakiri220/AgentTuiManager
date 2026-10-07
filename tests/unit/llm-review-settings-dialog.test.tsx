@@ -37,7 +37,7 @@ describe('reviewer pool settings form', () => {
     fireEvent.change(screen.getByLabelText('审核器名称'), { target: { value: 'Edited Alpha' } })
     fireEvent.change(screen.getByLabelText('API Key'), { target: { value: 'fictional-draft-secret' } })
     fireEvent.click(screen.getByRole('button', { name: /2\. Beta/ }))
-    expect(screen.getByLabelText('审核后端')).toHaveValue('claude-cli')
+    expect(screen.getByLabelText('审核方式')).toHaveValue('claude-cli')
     fireEvent.change(screen.getByLabelText('审核模型（可选）'), { target: { value: 'updated-cli-model' } })
     fireEvent.click(screen.getByRole('checkbox', { name: '启用 Beta' }))
     fireEvent.click(screen.getByRole('button', { name: '上移 Beta' }))
@@ -103,18 +103,18 @@ describe('reviewer pool settings form', () => {
 afterEach(cleanup)
 async function open(){render(<LlmReviewSettingsDialog onClose={()=>{}} />);await waitFor(()=>expect(screen.getByRole('button',{name:'保存设置'})).toBeEnabled())}
 async function fill(){
-  fireEvent.change(screen.getByLabelText('Base URL'),{target:{value:'https://fixture.example/v1'}})
+  fireEvent.change(screen.getByLabelText('服务地址（Base URL）'),{target:{value:'https://fixture.example/v1'}})
   fireEvent.change(screen.getByLabelText('API Key'),{target:{value:'fixture-key'}})
   fireEvent.click(screen.getByRole('button',{name:'获取模型'}))
   await screen.findByRole('option',{name:'review-a'})
-  fireEvent.change(screen.getByLabelText('Model'),{target:{value:'review-a'}})
+  fireEvent.change(screen.getByLabelText('审核模型'),{target:{value:'review-a'}})
 }
 describe('reviewer settings form',()=>{
   it('fetches and selects a model from the current draft without saving first',async()=>{
     await open();await fill()
     expect(api.listLlmReviewModels).toHaveBeenCalledWith(expect.objectContaining({baseUrl:'https://fixture.example/v1',apiKey:'fixture-key',model:undefined}))
     expect(api.updateLlmReviewSettings).not.toHaveBeenCalled()
-    expect(screen.getByLabelText('Model')).toHaveValue('review-a')
+    expect(screen.getByLabelText('审核模型')).toHaveValue('review-a')
   })
   it('saves the filled form before auditing instead of using the old empty configuration',async()=>{
     await open();await fill()
@@ -149,18 +149,18 @@ describe('reviewer settings form',()=>{
     await open();fireEvent.click(screen.getByRole('button',{name:'获取模型'}))
     await screen.findByText(/服务不支持模型列表/)
     fireEvent.click(screen.getByRole('button',{name:'手动输入模型'}))
-    fireEvent.change(screen.getByLabelText('Model'),{target:{value:'custom-reviewer'}})
-    expect(screen.getByLabelText('Model')).toHaveValue('custom-reviewer')
+    fireEvent.change(screen.getByLabelText('审核模型'),{target:{value:'custom-reviewer'}})
+    expect(screen.getByLabelText('审核模型')).toHaveValue('custom-reviewer')
     expect(api.updateLlmReviewSettings).not.toHaveBeenCalled()
   })
   it('shows which required fields are missing before attempting an audit',async()=>{
     await open();fireEvent.click(screen.getByRole('button',{name:'保存并立即审查'}))
-    await screen.findByText('开始审查前，请填写或选择：Base URL、API Key、Model')
+    await screen.findByText('开始审查前，请填写或选择：服务地址、API Key、审核模型')
     expect(api.reviewApprovalRules).not.toHaveBeenCalled()
     expect(api.updateLlmReviewSettings).not.toHaveBeenCalled()
   })
   it('can save and audit CLI settings without API credentials',async()=>{
-    await open();fireEvent.change(screen.getByLabelText('审核后端'),{target:{value:'codex-cli'}})
+    await open();fireEvent.change(screen.getByLabelText('审核方式'),{target:{value:'codex-cli'}})
     fireEvent.click(screen.getByRole('button',{name:'保存并立即审查'}))
     await waitFor(()=>expect(api.reviewApprovalRules).toHaveBeenCalledOnce())
     expect(api.updateLlmReviewSettings).toHaveBeenCalledWith(expect.objectContaining({backend:'codex-cli'}))

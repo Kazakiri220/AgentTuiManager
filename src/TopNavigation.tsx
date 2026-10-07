@@ -2,8 +2,10 @@ import { type KeyboardEvent, type ReactNode, useEffect, useId, useLayoutEffect, 
 import MotionPresence from './MotionPresence'
 import { usePreference } from './ui-preferences'
 import './top-navigation.css'
+import { useAppearanceSettings } from './appearance-settings'
+import { UI_SIZES } from './shared/appearance-settings'
 
-export type NavigationAction = 'overview' | 'attention' | 'audit' | 'tokens' | 'attention-sound' | 'terminal-settings' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review'
+export type NavigationAction = 'overview' | 'attention' | 'audit' | 'tokens' | 'attention-sound' | 'terminal-settings' | 'appearance' | 'approval-rules' | 'continue-keywords' | 'session-safety' | 'dingtalk' | 'llm-review'
 type NavigationView = 'overview' | 'attention' | 'audit' | 'tokens'
 type MenuName = 'statistics' | 'settings' | 'shortcuts'
 type ShortcutSlot = { id: string; action: NavigationAction; visible: boolean }
@@ -12,6 +14,7 @@ export const TOP_NAVIGATION_SHORTCUTS_KEY = 'agent-tui-manager:top-navigation-sh
 export const NAVIGATION_ACTIONS: ReadonlyArray<{ action: NavigationAction; label: string }> = [
   { action: 'overview', label: 'Agent 总览' }, { action: 'attention', label: '处理中心' },
   { action: 'audit', label: '审计' }, { action: 'tokens', label: 'Token 用量' },
+  { action: 'appearance', label: '界面与文字' },
   { action: 'terminal-settings', label: '终端显示模式' },
   { action: 'attention-sound', label: '提示音设置' }, { action: 'approval-rules', label: '安全规则' },
   { action: 'continue-keywords', label: '关键词续跑' }, { action: 'session-safety', label: '会话安全' },
@@ -37,6 +40,7 @@ function NavigationIcon({ action }: { action: NavigationAction | MenuName | 'con
     audit: 'M5 4h14v17H5zM8 9h8M8 13h8M8 17h5',
     tokens: 'M5 4h14M5 20h14M18 4l-8 8 8 8',
     settings: 'M9 3h6l1 3 3 1 2 5-2 5-3 1-1 3H9l-1-3-3-1-2-5 2-5 3-1zM15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0',
+    appearance: 'M3 4h18v13H3zM8 21h8M12 17v4M7 13l3-6 3 6M8 11h4M16 8v5',
     'terminal-settings': 'M3 4h18v16H3zM6 8l4 4-4 4M12 16h6',
     'attention-sound': 'M11 4v13M11 6l8-2v11M11 17a3 3 0 1 1-3-3 3 3 0 0 1 3 3M19 15a3 3 0 1 1-3-3 3 3 0 0 1 3 3',
     'approval-rules': 'M12 3l8 3v6c0 5-8 9-8 9S4 17 4 12V6zM8 12l3 3 5-6',
@@ -112,7 +116,9 @@ export default function TopNavigation({ view, pendingCount, onNavigate, onMenuOp
   const [shortcuts, setShortcuts] = usePreference(TOP_NAVIGATION_SHORTCUTS_KEY, DEFAULT_SHORTCUTS, isShortcuts)
   const [openMenu, setOpenMenu] = useState<MenuName | null>(null)
   const [configurationOpen, setConfigurationOpen] = useState(false)
-  const [compact, setCompact] = useState(() => window.matchMedia?.('(max-width: 1080px)').matches ?? window.innerWidth <= 1080)
+  const { settings: appearance } = useAppearanceSettings()
+  const compactWidth = 1080 * UI_SIZES[appearance.uiSize]
+  const [compact, setCompact] = useState(() => window.matchMedia?.(`(max-width: ${compactWidth}px)`).matches ?? window.innerWidth <= compactWidth)
   const settingsTrigger = useRef<HTMLButtonElement>(null)
   const dialog = useRef<HTMLDivElement>(null)
   const overlayCallback = useRef(onMenuOpenChange)
@@ -123,15 +129,16 @@ export default function TopNavigation({ view, pendingCount, onNavigate, onMenuOp
   useEffect(() => { overlayCallback.current?.(overlayOpen) }, [overlayOpen])
   useEffect(() => () => overlayCallback.current?.(false), [])
   useEffect(() => {
-    const media = window.matchMedia?.('(max-width: 1080px)')
+    const media = window.matchMedia?.(`(max-width: ${compactWidth}px)`)
     const resize = (): void => {
-      setCompact(media?.matches ?? window.innerWidth <= 1080)
+      setCompact(media?.matches ?? window.innerWidth <= compactWidth)
       setOpenMenu((current) => current === 'shortcuts' ? null : current)
     }
+    resize()
     media?.addEventListener?.('change', resize)
     window.addEventListener('resize', resize)
     return () => { media?.removeEventListener?.('change', resize); window.removeEventListener('resize', resize) }
-  }, [])
+  }, [compactWidth])
   useLayoutEffect(() => {
     if (configurationOpen) dialog.current?.querySelector<HTMLButtonElement>('button')?.focus()
   }, [configurationOpen])

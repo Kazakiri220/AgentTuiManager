@@ -5,6 +5,7 @@ import { AttentionSound } from './attention-sound'
 import { isAttentionSessionActive } from './attention-focus'
 import { AttentionAudioDelivery } from './attention-audio-delivery'
 import { TerminalSettingsStore } from './terminal-settings-store'
+import { AppearanceSettingsStore } from './appearance-settings-store'
 import { AttentionAudioSettingsStore } from './attention-audio-settings-store'
 import { NativeAttentionAudio } from './native-attention-audio'
 import { DEFAULT_ATTENTION_AUDIO_SETTINGS, parseAttentionAudioSettings, type AttentionAudioSettings } from '../src/shared/attention-audio-settings'
@@ -102,6 +103,7 @@ const attentionAudioDelivery = new AttentionAudioDelivery({
 })
 function playAttentionChime(preview?: AttentionAudioSettings): void { attentionAudioDelivery.play(preview) }
 let terminalSettingsStore: TerminalSettingsStore
+let appearanceSettingsStore: AppearanceSettingsStore
 let attentionAudioSettingsStore: AttentionAudioSettingsStore
 let auditStore: ActivityAuditStore
 let tokenUsageStore: TokenUsageStore
@@ -832,6 +834,16 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.getTerminalSettings, event => {
     trustedRenderer(event)
     return terminalSettingsStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.getAppearanceSettings, event => {
+    trustedRenderer(event)
+    return appearanceSettingsStore.getSettings()
+  })
+  ipcMain.handle(IPC_CHANNELS.updateAppearanceSettings, async (event, value: unknown) => {
+    trustedRenderer(event)
+    const settings = await appearanceSettingsStore.update(value)
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(IPC_CHANNELS.appearanceSettingsChanged, settings)
+    return settings
   })
   ipcMain.handle(IPC_CHANNELS.updateTerminalSettings, async (event, value: unknown) => {
     trustedRenderer(event)
@@ -1686,6 +1698,7 @@ void app.whenReady().then(async () => {
   sessionSafetyStore = await SessionSafetyStore.load(join(app.getPath('userData'), 'session-safety.json'))
   sessionCatalog = await ManagedSessionCatalog.load(join(app.getPath('userData'), 'managed-sessions.json'))
   terminalSettingsStore = await TerminalSettingsStore.load(join(app.getPath('userData'), 'terminal-settings.json'))
+  appearanceSettingsStore = await AppearanceSettingsStore.load(join(app.getPath('userData'), 'appearance-settings.json'))
   attentionAudioSettingsStore = await AttentionAudioSettingsStore.load(join(app.getPath('userData'), 'attention-sound-settings.json'))
   dingTalkSettingsStore = await DingTalkSettingsStore.load(join(app.getPath('userData'), 'dingtalk-settings.json'), safeStorage)
   llmReviewSettingsStore = await LlmReviewSettingsStore.load(join(app.getPath('userData'), 'llm-review-settings.json'), safeStorage)
