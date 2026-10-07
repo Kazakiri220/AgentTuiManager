@@ -1,4 +1,6 @@
 import { randomUUID } from 'node:crypto'
+import { freshSessionArgs } from './session-continuation'
+import { normalizeWorkspace } from './native-session-discovery'
 import { SessionMessageDelivery } from './session-message-delivery'
 import { TerminalInputState } from './terminal-input-state'
 import { terminalReplayText } from './terminal-state-replay'
@@ -112,6 +114,12 @@ interface RecentClaudeHookApproval extends ClaudeHookIdentity {
 }
 
 interface ManagedSession {
+  startupAttempt?: number
+  startupStillRequested?: () => boolean
+  bindingChangeBusy?: boolean
+  bindingAwaitingUser?: boolean
+  bindingVersion?: number
+  unusedFreshSession?: boolean
   summary: SessionSummary
   request?: StartSessionRequest
   handle: HostHandle
@@ -185,7 +193,7 @@ interface ManagedSession {
   }
 }
 
-interface ApprovalDeliveryContext { generation: number; handle: HostHandle; modeVersion: number | undefined }
+interface ApprovalDeliveryContext { generation: number; handle: HostHandle; modeVersion: number | undefined; bindingVersion: number | undefined }
 
 type Emit = (event: ManagerEvent) => void
 
@@ -270,6 +278,47 @@ export class SessionController {
   private approvalPolicyVersion = 0
   private readonly approvalReviews = new Map<string, { abort: AbortController }>()
   private readonly approvalActions = new Map<string, Promise<void>>()
+  private readonly restartingSessions = new Set<string>()
+  private readonly nativeSessionReservations = new Map<string, { owner: string; count: number }>()
+
+  private nativeSessionIdentity(request: StartSessionRequest | undefined, summary?: SessionSummary): string | undefined {
+    const explicit = summary?.nativeSessionId ?? request?.nativeSessionId
+    if (explicit) return explicit
+    const args = request?.recovery?.args
+    if (!args) return undefined
+    if (request.agentKind === 'codex') {
+      const index = args.indexOf('resume')
+      const id = index < 0 ? undefined : args[index + 1]
+      return id && !id.startsWith('-') ? id : undefined
+    }
+    if (request.agentKind === 'claude') {
+      const equals = args.find(arg => arg.startsWith('--resume='))?.slice('--resume='.length)
+      if (equals) return equals
+      const index = args.findIndex(arg => arg === '--resume' || arg === '-r')
+      const id = index < 0 ? undefined : args[index + 1]
+      return id && !id.startsWith('-') ? id : undefined
+    }
+    return undefined
+  }
+
+  private reserveNativeSession(kind: AgentKind, nativeSessionId: string | undefined, owner: string): () => void {
+    if (!nativeSessionId || (kind !== 'codex' && kind !== 'claude')) return () => undefined
+    const key = JSON.stringify([kind, nativeSessionId])
+    const pending = this.nativeSessionReservations.get(key)
+    if (pending && pending.owner !== owner || this.nativeCaptureReservations.has(nativeSessionId)
+      || [...this.sessions.values()].some(other => other.summary.sessionId !== owner
+      && other.summary.agentKind === kind && this.nativeSessionIdentity(other.request, other.summary) === nativeSessionId
+      && (!isTerminalStatus(other.summary.status) || other.hostTransitioning))) {
+      throw new Error('该会话正在另一个窗口中运行或启动，请先停止该窗口')
+    }
+    const reservation = pending ?? { owner, count: 0 }
+    reservation.count += 1
+    this.nativeSessionReservations.set(key, reservation)
+    return () => {
+      reservation.count -= 1
+      if (reservation.count === 0 && this.nativeSessionReservations.get(key) === reservation) this.nativeSessionReservations.delete(key)
+    }
+  }
 
   private approvalMode(managed: ManagedSession): ApprovalMode {
     return approvalModeOf(managed.summary, this.llmReview?.getSettings().enabled)
@@ -373,12 +422,13 @@ export class SessionController {
   }
 
   private approvalDeliveryContext(managed: ManagedSession): ApprovalDeliveryContext {
-    return { generation: managed.generation, handle: managed.handle, modeVersion: this.approvalModeVersions.get(managed.summary.sessionId) }
+    return { generation: managed.generation, handle: managed.handle, modeVersion: this.approvalModeVersions.get(managed.summary.sessionId), bindingVersion: managed.bindingVersion }
   }
 
   private sameApprovalDelivery(managed: ManagedSession, delivery: ApprovalDeliveryContext): boolean {
     return this.sessions.get(managed.summary.sessionId) === managed
       && managed.generation === delivery.generation && managed.handle === delivery.handle
+      && managed.bindingVersion === delivery.bindingVersion
   }
 
   private async stopAfterApprovalDeliveryFailure(managed: ManagedSession, request: ApprovalRequest, delivery: ApprovalDeliveryContext,
@@ -607,6 +657,68 @@ export class SessionController {
     } catch { /* Invalid/unavailable metadata never changes activity or approval. */ }
   }
 
+  private clearBindingAutomation(managed: ManagedSession, resetKeywordCount = true): void {
+    this.cancelSessionReviews(managed)
+    this.messageDelivery.interrupt(managed.summary.sessionId)
+    this.unattended.cancelApprovalEnter(managed.summary.sessionId)
+    this.cancelHookApprovalContinue(managed)
+    this.cancelKeywordContinue(managed)
+    this.cancelPendingContinueSubmit(managed)
+    this.cancelTransientRetry(managed)
+    this.cancelClaudeTerminalApproval(managed)
+    this.cancelCodexTerminalApproval(managed)
+    this.cancelPendingTerminalAutoApproval(managed)
+    managed.approvalRequests.length = 0
+    this.clearClaudeHookState(managed)
+    this.syncApprovalSummary(managed)
+    delete managed.lastTerminalAutoApproval
+    managed.continueKeywordTail = ''
+    delete managed.continueKeywordNativeText
+    managed.continueKeywordAttempted.clear()
+    if (resetKeywordCount) {
+      managed.continueKeywordCount = 0
+      managed.continueKeywordLimitLogged = false
+    }
+  }
+
+  private syncHookSessionBinding(managed: ManagedSession, event: Extract<HostEvent, { type: 'permission-request' }>): void {
+    const kind = managed.summary.agentKind
+    const nativeSessionId = event.nativeSessionId
+    // This only trusts the authenticated parent Hook's bounded UUID and cwd.
+    // It does not authorize reading transcriptPath; that requires validation above.
+    if ((kind !== 'codex' && kind !== 'claude') || event.hookSource !== kind
+      || event.agentId || event.agentType || !nativeSessionId || !event.cwd
+      || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(nativeSessionId)
+      || normalizeWorkspace(event.cwd) !== normalizeWorkspace(managed.summary.workspace)
+      || nativeSessionId === managed.summary.nativeSessionId || !managed.request
+      || this.nativeCaptureReservations.has(nativeSessionId)
+      || this.nativeSessionReservations.has(JSON.stringify([kind, nativeSessionId]))
+        && this.nativeSessionReservations.get(JSON.stringify([kind, nativeSessionId]))?.owner !== managed.summary.sessionId
+      || [...this.sessions.values()].some(other => other !== managed && other.summary.agentKind === kind
+        && this.nativeSessionIdentity(other.request, other.summary) === nativeSessionId
+        && (!isTerminalStatus(other.summary.status) || other.hostTransitioning))) return
+    try {
+      const base = managed.adapter.recoveryRecipe(managed.request.executable, nativeSessionId)
+      if (!base) return
+      const args = freshSessionArgs(kind, managed.request.args)
+      const recovery = { ...base, args: [...args, ...base.args.filter(arg => arg !== '--no-alt-screen' || !args.includes(arg))] }
+      if (managed.summary.nativeSessionId || managed.request.recovery) {
+        managed.bindingVersion = (managed.bindingVersion ?? 0) + 1
+        this.clearBindingAutomation(managed)
+        this.unattended.disable(managed.summary.sessionId, '原生会话已切换，无监管已关闭')
+      }
+      if (managed.nativeCapture?.timer) clearTimeout(managed.nativeCapture.timer)
+      delete managed.nativeCapture
+      delete managed.nativeActivityBinding
+      managed.nativeActivityBindingAttempt = (managed.nativeActivityBindingAttempt ?? 0) + 1
+      managed.request = { ...managed.request, args, nativeSessionId, recovery }
+      managed.summary = { ...managed.summary, nativeSessionId }
+      managed.unusedFreshSession = false
+      this.changed(managed.summary.sessionId)
+      void this.manager.updateMetadata(managed.handle.hostId, { nativeSessionId, recovery }).catch(() => undefined)
+    } catch { /* Invalid launch metadata must not interrupt the current approval. */ }
+  }
+
   listPendingApprovals(): ApprovalRequest[] {
     return [...this.sessions.values()]
       .flatMap(({ approvalRequests }) => approvalRequests.map((request) => this.copyApprovalRequest(request)))
@@ -662,7 +774,7 @@ export class SessionController {
     if (event.timestamp < (managed.summary.activityUpdatedAt ?? 0)) return
     // Current native task evidence proves the CLI is ready even when its
     // welcome/prompt screen was not recognized by the terminal adapter.
-    if (event.activity !== 'starting') managed.agentReady = true
+    if (event.activity !== 'starting') this.finishStartup(managed)
     this.setActivity(managed, event.activity, event.timestamp, event.error)
     if (event.assistantMessage || event.error) {
       managed.continueKeywordNativeText = (event.assistantMessage?.text ?? event.error ?? '').slice(-4096)
@@ -677,6 +789,7 @@ export class SessionController {
   }
 
   private setActivity(managed: ManagedSession, activity: NonNullable<SessionSummary['activity']>, timestamp = Date.now(), error?: string): void {
+    if (activity === 'running' || activity === 'completed') managed.unusedFreshSession = false
     const changed = managed.summary.activity !== activity || managed.summary.activityError !== error
     managed.summary = { ...managed.summary, activity, activityUpdatedAt: timestamp, activityError: error }
     if (changed) this.changed(managed.summary.sessionId)
@@ -694,7 +807,7 @@ export class SessionController {
     }
     const submitted = input.observe(data, Date.now())
     managed.activityInputPending = input.pending
-    if (submitted) this.setActivity(managed, 'running')
+    if (submitted) { managed.bindingAwaitingUser = false; this.setActivity(managed, 'running') }
   }
 
   continuationSource(sessionId: string): { summary: SessionSummary; request: StartSessionRequest } {
@@ -704,15 +817,25 @@ export class SessionController {
   }
 
   async startSession(request: StartSessionRequest, initialPrompt?: string): Promise<SessionSummary> {
+    const sessionId = randomUUID()
+    const release = this.reserveNativeSession(request.agentKind, this.nativeSessionIdentity(request), sessionId)
+    try { return await this.startManagedSession(request, initialPrompt, sessionId) }
+    finally { release() }
+  }
+
+  private async startManagedSession(request: StartSessionRequest, initialPrompt: string | undefined, sessionId: string): Promise<SessionSummary> {
     const adapter = createAgentAdapter(request.agentKind)
     const nativeCapture = !request.nativeSessionId && adapter.supportsNativeSessions
       ? await this.prepareNativeCapture(request.agentKind, request.workspace)
       : undefined
-    const sessionId = randomUUID()
     // The host can consume an initial prompt before start() finishes connecting.
     const activitySince = Date.now()
     const handle = await this.manager.start({ ...this.hostOptions(request, sessionId), ...(initialPrompt ? { initialPrompt } : {}) })
     const managed: ManagedSession = {
+      startupAttempt: request.nativeSessionId ? 1 : undefined,
+      // 仅为确定未开始对话的新窗口开放原配置重启；未知历史记录保持保守。
+      unusedFreshSession: !request.nativeSessionId && !request.recovery && !initialPrompt
+        && request.args.every(arg => request.agentKind === 'codex' && arg === '--no-alt-screen'),
       summary: {
         sessionId,
         displayName: request.displayName,
@@ -870,6 +993,7 @@ export class SessionController {
           }
       const handle = this.detachedHandle(entry.hostId)
       this.sessions.set(entry.sessionId, {
+        unusedFreshSession: entry.unusedFreshSession === true,
         summary,
         ...(entry.request ? { request: entry.request } : {}),
         handle,
@@ -1187,7 +1311,13 @@ export class SessionController {
     this.cancelSessionReviews(managed)
     this.unattended.disable(sessionId, '已手动停止 Agent，无监管已关闭')
     this.messageDelivery.interrupt(sessionId)
-    if (isTerminalStatus(managed.summary.status)) return
+    managed.startupAttempt = undefined
+    managed.summary = { ...managed.summary, startupRecoveryRequired: false }
+    this.cancelHookApprovalContinue(managed)
+    this.cancelClaudeTerminalApproval(managed)
+    this.cancelCodexTerminalApproval(managed)
+    this.cancelPendingTerminalAutoApproval(managed)
+    if (isTerminalStatus(managed.summary.status)) { this.changed(sessionId); return }
     managed.recoveryToken += 1
     this.cancelTransientRetry(managed)
     this.cancelPendingContinueSubmit(managed)
@@ -1320,27 +1450,103 @@ export class SessionController {
     return this.catalog?.flush() ?? Promise.resolve()
   }
 
+  async replaceSessionBinding(sessionId: string, nativeSessionId: string | null): Promise<void> {
+    const managed = this.required(sessionId)
+    if (managed.bindingChangeBusy || managed.hostTransitioning || this.restartingSessions.has(sessionId)) throw new Error('正在切换会话，请稍后再试')
+    if (!isTerminalStatus(managed.summary.status) && managed.summary.status !== 'needs_attention') throw new Error('请先停止 Agent，再切换会话')
+    const request = managed.request
+    if (!request || !['codex', 'claude'].includes(managed.summary.agentKind)) throw new Error('此 Agent 不支持切换原生会话')
+    const args = freshSessionArgs(managed.summary.agentKind, request.args)
+    const baseRecovery = nativeSessionId ? managed.adapter.recoveryRecipe(request.executable, nativeSessionId) : undefined
+    const recovery = baseRecovery ? { ...baseRecovery, args: [...args, ...baseRecovery.args.filter(arg => arg !== '--no-alt-screen' || !args.includes(arg))] } : undefined
+    if (nativeSessionId && !recovery) throw new Error('无法构建会话恢复参数')
+    const release = this.reserveNativeSession(managed.summary.agentKind, nativeSessionId ?? undefined, sessionId)
+    managed.bindingChangeBusy = true
+    try {
+      this.clearBindingAutomation(managed)
+      let transitionStopVersion = managed.stopRequestVersion
+      if (managed.summary.status === 'needs_attention') {
+        const stopping = this.stopSession(sessionId)
+        transitionStopVersion = managed.stopRequestVersion
+        await stopping
+        if (managed.stopRequestVersion !== transitionStopVersion) return
+      }
+      await this.setApprovalMode(sessionId, 'manual')
+      managed.startupAttempt = undefined
+      // 先移除已结束 Host 的恢复元数据，避免 Manager 重启重新读回旧 ID。
+      await this.releaseHostBeforeRestart(managed.handle.hostId)
+      await this.manager.removeArtifacts(managed.handle.hostId)
+      // A later Stop wins even if releasing the old Host was slow.
+      if (managed.stopRequestVersion !== transitionStopVersion) return
+      if (managed.nativeCapture?.timer) clearTimeout(managed.nativeCapture.timer)
+      delete managed.nativeCapture
+      managed.generation += 1
+      const { nativeSessionId: _oldId, recovery: _oldRecovery, ...baseRequest } = request
+      managed.request = { ...baseRequest, args, ...(nativeSessionId ? { nativeSessionId, recovery } : {}) }
+      const { nativeSessionId: _summaryId, ...summary } = managed.summary
+      managed.summary = { ...summary, approvalMode: 'manual', fullAutoEnabled: false, ...(nativeSessionId ? { nativeSessionId } : {}) }
+      managed.unusedFreshSession = !nativeSessionId
+      managed.bindingAwaitingUser = true
+      managed.continueKeywordTail = ''
+      delete managed.continueKeywordNativeText
+      this.changed(sessionId)
+      await this.flushCatalog()
+      if (managed.stopRequestVersion !== transitionStopVersion) return
+      await this.restartManagedSession(sessionId)
+    } finally { managed.bindingChangeBusy = false; release() }
+  }
+
   async restartSession(sessionId: string, stillRequested?: () => boolean): Promise<void> {
+    const managed = this.required(sessionId)
+    if (this.restartingSessions.has(sessionId) || managed.bindingChangeBusy) throw new Error('正在启动或切换 Agent，请稍后再试')
+    const release = this.reserveNativeSession(managed.summary.agentKind, this.nativeSessionIdentity(managed.request, managed.summary), sessionId)
+    this.restartingSessions.add(sessionId)
+    try { await this.restartManagedSession(sessionId, stillRequested) }
+    finally { this.restartingSessions.delete(sessionId); release() }
+  }
+
+  private async restartManagedSession(sessionId: string, stillRequested?: () => boolean, startupRetry = false): Promise<void> {
     if (stillRequested && !stillRequested()) return
     this.unattended.cancelApprovalEnter(sessionId)
     this.messageDelivery.interrupt(sessionId)
     const managed = this.required(sessionId)
 
     if (!isTerminalStatus(managed.summary.status)) throw new Error('Agent 仍在运行，无需重新启动')
-    const request = managed.request
-    if (!request) throw new Error('缺少该 Agent 的启动信息，无法重新启动')
+    if (managed.hostTransitioning) throw new Error('正在启动 Agent，请稍后再试')
+    if (!managed.request) throw new Error('缺少该 Agent 的启动信息，无法重新启动')
+    const stopVersionBeforeCapture = managed.stopRequestVersion
     if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && managed.nativeCapture) {
       await this.tryCaptureNativeSession(managed)
+    }
+    if (managed.stopRequestVersion !== stopVersionBeforeCapture || stillRequested && !stillRequested()) return
+    const request = managed.request
+    if (!startupRetry) {
+      managed.startupAttempt = managed.summary.nativeSessionId || request.recovery ? 1 : undefined
+      managed.startupStillRequested = stillRequested
+      managed.summary = { ...managed.summary, startupFailureCount: 0, startupRecoveryRequired: false }
     }
     // A persisted recovery recipe is already a valid native-session binding.
     // The summary can lag behind it after a host exit or an app restart; do not
     // force the user through "new Agent -> restore" again in that case.
-    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && !request.recovery) {
-      throw new Error('该窗口尚未绑定原生会话，已阻止启动新 Agent。请在“新增 Agent”中选择对应历史会话进行恢复。')
+    if (!managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && !request.recovery && !managed.unusedFreshSession) {
+      throw new Error('该窗口尚未绑定原生会话，无法确认已有历史。请先选择历史会话，或明确选择新会话。')
     }
 
     const oldHostId = managed.handle.hostId
-    const recipe = request.recovery
+    const freshCapture = !managed.summary.nativeSessionId && !request.recovery && managed.adapter.supportsNativeSessions
+      ? await this.prepareNativeCapture(managed.summary.agentKind, managed.summary.workspace)
+      : undefined
+    if (managed.stopRequestVersion !== stopVersionBeforeCapture || stillRequested && !stillRequested()) return
+    const nativeRecipe = !request.recovery && managed.summary.nativeSessionId
+      ? managed.adapter.recoveryRecipe(request.executable, managed.summary.nativeSessionId)
+      : undefined
+    const recipe = request.recovery ?? (nativeRecipe ? {
+      ...nativeRecipe,
+      args: [...freshSessionArgs(managed.summary.agentKind, request.args), ...nativeRecipe.args.filter(arg => arg !== '--no-alt-screen')],
+    } : undefined)
+    if (managed.summary.nativeSessionId && managed.adapter.supportsNativeSessions && !recipe) {
+      throw new Error('无法构建原生会话恢复参数，请重新选择历史会话')
+    }
     const scrollableRecipe = recipe ? { ...recipe, args: terminalScrollbackArgs(managed.summary.agentKind, recipe.args) } : undefined
     const options: StartHostOptions = scrollableRecipe ? {
       displayName: managed.summary.displayName,
@@ -1357,14 +1563,18 @@ export class SessionController {
       ...(managed.summary.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
       recovery: scrollableRecipe,
     } : this.hostOptions(request)
-    if (managed.summary.fullAutoEnabled) options.fullAutoEnabled = true
     options.approvalMode = this.approvalMode(managed)
+    if (options.approvalMode === 'agent-review' || options.approvalMode === 'rules-auto') options.fullAutoEnabled = true
+    else delete options.fullAutoEnabled
+
+    // Capture may have discovered an identity after the public restart began.
+    const releaseNative = this.reserveNativeSession(managed.summary.agentKind, this.nativeSessionIdentity(request, managed.summary), sessionId)
 
     managed.recoveryToken += 1
-    this.cancelTransientRetry(managed)
-    this.cancelPendingContinueSubmit(managed)
-    this.cancelKeywordContinue(managed)
+    this.clearBindingAutomation(managed, false)
     managed.generation += 1
+    const generation = managed.generation
+    const stopRequestVersion = managed.stopRequestVersion
     managed.hostTransitioning = true
     managed.pendingHostInput = ''
     managed.handle.disconnect()
@@ -1378,6 +1588,7 @@ export class SessionController {
     delete managed.lastTerminalAutoApproval
     if (managed.nativeCapture?.timer) clearTimeout(managed.nativeCapture.timer)
     delete managed.nativeCapture
+    if (freshCapture) managed.nativeCapture = freshCapture
     const {
       lastError: _lastError,
       pendingApprovalCommand: _pending,
@@ -1413,8 +1624,26 @@ export class SessionController {
     try {
       await this.releaseHostBeforeRestart(oldHostId)
       if (stillRequested && !stillRequested()) throw new Error('审批模式已切换，已取消无监管的自动重启')
+      if (managed.generation !== generation || managed.stopRequestVersion !== stopRequestVersion) {
+        managed.hostTransitioning = false
+        managed.pendingHostInput = ''
+        return
+      }
       options.sessionId = sessionId
       const handle = await this.manager.start(options)
+      if (this.sessions.get(sessionId) !== managed || managed.generation !== generation
+        || managed.stopRequestVersion !== stopRequestVersion || stillRequested && !stillRequested()) {
+        await handle.stop().catch(() => undefined)
+        handle.disconnect()
+        await this.manager.removeArtifacts(handle.hostId).catch(() => undefined)
+        managed.hostTransitioning = false
+        managed.pendingHostInput = ''
+        if (managed.generation === generation && !managed.summary.userStopRequested) {
+          managed.summary = { ...managed.summary, status: 'stopped' }
+          this.changed(sessionId)
+        }
+        return
+      }
       managed.handle = handle
       managed.hostTransitioning = false
       managed.terminalReplay.clear()
@@ -1424,7 +1653,13 @@ export class SessionController {
       await this.manager.removeArtifacts(oldHostId).catch(() => undefined)
       this.changed(sessionId)
       void this.pump(managed, managed.generation)
+      this.scheduleNativeCapture(managed)
     } catch (error) {
+      if (managed.generation !== generation || managed.stopRequestVersion !== stopRequestVersion) {
+        managed.hostTransitioning = false
+        managed.pendingHostInput = ''
+        return
+      }
       managed.hostTransitioning = false
       managed.pendingHostInput = ''
       managed.summary = {
@@ -1433,7 +1668,47 @@ export class SessionController {
         lastError: error instanceof Error ? error.message : String(error),
       }
       this.changed(sessionId)
+      if (await this.retryFailedStartup(managed, managed.summary.lastError ?? '启动失败', stillRequested)) return
       throw error
+    } finally { releaseNative() }
+  }
+
+  /** 仅重试尚未就绪的历史会话；绝不把运行中途的异常当成启动失败。 */
+  private async retryFailedStartup(managed: ManagedSession, reason: string, stillRequested = managed.startupStillRequested): Promise<boolean> {
+    const release = this.reserveNativeSession(managed.summary.agentKind, this.nativeSessionIdentity(managed.request, managed.summary), managed.summary.sessionId)
+    try { return await this.retryReservedStartup(managed, reason, stillRequested) }
+    finally { release() }
+  }
+
+  private async retryReservedStartup(managed: ManagedSession, reason: string, stillRequested?: () => boolean): Promise<boolean> {
+    if (!managed.startupAttempt || managed.agentReady || managed.pendingUserInterrupt || managed.summary.userStopRequested) return false
+    if (stillRequested && !stillRequested()) {
+      managed.startupAttempt = undefined
+      managed.summary = { ...managed.summary, status: 'failed', lastError: reason }
+      this.changed(managed.summary.sessionId)
+      return false
+    }
+    const attempt = managed.startupAttempt
+    managed.summary = { ...managed.summary, status: 'failed', lastError: reason,
+      startupFailureCount: attempt, startupRecoveryRequired: attempt >= 3 }
+    this.changed(managed.summary.sessionId)
+    if (attempt >= 3) { managed.startupAttempt = undefined; return false }
+    const generation = managed.generation
+    await new Promise(resolve => setTimeout(resolve, 500))
+    if (this.sessions.get(managed.summary.sessionId) !== managed || managed.generation !== generation || managed.startupAttempt !== attempt || managed.summary.userStopRequested
+      || stillRequested && !stillRequested()) return true
+    managed.startupAttempt = attempt + 1
+    await this.restartManagedSession(managed.summary.sessionId, stillRequested, true)
+    return true
+  }
+
+  private finishStartup(managed: ManagedSession): void {
+    managed.agentReady = true
+    managed.startupAttempt = undefined
+    managed.startupStillRequested = undefined
+    if (managed.summary.startupFailureCount || managed.summary.startupRecoveryRequired) {
+      managed.summary = { ...managed.summary, startupFailureCount: 0, startupRecoveryRequired: false }
+      this.changed(managed.summary.sessionId)
     }
   }
 
@@ -1523,13 +1798,13 @@ export class SessionController {
           this.changed(managed.summary.sessionId)
         }
         if (observation.ready && managed.summary.activity === 'starting') {
-          // A welcome/prompt repaint proves readiness, not task inactivity. Keep
-          // it behind native events already written while the host was starting.
+          // Readiness is provisional; buffered native activity can still supersede it.
           this.setActivity(managed, 'idle', managed.summary.activitySince ?? 0)
         }
-        if (observation.ready || observation.approvalRequired) managed.agentReady = true
+        if (observation.ready || observation.approvalRequired) this.finishStartup(managed)
         this.observeContinueKeyword(managed, event.data, observation)
         if (observation.approvalRequired) {
+          managed.unusedFreshSession = false
           this.cancelTransientRetry(managed, true)
           this.cancelPendingContinueSubmit(managed)
         }
@@ -1570,10 +1845,11 @@ export class SessionController {
         }
         this.scheduleNativeCapture(managed)
       } else if (event.type === 'permission-request') {
-        // Keep the live transcript binding separate from stable resume identity.
-        // Filesystem validation cannot delay or change the approval decision.
+        // Authenticated parent-hook metadata can synchronize a manual /resume.
+        // Transcript validation stays separate and never delays an approval.
+        this.syncHookSessionBinding(managed, event)
         void this.bindHookNativeActivity(managed, event)
-        managed.agentReady = true
+        this.finishStartup(managed)
         this.setActivity(managed, 'running')
         this.cancelClaudeTerminalApproval(managed)
         this.cancelCodexTerminalApproval(managed)
@@ -1666,6 +1942,10 @@ export class SessionController {
     this.clearClaudeHookState(managed)
     this.syncApprovalSummary(managed)
     managed.handle.disconnect()
+    if (exitCode !== 0 && !managed.agentReady && managed.startupAttempt && !managed.pendingUserInterrupt && !managed.summary.userStopRequested) {
+      try { await this.retryFailedStartup(managed, `Process exited with code ${exitCode}`) } catch { /* 失败详情已发布到窗口 */ }
+      return
+    }
     if (managed.summary.userStopRequested) {
       managed.summary = reduceSession(managed.summary, {
         type: 'process-exited', exitCode, userInitiated: true, adapterCompletion: false,
@@ -1699,6 +1979,10 @@ export class SessionController {
 
   private async failOrRecover(managed: ManagedSession, generation: number, reason: string): Promise<void> {
     if (managed.generation !== generation) return
+    if (!managed.agentReady && managed.startupAttempt && !managed.pendingUserInterrupt && !managed.summary.userStopRequested) {
+      try { await this.retryFailedStartup(managed, reason) } catch { /* 启动失败已发布，等待用户选择 */ }
+      return
+    }
     if (this.unattended.enabled(managed.summary.sessionId) || !managed.request?.recovery) {
       managed.summary = reduceSession(managed.summary, {
         type: 'process-exited', exitCode: 1, userInitiated: false, adapterCompletion: false,
@@ -1737,7 +2021,8 @@ export class SessionController {
         maxContinueRetries: managed.request?.maxContinueRetries,
         ...(managed.summary.agentConfig ? { agentConfig: { ...managed.summary.agentConfig, extraArgs: [...managed.summary.agentConfig.extraArgs] } } : {}),
         ...(managed.summary.agentProxy?.enabled ? { agentProxy: { ...managed.summary.agentProxy } } : {}),
-        ...(managed.summary.fullAutoEnabled ? { fullAutoEnabled: true } : {}),
+        approvalMode: this.approvalMode(managed),
+        ...(['agent-review', 'rules-auto'].includes(this.approvalMode(managed)) ? { fullAutoEnabled: true } : {}),
         ...(managed.summary.nativeSessionId ? { nativeSessionId: managed.summary.nativeSessionId } : {}),
         recovery: scrollableRecipe,
       })
@@ -1967,6 +2252,7 @@ export class SessionController {
     // Keep text and Enter in one PTY write. Splitting them could leave a visible
     // but unsubmitted "continue" when state changed during the old 75 ms gap.
     managed.handle.write(`${input}\r`)
+    this.observeActivityInput(managed, `${input}\r`)
   }
 
   private readonly hookApprovalContinues = new Map<string, ReturnType<typeof setTimeout>>()
@@ -1979,6 +2265,7 @@ export class SessionController {
   }
 
   private scheduleHookApprovalContinue(managed: ManagedSession): void {
+    if (managed.bindingAwaitingUser) return
     if (this.unattended.enabled(managed.summary.sessionId)) return
     this.cancelHookApprovalContinue(managed)
     const generation = managed.generation
@@ -2024,6 +2311,7 @@ export class SessionController {
   }
 
   private observeContinueKeyword(managed: ManagedSession, data: string, observation: AgentObservation, fromActivity = false): void {
+    if (managed.bindingAwaitingUser) return
     if (this.unattended.enabled(managed.summary.sessionId)) return
     if (!fromActivity && managed.continueKeywordNativeText !== undefined) return
     const policy = this.continueKeywordPolicy
@@ -2197,6 +2485,8 @@ export class SessionController {
         .filter((id): id is string => Boolean(id)))
       const candidates = sessions.filter((session) => !capture.baselineIds.has(session.id)
         && !claimed.has(session.id) && !this.nativeCaptureReservations.has(session.id)
+        && (!this.nativeSessionReservations.has(JSON.stringify([managed.summary.agentKind, session.id]))
+          || this.nativeSessionReservations.get(JSON.stringify([managed.summary.agentKind, session.id]))?.owner === managed.summary.sessionId)
         && session.updatedAt >= capture.startedAt - 5_000
         && session.updatedAt <= (finalCapture ? Date.now() + 5_000 : capture.startedAt + 5 * 60_000))
         .sort((left, right) => Math.abs(left.updatedAt - capture.startedAt) - Math.abs(right.updatedAt - capture.startedAt)
@@ -2976,6 +3266,7 @@ export class SessionController {
       void this.catalog.upsert({
         sessionId,
         hostId: managed.handle.hostId,
+        unusedFreshSession: managed.unusedFreshSession === true,
         summary: this.catalogSummary(managed.summary),
         ...(managed.request ? { request: this.catalogRequest(managed.request) } : {}),
         ...(managed.nativeCapture ? {

@@ -824,3 +824,9 @@ button:disabled { cursor: default; opacity: .55; }
 .approval-mode-options small { line-height: 1.5; opacity: .8; }
 .approval-mode-dialog { max-height: 90vh; overflow-y: auto; }
 .terminal-card-active { border-color: var(--green); box-shadow: inset 0 0 0 1px var(--green); }
+
+.provider-model-field { display: grid; align-content: start; gap: 7px; min-width: 0; }
+.provider-model-field .launcher-field { width: 100%; min-width: 0; }
+.provider-model-field > button { justify-self: start; }
+.session-binding-actions { display: flex; flex-shrink: 0; flex-wrap: wrap; gap: 7px; padding: 7px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.recovery-choice-actions { flex-wrap: wrap; gap: 8px; }

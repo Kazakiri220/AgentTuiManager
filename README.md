@@ -9,7 +9,7 @@
 
 Windows / macOS · MIT Open Source
 
-当前代码版本：**0.4.12-local.9**（本地四模式、提示音、自由布局及顶部导航修改版）。上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
+当前代码版本：**0.4.13-local.1**（已整合上游会话恢复与模型获取功能，保留本地四模式、提示音、自由布局及顶部导航）。合并范围及验证见 [上游整合记录](UPSTREAM_INTEGRATION.md)；上游发行版见 [Releases](https://github.com/MulaLee4851/AgentTuiManager/releases)。
 
 界面开发请遵循 [统一动效规范](UI_MOTION_STANDARD.md)；本批升级验收见 [导航与工作区验证记录](NAVIGATION_WORKSPACE_VERIFICATION.md)。
 
@@ -452,7 +452,7 @@ claude --resume <session-id>
 - 外部终端**拖入**仍为 Beta，默认关闭；**拖出**可用
 - 代理目前支持 **HTTP**；HTTPS / SOCKS5 配置尚未开放
 - Pi 新建入口暂不可用；DeepSeek Harness 使用官方 Web，不是与 Claude Code / Codex 同等粒度的终端集成
-- 各平台产物以对应 Release 的附件为准；0.4.11 已构建 Windows x64 安装包，macOS 需要在对应平台另行构建
+- 各平台产物以对应 Release 的附件为准；本地整合版的构建与验证状态见 [上游整合记录](UPSTREAM_INTEGRATION.md)，macOS 需要在对应平台另行构建
 
 ---
 

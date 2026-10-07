@@ -10,6 +10,16 @@ import type { HostCommand, HostEvent, HostExitFact } from '../src/shared/protoco
 import type { ApprovalMode, AgentConfigSummary, AgentKind, AgentProxySummary, RecoveryRecipe } from '../src/shared/manager-api'
 
 const DEFAULT_TIMEOUT_MS = 5_000
+const DEFAULT_STARTUP_TIMEOUT_MS = 30_000
+
+export interface HostStartupProgress {
+  hostId: string
+  sessionId?: string
+  phase: 'spawn' | 'connect' | 'configure' | 'ready' | 'persist' | 'complete'
+  elapsedMs: number
+  phaseElapsedMs: number
+  failed?: boolean
+}
 
 export interface HostRecord {
   hostId: string
@@ -87,6 +97,8 @@ export interface SessionHostManagerOptions {
   hostEntry: string
   nodeExecutable?: string
   timeoutMs?: number
+  startupTimeoutMs?: number
+  onStartupProgress?: (progress: HostStartupProgress) => void
   leaseMs?: number
   preserveOnLeaseExpiry?: boolean
   resolveAgentConfig?: (profileId: string, agentKind: AgentKind, args: string[]) => Promise<{ environment: Record<string, string>; args: string[] }>
@@ -347,6 +359,9 @@ class PipeHostHandle implements HostHandle {
 }
 
 export class SessionHostManager {
+  private readonly metadataWrites = new Map<string, Promise<void>>()
+  private readonly startupTimeoutMs: number
+  private readonly onStartupProgress?: SessionHostManagerOptions['onStartupProgress']
   private readonly runtimeDir: string
   private readonly socketDir: string
   private readonly hostEntry: string
@@ -364,6 +379,8 @@ export class SessionHostManager {
     this.hostEntry = options.hostEntry
     this.nodeExecutable = options.nodeExecutable ?? process.execPath
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS
+    this.startupTimeoutMs = options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS
+    this.onStartupProgress = options.onStartupProgress
     this.leaseMs = Math.max(5_000, Math.min(60_000, options.leaseMs ?? 15_000))
     this.preserveOnLeaseExpiry = options.preserveOnLeaseExpiry !== false
     this.resolveAgentConfig = options.resolveAgentConfig
@@ -406,6 +423,15 @@ export class SessionHostManager {
 
     let child: ReturnType<typeof spawn> | undefined
     let handle: PipeHostHandle | undefined
+    const startedAt = Date.now()
+    let phaseStartedAt = startedAt
+    let phase: HostStartupProgress['phase'] = 'spawn'
+    const report = (next: HostStartupProgress['phase'], failed = false): void => {
+      const now = Date.now()
+      try { this.onStartupProgress?.({ hostId, sessionId: options.sessionId, phase, elapsedMs: now - startedAt, phaseElapsedMs: now - phaseStartedAt, ...(failed ? { failed: true } : {}) }) } catch { /* 审计失败不能影响启动。 */ }
+      phase = next
+      phaseStartedAt = now
+    }
 
     try {
       child = spawn(this.nodeExecutable, [this.hostEntry, '--host-id', hostId, '--endpoint', endpoint, '--exit-path', exitPath], {
@@ -430,7 +456,9 @@ export class SessionHostManager {
       if (child.pid === undefined) throw await childFailure
       await this.writeRecord({ ...pendingRecord, pid: child.pid, updatedAt: new Date().toISOString() })
       child.unref()
-      handle = await raceChild(this.connect(hostId, endpoint))
+      report('connect')
+      handle = await raceChild(this.connect(hostId, endpoint, this.startupTimeoutMs))
+      report('configure')
       handle.claim()
       const configured = options.agentConfig?.enabled && options.agentConfig.profileId
         ? await this.resolveAgentConfig?.(options.agentConfig.profileId, options.agentKind, options.args)
@@ -441,6 +469,7 @@ export class SessionHostManager {
         ? await this.resolveAgentProxy?.(options.agentProxy.proxyId)
         : undefined
       if (options.agentProxy?.enabled && options.agentProxy.proxyId && !proxyEnvironment) throw new Error('代理配置不可用，未启动 Agent')
+      report('ready')
       handle.send({
         type: 'start',
         ...(options.initialPrompt ? { initialPrompt: options.initialPrompt } : {}),
@@ -452,11 +481,12 @@ export class SessionHostManager {
         rows: options.rows,
         ...((configured || proxyEnvironment || Object.keys(retry.environment).length) ? { environment: { ...configured?.environment, ...proxyEnvironment, ...retry.environment } } : {}),
       })
-      const event = await raceChild(handle.nextEvent(this.timeoutMs))
+      const event = await raceChild(handle.nextEvent(this.startupTimeoutMs))
       if (event.type !== 'ready') {
         throw new Error(event.type === 'error' ? event.message : `Expected ready, received ${event.type}`)
       }
       handle.permissionHook = event.permissionHook
+      report('persist')
       await this.writeRecord({
         ...pendingRecord,
         pid: child.pid,
@@ -464,11 +494,18 @@ export class SessionHostManager {
         ...(event.permissionHook ? { permissionHook: event.permissionHook } : {}),
         updatedAt: new Date().toISOString(),
       })
+      report('complete')
+      // 先记录 persist 耗时，再记录握手完成，不能将 PTY 就绪误写成模型已就绪。
+      report('complete')
       return handle
     } catch (error) {
+      report(phase, true)
       handle?.disconnect()
       if (child && !child.killed) child.kill()
       await unlink(this.registryPath(hostId)).catch(() => undefined)
+      if (error instanceof Error && /Timed out/i.test(error.message)) {
+        throw new Error(`Agent 启动超时（阶段：${phase}，已等待 ${Math.round((Date.now() - startedAt) / 1000)} 秒）；尚未确认终端就绪，请稍后手动重试。${error.message}`)
+      }
       throw error
     }
   }
@@ -560,6 +597,15 @@ export class SessionHostManager {
   }
 
   async updateMetadata(hostId: string, update: HostMetadataUpdate): Promise<void> {
+    const snapshot = structuredClone(update)
+    const previous = this.metadataWrites.get(hostId) ?? Promise.resolve()
+    const writing = previous.catch(() => undefined).then(() => this.writeMetadataUpdate(hostId, snapshot))
+    this.metadataWrites.set(hostId, writing)
+    try { await writing }
+    finally { if (this.metadataWrites.get(hostId) === writing) this.metadataWrites.delete(hostId) }
+  }
+
+  private async writeMetadataUpdate(hostId: string, update: HostMetadataUpdate): Promise<void> {
     const record = await this.readRecord(hostId)
     const updated: HostRecord = {
       ...record,
@@ -582,6 +628,9 @@ export class SessionHostManager {
   }
 
   async removeArtifacts(hostId: string): Promise<void> {
+    // Finish queued resume/mode writes before deletion, so an old write cannot
+    // recreate the released Host's record and revive an obsolete binding.
+    await this.metadataWrites.get(hostId)?.catch(() => undefined)
     await Promise.all([
       unlink(this.registryPath(hostId)).catch(() => undefined),
       unlink(this.exitPath(hostId)).catch(() => undefined),

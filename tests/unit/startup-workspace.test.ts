@@ -21,12 +21,12 @@ describe('startup workspace native resume', () => {
       restartSession: vi.fn(async (id: string) => { calls.push('start-' + id); if (id === 'b') throw new Error('connection failed') }),
     }
     const result = await restoreStartupWorkspace(['a', 'b', 'c', 'missing', 'a'], port)
-    expect(calls).toEqual(['start-a', 'start-b', 'start-c'])
+    expect(calls).toEqual(['start-a', 'start-b', 'start-c', 'start-missing'])
     expect(port.setFullAutoMode).not.toHaveBeenCalled()
     expect(sessions[0]!.fullAutoEnabled).toBe(true)
     expect(sessions[1]!.fullAutoEnabled).toBe(false)
-    expect(result.restored).toEqual(['a', 'c'])
-    expect(result.failed.map(item => item.sessionId)).toEqual(['b', 'missing'])
+    expect(result.restored).toEqual(['a', 'c', 'missing'])
+    expect(result.failed.map(item => item.sessionId)).toEqual(['b'])
     expect(result.failed[0]!.reason).toBe('connection failed')
   })
 
@@ -36,5 +36,15 @@ describe('startup workspace native resume', () => {
     const result = await restoreStartupWorkspace(['a', 'duplicate', 'live'], port)
     expect(port.restartSession).toHaveBeenCalledTimes(1)
     expect(result.failed[0]!.sessionId).toBe('duplicate')
+  })
+
+  it('reports a missing-history refusal and still restores the next known-unused window', async () => {
+    const sessions = ['used-unbound', 'unused-blank'].map(id => ({ ...entry(id), nativeSessionId: undefined }))
+    const restartSession = vi.fn(async (id: string) => {
+      if (id === 'used-unbound') throw new Error('请选择历史会话，或明确选择新会话')
+    })
+    const result = await restoreStartupWorkspace(sessions.map(item => item.sessionId), { listSessions: () => sessions, restartSession })
+    expect(result.restored).toEqual(['unused-blank'])
+    expect(result.failed).toEqual([{ sessionId: 'used-unbound', name: 'used-unbound', reason: '请选择历史会话，或明确选择新会话' }])
   })
 })

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 
-import { SessionController, type NativeSessionDiscoveryPort, type SessionHostManagerPort } from '../../electron/session-controller'
+import { SessionController, type LlmApprovalReviewPort, type NativeSessionDiscoveryPort, type SessionHostManagerPort } from '../../electron/session-controller'
 import type { HostEvent } from '../../src/shared/protocol'
 import type { StartSessionRequest } from '../../src/shared/manager-api'
 import type { HostHandle, HostRecord, StartHostOptions } from '../../electron/session-host-manager'
@@ -8,6 +8,8 @@ import { ApprovalPolicyEngine } from '../../electron/approval-policy'
 import { TerminalReplayBuffer } from '../../electron/terminal-replay-buffer'
 import { parseNativeActivity } from '../../electron/native-session-activity'
 import { sessionDisplayStatus } from '../../src/shared/session-state'
+import { discoverNativeSessions } from '../../electron/native-session-discovery'
+import type { StoredManagedSession } from '../../electron/managed-session-catalog'
 
 class FakeHandle implements HostHandle {
   readonly writes: string[] = []
@@ -88,6 +90,414 @@ async function settle(): Promise<void> {
 }
 
 describe('SessionController recovery evidence', () => {
+  it.each([
+    ['start', 'start'], ['rebind', 'rebind'], ['rebind', 'start'], ['start', 'rebind'],
+    ['restart', 'rebind'], ['rebind', 'restart'], ['restart', 'restart'],
+  ] as const)('reserves a native target across concurrent %s / %s operations', async (firstKind, secondKind) => {
+    const { controller, manager } = fixture()
+    const target = 'shared-native-target'
+    const boundRequest = (nativeSessionId: string): StartSessionRequest => ({ ...request(), nativeSessionId,
+      recovery: { executable: 'codex', args: ['resume', nativeSessionId] } })
+    const firstWindow = await controller.startSession(boundRequest(firstKind === 'restart' ? target : 'first-history'))
+    await controller.stopSession(firstWindow.sessionId)
+    const secondWindow = await controller.startSession(boundRequest(secondKind === 'restart' ? target : 'second-history'))
+    await controller.stopSession(secondWindow.sessionId)
+    let connected!: (handle: HostHandle) => void
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const run = (kind: typeof firstKind, sessionId: string) => kind === 'start'
+      ? controller.startSession(boundRequest(target))
+      : kind === 'restart' ? controller.restartSession(sessionId) : controller.replaceSessionBinding(sessionId, target)
+    const first = run(firstKind, firstWindow.sessionId)
+    await expect(run(secondKind, secondWindow.sessionId)).rejects.toThrow('正在另一个窗口中运行或启动')
+    await settle()
+    connected(new FakeHandle('reserved-target-host'))
+    await first
+    expect(manager.start).toHaveBeenCalledTimes(3)
+    await controller.stopAllSessions()
+  })
+
+  it('reserves a recovery-recipe identity even before the summary has captured its native ID', async () => {
+    const { controller, manager } = fixture()
+    let connected!: (handle: HostHandle) => void
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const first = controller.startSession(request(true))
+    await settle()
+    await expect(controller.startSession({ ...request(true), nativeSessionId: 'native-1' })).rejects.toThrow('正在另一个窗口中运行或启动')
+    connected(new FakeHandle('recipe-reservation-host'))
+    await first
+    await controller.stopAllSessions()
+  })
+
+  it('releases a failed new-host reservation so a later explicit retry can use the target', async () => {
+    const { controller, manager } = fixture()
+    vi.mocked(manager.start).mockRejectedValueOnce(new Error('synthetic startup failure'))
+    const bound = { ...request(true), nativeSessionId: 'failed-target' }
+    await expect(controller.startSession(bound)).rejects.toThrow('synthetic startup failure')
+    await controller.startSession(bound)
+    expect(manager.start).toHaveBeenCalledTimes(2)
+    await controller.stopAllSessions()
+  })
+
+  it('keeps a later Stop authoritative while binding replacement is awaiting old-host release', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'original-history' })
+    await controller.stopSession(session.sessionId)
+    let released!: () => void
+    vi.mocked(manager.release!).mockImplementationOnce(() => new Promise(resolve => { released = resolve }))
+    const changing = controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    await settle()
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('正在启动或切换')
+    await controller.stopSession(session.sessionId)
+    released()
+    await changing
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: 'original-history', status: 'stopped', userStopRequested: true })
+    // The cancellation must release its target reservation as well.
+    await controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    expect(starts).toHaveLength(2)
+    await controller.stopSession(session.sessionId)
+  })
+
+  it('does not absorb a later Stop into the binding change while its own stop receipt is pending', async () => {
+    const { controller, manager, handles, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'original-history' })
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    handles[0]!.fail(new Error('synthetic lost connection'))
+    await settle()
+    expect(controller.listSessions()[0]?.status).toBe('needs_attention')
+    let stopped!: () => void
+    vi.spyOn(handles[0]!, 'stop').mockImplementationOnce(() => new Promise(resolve => { stopped = resolve }))
+    const changing = controller.replaceSessionBinding(session.sessionId, 'replacement-history')
+    await settle()
+    await controller.stopSession(session.sessionId)
+    stopped()
+    await changing
+    expect(starts).toHaveLength(1)
+    expect(manager.release).not.toHaveBeenCalled()
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: 'original-history', status: 'stopped', userStopRequested: true })
+  })
+
+  it('keeps the native target reserved during a startup retry delay and releases it after cancellation', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles } = fixture()
+      const bound = { ...request(true), nativeSessionId: 'retry-target' }
+      const session = await controller.startSession(bound)
+      handles[0]!.emit({ type: 'exit', exitCode: 1 })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+      await expect(controller.startSession(bound)).rejects.toThrow('正在另一个窗口中运行或启动')
+      await controller.stopSession(session.sessionId)
+      await vi.advanceTimersByTimeAsync(500)
+      await controller.startSession(bound)
+      await controller.stopAllSessions()
+    } finally { vi.clearAllTimers(); vi.useRealTimers() }
+  })
+
+  it.each([true, false, undefined])('only freshly restarts catalog windows with unusedFreshSession=%s explicitly true', async unusedFreshSession => {
+    const { manager, starts } = fixture()
+    const entry: StoredManagedSession = {
+      sessionId: 'persisted-window', hostId: 'old-host', request: request(), unusedFreshSession,
+      summary: { sessionId: 'persisted-window', displayName: 'Persisted', workspace: 'B:\\work', agentKind: 'codex',
+        status: 'stopped', userStopRequested: true, recoveryAttempts: 0, approvalMode: 'rules-auto' },
+      updatedAt: '2026-01-01T00:00:00Z',
+    }
+    const catalog = { list: () => [entry], upsert: vi.fn(async () => undefined), flush: vi.fn(async () => undefined),
+      remove: vi.fn(async () => undefined), clear: vi.fn(async () => undefined) }
+    const controller = new SessionController(manager, undefined, undefined, undefined, undefined, undefined, undefined, undefined, catalog)
+    await controller.restoreSessions()
+    if (unusedFreshSession) {
+      await controller.restartSession(entry.sessionId)
+      expect(starts).toHaveLength(1)
+      expect(starts[0]).toMatchObject({ approvalMode: 'rules-auto', fullAutoEnabled: true })
+      expect(starts[0]?.nativeSessionId).toBeUndefined()
+      await controller.stopSession(entry.sessionId)
+    } else {
+      await expect(controller.restartSession(entry.sessionId)).rejects.toThrow('尚未绑定原生会话')
+      expect(starts).toHaveLength(0)
+    }
+  })
+
+  it.each(['agent-review', 'rules-auto'] as const)('preserves %s on restart and resets it explicitly on binding replacement', async mode => {
+    const { controller, handles, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'old-native' })
+    await controller.setApprovalMode(session.sessionId, mode)
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]).toMatchObject({ approvalMode: mode, fullAutoEnabled: true })
+    await controller.stopSession(session.sessionId)
+    await controller.replaceSessionBinding(session.sessionId, 'new-native')
+    expect(starts[2]).toMatchObject({ approvalMode: 'manual' })
+    expect(starts[2]?.fullAutoEnabled).not.toBe(true)
+    expect(controller.listSessions()[0]).toMatchObject({ approvalMode: 'manual', fullAutoEnabled: false })
+    handles[2]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'new-approval', toolName: 'Bash', command: 'git status' })
+    await settle()
+    expect(handles[2]!.permissionResponses).toEqual([])
+    expect(controller.listPendingApprovals().map(item => item.requestId)).toEqual(['new-approval'])
+    await controller.stopSession(session.sessionId)
+  })
+
+  it('aborts old reviews across a parent /resume while handling the new hook in its existing automatic mode', async () => {
+    const base = fixture()
+    let completeReview!: (value: Awaited<ReturnType<LlmApprovalReviewPort['reviewApproval']>>) => void
+    const reviewer = {
+      getSettings: () => ({ enabled: true, level: 'high' as const }),
+      reviewApproval: vi.fn<LlmApprovalReviewPort['reviewApproval']>(() => new Promise(resolve => { completeReview = resolve })),
+    }
+    const controller = new SessionController(base.manager, undefined, undefined, new ApprovalPolicyEngine(), undefined, undefined,
+      undefined, undefined, undefined, reviewer)
+    const oldId = '00000000-0000-4000-8000-000000000071'
+    const nextId = '00000000-0000-4000-8000-000000000072'
+    const session = await controller.startSession({ ...request(true), nativeSessionId: oldId })
+    await controller.setApprovalMode(session.sessionId, 'agent-review')
+    base.handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'old-review', toolName: 'PowerShell',
+      command: 'Remove-Item -LiteralPath .\\cache -Recurse -Force', operation: 'delete' })
+    await settle()
+    expect(reviewer.reviewApproval).toHaveBeenCalledOnce()
+    base.handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'new-safe', toolName: 'PowerShell',
+      command: 'git status --short', operation: 'read', nativeSessionId: nextId, cwd: 'B:\\work' })
+    await settle()
+    expect(reviewer.reviewApproval.mock.calls[0]?.[2]?.aborted).toBe(true)
+    completeReview({ verdict: 'allow', requiresHumanApproval: false, riskScore: 1, summary: 'synthetic', reasons: [], hazards: [], assumptions: [], model: 'test', reviewedAt: 1 })
+    await settle()
+    expect(base.handles[0]!.permissionResponses).toEqual([{ requestId: 'new-safe', action: 'allow' }])
+    expect(controller.listPendingApprovals()).toEqual([])
+    expect(controller.listSessions()[0]).toMatchObject({ nativeSessionId: nextId, approvalMode: 'agent-review', status: 'running' })
+    await controller.stopSession(session.sessionId)
+  })
+
+  it.each(['stop', 'mode-change'] as const)('releases a late startup result after %s instead of reviving its window', async action => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request(true))
+    await controller.stopSession(session.sessionId)
+    let requested = true
+    let connected!: (handle: HostHandle) => void
+    const late = new FakeHandle('late-host')
+    vi.mocked(manager.start).mockImplementationOnce(() => new Promise(resolve => { connected = resolve }))
+    const restart = controller.restartSession(session.sessionId, () => requested)
+    await settle()
+    if (action === 'stop') await controller.stopSession(session.sessionId)
+    else { requested = false; await controller.setApprovalMode(session.sessionId, 'rules-auto') }
+    connected(late)
+    await restart
+    expect(late.stops).toBe(1)
+    expect(late.disconnects).toBe(1)
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]?.status).toBe('stopped')
+    expect(late.writes).toEqual([])
+  })
+
+  it('serializes restart requests while the previous Host is being released', async () => {
+    const { controller, manager, starts } = fixture()
+    const session = await controller.startSession(request(true))
+    await controller.stopSession(session.sessionId)
+    let released!: () => void
+    vi.mocked(manager.release!).mockImplementationOnce(() => new Promise(resolve => { released = resolve }))
+    const restart = controller.restartSession(session.sessionId)
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('正在启动')
+    released()
+    await restart
+    expect(starts).toHaveLength(2)
+    await controller.stopSession(session.sessionId)
+  })
+
+  it.each(['before-exit', 'during-delay'])('keeps the unattended request guard when revoked %s during startup', async timing => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles, starts } = fixture()
+      const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-one' })
+      await controller.stopSession(session.sessionId)
+      let requested = true
+      await controller.restartSession(session.sessionId, () => requested)
+      if (timing === 'before-exit') requested = false
+      handles[1]!.emit({ type: 'exit', exitCode: 1 })
+      await vi.advanceTimersByTimeAsync(0)
+      requested = false
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(starts).toHaveLength(2)
+      expect(controller.listSessions()[0]?.status).toBe('failed')
+    } finally { vi.clearAllTimers(); vi.useRealTimers() }
+  })
+
+  it('constructs a resume recipe from a known native identity when its stored recipe is missing', async () => {
+    const { controller, starts } = fixture()
+    const session = await controller.startSession({ ...request(), nativeSessionId: 'known-history' })
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]?.args).toEqual(['--no-alt-screen', 'resume', 'known-history'])
+    expect(starts[1]?.recovery?.args).toEqual(starts[1]?.args)
+    await controller.stopSession(session.sessionId)
+  })
+
+  it('updates Codex hook identity so completion and future resume follow the actual conversation', async () => {
+    const { controller, handles, starts, manager } = fixture()
+    const oldId = '00000000-0000-4000-8000-000000000081'
+    const actualId = '00000000-0000-4000-8000-000000000082'
+    const agentConfig = { enabled: true, source: 'custom' as const, profileId: 'original-profile', extraArgs: ['--model', 'test-model'], hasApiKey: true }
+    const session = await controller.startSession({ ...request(true), args: ['--no-alt-screen', '--model', 'base-model', 'resume', oldId], nativeSessionId: oldId, agentConfig })
+    handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'actual-tool', toolName: 'Bash', command: 'npm test', nativeSessionId: actualId, cwd: 'B:\\work' })
+    await settle()
+    await controller.approveSession(session.sessionId)
+    controller.observeNativeActivity({ ...controller.listSessions()[0]!, nativeSessionId: actualId }, { activity: 'completed', timestamp: Date.now() + 1000 })
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe(actualId)
+    expect(controller.listSessions()[0]?.activity).toBe('completed')
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', expect.objectContaining({ nativeSessionId: actualId }))
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]?.args).toContain(actualId)
+    expect(starts[1]?.args).not.toContain(oldId)
+    expect(starts[1]?.args.filter(arg => arg === '--no-alt-screen')).toHaveLength(1)
+    expect(starts[1]?.agentConfig).toEqual(agentConfig)
+    expect(starts[1]?.args).toContain('base-model')
+  })
+  it.each([
+    { agentId: 'child' }, { agentType: 'Explore' }, { cwd: 'B:\\other' },
+    { hookSource: 'claude' as const }, { nativeSessionId: 'malformed-id' },
+  ])('does not rebind Codex to unsafe hook identity %j', async overrides => {
+    const { controller, handles } = fixture()
+    const oldId = '00000000-0000-4000-8000-000000000081'
+    const session = await controller.startSession({ ...request(true), nativeSessionId: oldId })
+    handles[0]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'unsafe', toolName: 'Bash', command: 'npm test', nativeSessionId: '00000000-0000-4000-8000-000000000082', cwd: 'B:\\work', ...overrides })
+    await settle()
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe(oldId)
+    expect(controller.listPendingApprovals()).toHaveLength(1)
+    await controller.stopSession(session.sessionId)
+  })
+  it('does not adopt a native ID already running in another window', async () => {
+    const { controller, handles } = fixture()
+    const occupied = '00000000-0000-4000-8000-000000000082'
+    const first = await controller.startSession({ ...request(), nativeSessionId: occupied })
+    const second = await controller.startSession(request())
+    handles[1]!.emit({ type: 'permission-request', hookSource: 'codex', requestId: 'occupied', toolName: 'Bash', cwd: 'B:\\work', nativeSessionId: occupied })
+    await settle()
+    expect(controller.listSessions().find(item => item.sessionId === second.sessionId)?.nativeSessionId).toBeUndefined()
+    await controller.stopSession(first.sessionId)
+    await controller.stopSession(second.sessionId)
+  })
+  it('uses the Claude parent hook identity after manual resume, without adopting subagent IDs', async () => {
+    const { controller, handles, manager } = fixture()
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    const nativeSessionId = '00000000-0000-4000-8000-000000000092'
+    handles[0]!.emit({ type: 'permission-request', hookSource: 'claude', requestId: 'parent', toolName: 'Read', cwd: 'B:\\work', nativeSessionId })
+    await settle()
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe(nativeSessionId)
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', expect.objectContaining({ nativeSessionId }))
+    handles[0]!.emit({ type: 'permission-request', hookSource: 'claude', requestId: 'child', toolName: 'Read', cwd: 'B:\\work', agentId: 'child', nativeSessionId: '00000000-0000-4000-8000-000000000093' })
+    await settle()
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe(nativeSessionId)
+    await controller.stopSession(session.sessionId)
+  })
+  it.each(['codex', 'claude'] as const)('clears old %s binding while preserving window and independent config', async agentKind => {
+    const { controller, starts, manager } = fixture()
+    const oldId = 'old-native'
+    const agentConfig = { enabled: true, source: 'custom' as const, profileId: 'profile-original', extraArgs: ['--model', 'test-model'], hasApiKey: true, networkRetry: { codexStreamRetries: 100 } }
+    const args = agentKind === 'codex' ? ['--no-alt-screen', 'resume', oldId] : ['--resume', oldId]
+    const session = await controller.startSession({ ...request(), agentKind, executable: agentKind, args, nativeSessionId: oldId, recovery: { executable: agentKind, args }, agentConfig })
+    await controller.setFullAutoMode(session.sessionId, true)
+    await expect(controller.replaceSessionBinding(session.sessionId, null)).rejects.toThrow('请先停止')
+    await controller.stopSession(session.sessionId)
+    await controller.replaceSessionBinding(session.sessionId, null)
+    expect(starts[1]).toMatchObject({ sessionId: session.sessionId, displayName: session.displayName, agentConfig })
+    expect(starts[1]?.nativeSessionId).toBeUndefined()
+    expect(starts[1]?.recovery).toBeUndefined()
+    expect(starts[1]?.args).not.toContain(oldId)
+    expect(starts[1]?.fullAutoEnabled).toBeUndefined()
+    expect(manager.removeArtifacts).toHaveBeenCalledWith('host-1')
+    expect(controller.listSessions()[0]?.nativeSessionId).toBeUndefined()
+    await controller.stopSession(session.sessionId)
+    await controller.replaceSessionBinding(session.sessionId, 'new-native')
+    expect(starts[2]?.nativeSessionId).toBe('new-native')
+    expect(starts[2]?.args).toContain('new-native')
+    expect(starts[2]?.args).not.toContain(oldId)
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[3]?.args).toContain('new-native')
+  })
+
+  it('preserves the replacement binding and configuration when its new process fails to start', async () => {
+    const { controller, manager } = fixture()
+    const session = await controller.startSession(request(true))
+    await controller.stopSession(session.sessionId)
+    vi.mocked(manager.start)
+      .mockRejectedValueOnce(new Error('startup failed'))
+      .mockRejectedValueOnce(new Error('startup failed'))
+      .mockRejectedValueOnce(new Error('startup failed'))
+    await expect(controller.replaceSessionBinding(session.sessionId, 'new-native')).rejects.toThrow('startup failed')
+    expect(controller.listSessions()[0]).toMatchObject({ sessionId: session.sessionId, nativeSessionId: 'new-native', status: 'failed', startupFailureCount: 3, startupRecoveryRequired: true })
+    await controller.restartSession(session.sessionId)
+    expect(controller.listSessions()[0]?.status).toBe('running')
+  })
+  it('retries an early native resume exit three times before requesting a binding decision', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles, starts } = fixture()
+      const config = { enabled: true, source: 'custom' as const, profileId: 'original', extraArgs: ['--model', 'demo'], hasApiKey: true }
+      const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-1', agentConfig: config })
+      for (let index = 0; index < 3; index += 1) {
+        handles[index]!.emit({ type: 'exit', exitCode: 1 })
+        await vi.advanceTimersByTimeAsync(0)
+        expect(controller.listSessions()[0]?.startupRecoveryRequired).toBe(index === 2)
+        await vi.advanceTimersByTimeAsync(500)
+      }
+      expect(starts).toHaveLength(3)
+      expect(starts.every(start => start.nativeSessionId === 'native-1' && start.agentConfig?.profileId === 'original')).toBe(true)
+      expect(controller.listSessions()[0]).toMatchObject({ status: 'failed', startupFailureCount: 3, startupRecoveryRequired: true })
+      await controller.restartSession(session.sessionId)
+      handles[3]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.listSessions()[0]).toMatchObject({ status: 'running', startupFailureCount: 0, startupRecoveryRequired: false })
+    } finally { vi.useRealTimers() }
+  })
+  it('cancels a scheduled startup retry when the user stops during the retry delay', async () => {
+    vi.useFakeTimers()
+    try {
+      const { controller, handles, starts } = fixture()
+      const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-1' })
+      handles[0]!.emit({ type: 'exit', exitCode: 1 })
+      await vi.advanceTimersByTimeAsync(0)
+      await controller.stopSession(session.sessionId)
+      await vi.advanceTimersByTimeAsync(2000)
+      expect(starts).toHaveLength(1)
+      expect(controller.listSessions()[0]?.startupRecoveryRequired).toBe(false)
+    } finally { vi.useRealTimers() }
+  })
+  it('does not retry a native session that crashes after its normal input prompt appeared', async () => {
+    const { controller, handles, starts } = fixture()
+    const session = await controller.startSession({ ...request(true), nativeSessionId: 'native-1' })
+    handles[0]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    handles[0]!.emit({ type: 'exit', exitCode: 1 })
+    await settle()
+    expect(starts).toHaveLength(1)
+    expect(controller.listSessions()[0]?.startupRecoveryRequired).not.toBe(true)
+    expect(controller.listSessions()[0]?.status).toBe('needs_attention')
+    await controller.stopSession(session.sessionId)
+  })
+  it('reproduces binding and restarting a Claude history-only ID with no transcript', async () => {
+    let history = ''
+    const id = '00000000-0000-4000-8000-000000000091'
+    const discover = () => discoverNativeSessions('claude', 'B:\\work', {
+      roots: { claude: 'B:\\fixture\\claude' },
+      reader: {
+        listFiles: async () => [],
+        readFirstLine: async () => { throw new Error('No transcript') },
+        readLines: () => (async function* () { if (history) yield history })(),
+        mtime: async () => 0,
+      },
+    })
+    const { controller, handles, starts, manager } = fixture({ discover })
+    const session = await controller.startSession({ ...request(), agentKind: 'claude', executable: 'claude' })
+    history = JSON.stringify({ sessionId: id, project: 'B:\\work', display: 'hello', timestamp: Date.now() })
+    handles[0]!.emit({ type: 'output', data: 'hello' })
+    await settle()
+    await settle()
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe(id)
+    expect(manager.updateMetadata).toHaveBeenCalledWith('host-1', expect.objectContaining({ nativeSessionId: id }))
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[1]?.args).toEqual(['--resume', id])
+  })
   it('carries retry-only configuration through start, edit and native restart', async () => {
     const { controller, starts, manager } = fixture()
     const agentConfig = { enabled: false, source: 'local' as const, extraArgs: [], hasApiKey: false, networkRetry: { codexStreamRetries: 20 } }
@@ -596,12 +1006,27 @@ describe('SessionController recovery evidence', () => {
     } finally { clock.mockRestore() }
   })
 
-  it('still refuses to restart an unbound native session without a recovery recipe', async () => {
+  it.each(['codex', 'claude'] as const)('restarts a never-used %s Agent with its edited independent configuration', async agentKind => {
+    const { controller, starts } = fixture()
+    const session = await controller.startSession({ ...request(), agentKind, executable: agentKind, args: agentKind === 'codex' ? ['--no-alt-screen'] : [] })
+    const agentConfig = { enabled: true, source: 'custom' as const, profileId: 'saved-profile', extraArgs: ['--model', 'test-model'], hasApiKey: true, networkRetry: { codexStreamRetries: 100 }, autoCompactTokens: 500_000 }
+    await controller.updateSessionConfig(session.sessionId, agentConfig)
+    await controller.renameSession(session.sessionId, 'My Agent')
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts).toHaveLength(2)
+    expect(starts[1]).toMatchObject({ sessionId: session.sessionId, displayName: 'My Agent', agentConfig, executable: agentKind, cwd: 'B:\\work' })
+    expect(starts[1]?.recovery).toBeUndefined()
+    expect(starts[1]?.nativeSessionId).toBeUndefined()
+  })
+
+  it('refuses to replace a used conversation whose native ID was never captured', async () => {
     const { controller, handles, starts } = fixture()
     const session = await controller.startSession(request())
+    controller.write(session.sessionId, 'implement a feature\r')
     handles[0]!.emit({ type: 'exit', exitCode: 0 })
     await settle()
-    await expect(controller.restartSession(session.sessionId)).rejects.toThrow()
+    await expect(controller.restartSession(session.sessionId)).rejects.toThrow('尚未绑定原生会话')
     expect(starts).toHaveLength(1)
   })
 
@@ -1831,6 +2256,25 @@ describe('SessionController recovery evidence', () => {
       await fail(a.sessionId)
       expect(base.handles[0]!.writes.filter(value => value === '\r')).toHaveLength(3)
     } finally { vi.useRealTimers() }
+  })
+
+  it('captures a native session after restarting a never-used window and resumes it next time', async () => {
+    let created = false
+    const discovery: NativeSessionDiscoveryPort = { discover: vi.fn(async () => created ? [{ id: 'after-restart', title: 'New conversation', updatedAt: Date.now(), workspace: 'B:\\work' }] : []) }
+    const { controller, handles, starts } = fixture(discovery)
+    const session = await controller.startSession(request())
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    created = true
+    controller.write(session.sessionId, 'hello\r')
+    handles[1]!.emit({ type: 'output', data: 'OpenAI Codex\r\n›\r\n' })
+    await settle()
+    await settle()
+    expect(controller.listSessions()[0]?.nativeSessionId).toBe('after-restart')
+    await controller.stopSession(session.sessionId)
+    await controller.restartSession(session.sessionId)
+    expect(starts[2]?.args).toContain('resume')
+    expect(starts[2]?.args).toContain('after-restart')
   })
 
   it('ignores a keyword in an earlier terminal line when the latest line does not match', async () => {

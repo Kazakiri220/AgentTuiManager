@@ -1840,6 +1840,61 @@ describe('App terminal wall', () => {
     expect(first.style.width).toBe('')
   })
 
+  it('opens history replacement from a stopped tile without restoring the upstream sidebar', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, status: 'stopped' }])
+    api.listBindingSessions = vi.fn(async () => [{ id: 'replacement-id', title: 'Replacement history', workspace: session.workspace, updatedAt: 1 }])
+    api.replaceSessionBinding = vi.fn(async () => undefined)
+    const { container } = render(<App />)
+    fireEvent.click(await screen.findByRole('button', { name: '切换历史会话' }))
+    const dialog = await screen.findByRole('dialog', { name: '选择历史会话' })
+    expect(api.listBindingSessions).toHaveBeenCalledWith(session.sessionId)
+    fireEvent.click(await within(dialog).findByRole('button', { name: /Replacement history/ }))
+    fireEvent.click(within(dialog).getByRole('button', { name: '关联并启动' }))
+    await waitFor(() => expect(api.replaceSessionBinding).toHaveBeenCalledWith(session.sessionId, 'replacement-id'))
+    expect(container.querySelector('[data-panel="navigation"]')).toBeNull()
+    expect(screen.getByRole('navigation', { name: '主导航' })).toBeInTheDocument()
+  })
+
+  it('surfaces exhausted startup recovery with retry and explicit fresh-session confirmation', async () => {
+    vi.mocked(api.listSessions).mockResolvedValue([{ ...session, status: 'failed', startupRecoveryRequired: true, startupFailureCount: 3, lastError: 'Fixture resume failure' }])
+    api.replaceSessionBinding = vi.fn(async () => undefined)
+    render(<App />)
+    const recovery = await screen.findByRole('dialog', { name: '会话恢复失败' })
+    expect(within(recovery).getByText('Fixture resume failure')).toBeInTheDocument()
+    fireEvent.click(within(recovery).getByRole('button', { name: '按原配置开启新会话' }))
+    const binding = await screen.findByRole('dialog', { name: '按原配置开启新会话' })
+    expect(api.replaceSessionBinding).not.toHaveBeenCalled()
+    fireEvent.click(within(binding).getByRole('button', { name: '确认开启新会话' }))
+    await waitFor(() => expect(api.replaceSessionBinding).toHaveBeenCalledWith(session.sessionId, null))
+  })
+
+  it('continues to surface recovery prompts after an earlier recovery session is removed', async () => {
+    const failed = { ...session, status: 'failed' as const, startupRecoveryRequired: true, startupFailureCount: 3 }
+    vi.mocked(api.listSessions).mockResolvedValue([failed])
+    render(<App />)
+    await screen.findByRole('dialog', { name: '会话恢复失败' })
+    const notify = vi.mocked(api.subscribe).mock.calls[0]![0]
+    act(() => notify({ type: 'sessions-changed', sessionId: session.sessionId, session: null, approvals: [] }))
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: '会话恢复失败' })).not.toBeInTheDocument())
+    act(() => notify({ type: 'sessions-changed', sessionId: 'second-recovery', session: { ...failed, sessionId: 'second-recovery', displayName: 'Second recovery' }, approvals: [] }))
+    const dialog = await screen.findByRole('dialog', { name: '会话恢复失败' })
+    expect(within(dialog).getByText('Second recovery')).toBeInTheDocument()
+  })
+
+  it('fetches and selects provider models in the existing new-Agent configuration form', async () => {
+    api.listProviderModels = vi.fn(async () => ['upstream-model'])
+    render(<App />)
+    await screen.findByText('Codex API 重构')
+    fireEvent.click(screen.getByRole('button', { name: '＋ 新建 Agent' }))
+    fireEvent.click(screen.getByRole('button', { name: /独立配置/ }))
+    fireEvent.click(screen.getByRole('switch', { name: '启用独立配置' }))
+    fireEvent.change(screen.getByLabelText('Base URL'), { target: { value: 'https://models.example/v1' } })
+    fireEvent.click(screen.getByRole('button', { name: '获取模型列表' }))
+    await screen.findByRole('option', { name: 'upstream-model' })
+    fireEvent.change(screen.getByRole('combobox', { name: '选择模型' }), { target: { value: 'upstream-model' } })
+    expect(screen.getByLabelText('Model')).toHaveValue('upstream-model')
+  })
+
   it('renders large audit histories in pages of fifty rows', async () => {
     vi.mocked(api.listAuditEntries).mockResolvedValue(Array.from({ length: 120 }, (_, index) => ({
       id: `audit-${index}`, timestamp: Date.now() - index, level: 'info' as const, category: 'session' as const,

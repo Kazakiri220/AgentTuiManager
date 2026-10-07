@@ -22,7 +22,7 @@ import { DeepSeekWebWindows } from './deepseek-web-window'
 import { openExternalWeb, routeExternalLinks } from './external-links'
 import { openSessionWorkspace } from './open-session-workspace'
 import { SessionHostManager } from './session-host-manager'
-import { discoverNativeSessions, discoverRecentNativeSessions, discoverGlobalCodexSessions } from './native-session-discovery'
+import { discoverNativeSessions, discoverRecentNativeSessions, discoverGlobalCodexSessions, discoverBindableSessions } from './native-session-discovery'
 import { canonicalNativeRecovery, terminalScrollbackArgs, validateExecutable } from './start-request-policy'
 import { ApprovalPolicyStore } from './approval-policy-store'
 import { classifyApprovalRisk } from './approval-policy'
@@ -31,6 +31,7 @@ import { resolveExecutableForPty } from './executable-resolution'
 import { ActivityAuditStore, type NewAuditEntry } from './activity-audit-store'
 import { RecoveryPolicyStore } from './recovery-policy-store'
 import { AgentConfigurationStore } from './agent-configuration-store'
+import { fetchProviderModels } from './provider-models'
 import { applyAgentLaunchProfile } from './agent-launch-profile'
 import { CCSwitchProviderReader } from './ccswitch-provider-reader'
 import { readCodexGlobalProvider } from './codex-global-config'
@@ -1074,6 +1075,22 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
     await controller.renameSession(target, displayName)
     recordAudit({ level: 'info', category: 'session', action: 'session_renamed', message: `${before} 已重命名为 ${displayName}`, sessionId: target, details: { before, after: displayName } })
   })
+  ipcMain.handle(IPC_CHANNELS.listBindingSessions, async (event, id: unknown) => {
+    trustedRenderer(event)
+    const session = controller.listSessions().find(item => item.sessionId === sessionId(id))
+    if (!session) throw new Error('Agent 不存在或已删除')
+    return sessionCatalog.nameHistory(session.agentKind, await discoverBindableSessions(session.agentKind, session.workspace))
+  })
+  ipcMain.handle(IPC_CHANNELS.replaceSessionBinding, async (event, id: unknown, target: unknown) => {
+    trustedRenderer(event)
+    const currentId = sessionId(id)
+    const nativeId = target === null ? null : text(target, 'nativeSessionId', 512)
+    const session = controller.listSessions().find(item => item.sessionId === currentId)
+    if (!session) throw new Error('Agent 不存在或已删除')
+    if (nativeId && !(await discoverBindableSessions(session.agentKind, session.workspace)).some(item => item.id === nativeId)) throw new Error('该目录下找不到有效的对话文件，请刷新列表后重试')
+    await controller.replaceSessionBinding(currentId, nativeId)
+    recordAudit({ level: 'info', category: 'session', action: 'session_binding_replaced', message: nativeId ? '已重新关联原生会话' : '已按原配置开启新会话', sessionId: currentId, details: { previous: session.nativeSessionId ?? '', current: nativeId ?? '' } })
+  })
   ipcMain.handle(IPC_CHANNELS.updateSessionConfig, async (event, id: unknown, value: unknown) => {
     trustedRenderer(event)
     const target = sessionId(id)
@@ -1149,6 +1166,26 @@ function registerIpc(approvalPolicy: ApprovalPolicyStore): void {
   ipcMain.handle(IPC_CHANNELS.saveUnattendedSettings, async (event, id: unknown, value: unknown) => {
     trustedRenderer(event)
     await controller.saveUnattendedSettings(sessionId(id), parseUnattendedSettings(value))
+  })
+  ipcMain.handle(IPC_CHANNELS.listProviderModels, async (event, value: unknown) => {
+    trustedRenderer(event)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('模型查询参数无效')
+    const input = value as Record<string, unknown>
+    if (typeof input.baseUrl !== 'string' || input.baseUrl.length > 4096) throw new Error('Base URL 无效')
+    if (input.apiKey !== undefined && (typeof input.apiKey !== 'string' || input.apiKey.length > 16384)) throw new Error('API Key 无效')
+    let apiKey = typeof input.apiKey === 'string' ? input.apiKey.trim() : undefined
+    if (input.sessionId !== undefined) {
+      const target = sessionId(input.sessionId)
+      const session = controller.listSessions().find(item => item.sessionId === target)
+      if (!session) throw new Error('Agent 不存在或已删除')
+      if (!apiKey && input.clearApiKey !== true && session.agentConfig?.profileId) {
+        const saved = await agentConfigurationStore.get(session.agentConfig.profileId)
+        // 更换地址时禁止静默将旧密钥发给新的服务器。
+        if (saved?.apiKey && saved.baseUrl?.replace(/\/+$/, '') !== input.baseUrl.trim().replace(/\/+$/, '')) throw new Error('Base URL 已修改，请重新填写 API Key 后获取模型')
+        apiKey = saved?.apiKey
+      }
+    }
+    return fetchProviderModels(input.baseUrl, input.clearApiKey === true ? undefined : apiKey)
   })
   ipcMain.handle(IPC_CHANNELS.listCCSwitchProviders, (event, kind: unknown) => {
     trustedRenderer(event)
@@ -1485,7 +1522,7 @@ async function promptStartupWorkspace(window: BrowserWindow): Promise<void> {
     type: 'question', title: '恢复上次工作区',
     message: `恢复上次启动的 ${candidates.length} 个 Agent？`,
     detail: candidates.map(item => `• ${item.displayName}（${item.agentKind}）`).join('\n')
-      + '\n\n只恢复原生会话，不创建新会话。已停止的旧窗口不在此列表；全自动批准保留原开关，无监管仍需手动开启。',
+      + '\n\n有绑定时恢复原生对话；确认尚未使用的空窗口可按原配置启动。无法确定旧对话时保留窗口供选择。规则和 Agent 审核模式保持，无监管仍需手动开启。',
     buttons: ['恢复上次工作区', '跳过'], defaultId: 0, cancelId: 1, noLink: true,
   })
   if (result.response !== 0 || window.isDestroyed() || quitting) return
@@ -1649,6 +1686,12 @@ void app.whenReady().then(async () => {
     ? join('/tmp', `agent-tui-${typeof process.getuid === 'function' ? process.getuid() : 'user'}`)
     : undefined
   const manager = new SessionHostManager({
+    onStartupProgress: (progress) => recordAudit({
+      level: progress.failed ? 'warning' : 'info', category: 'session', action: 'host_startup_phase',
+      message: progress.failed ? '终端启动阶段失败' : progress.phase === 'complete' ? '终端启动握手完成' : '终端启动阶段完成',
+      ...(progress.sessionId ? { sessionId: progress.sessionId } : {}),
+      details: { hostId: progress.hostId, phase: progress.phase, elapsedMs: progress.elapsedMs, phaseElapsedMs: progress.phaseElapsedMs },
+    }),
     runtimeDir: join(app.getPath('userData'), 'runtime', 'session-hosts'),
     ...(hostSocketDir ? { socketDir: hostSocketDir } : {}),
     hostEntry: join(__dirname, 'session-host.js'),

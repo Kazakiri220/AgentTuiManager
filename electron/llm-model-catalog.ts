@@ -1,4 +1,4 @@
-import axios from 'axios'
+import axios, { type AxiosRequestConfig } from 'axios'
 
 import type { StoredLlmReviewSettings } from './llm-review-settings-store'
 
@@ -68,7 +68,7 @@ export function configuredProxy(settings: StoredLlmReviewSettings) {
   }
 }
 
-export function llmApiHeaders(settings: StoredLlmReviewSettings): Record<string, string> {
+export function llmApiHeaders(settings: Pick<StoredLlmReviewSettings, 'apiKey' | 'protocol' | 'anthropicAuth'>): Record<string, string> {
   const apiKey = settings.apiKey?.trim()
   if (!apiKey || apiKey.length > 16384 || UNSAFE_TEXT.test(settings.apiKey!)) throw new LlmModelCatalogError('configuration')
   return settings.protocol === 'anthropic-messages'
@@ -76,7 +76,7 @@ export function llmApiHeaders(settings: StoredLlmReviewSettings): Record<string,
     : { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }
 }
 
-function protectedValues(settings: StoredLlmReviewSettings): string[] {
+export function protectedLlmApiValues(settings: Pick<StoredLlmReviewSettings, 'apiKey' | 'proxyPassword' | 'proxyUsername' | 'reviewers'>): string[] {
   const values = new Set<string>()
   for (const value of [settings.apiKey, settings.proxyPassword, ...(settings.reviewers?.map(entry => entry.apiKey) ?? [])]) {
     if (typeof value !== 'string' || !value) continue
@@ -127,19 +127,18 @@ export function safeLlmApiError(error: unknown): Error {
   return new LlmModelCatalogError('network')
 }
 
-/** Fetches in the main process; neither credentials nor upstream bodies leave here. */
-export async function listLlmReviewModels(settings: StoredLlmReviewSettings): Promise<string[]> {
+/** Shared bounded transport for provider and reviewer model catalogs. */
+export async function requestLlmModels(endpoint: string, options: {
+  headers: Record<string, string>
+  timeout: number
+  proxy?: AxiosRequestConfig['proxy']
+  secrets: readonly string[]
+}): Promise<string[]> {
   try {
-    const apiKey = settings.apiKey?.trim()
-    if (!apiKey || apiKey.length > 16_384 || UNSAFE_TEXT.test(settings.apiKey!)) throw new LlmModelCatalogError('configuration')
-    const endpoint = resolveLlmApiEndpoint(settings.baseUrl ?? '', 'models')
-    const proxy = configuredProxy(settings)
-    const secrets = protectedValues(settings)
-    const timeoutSeconds = Number.isFinite(settings.timeoutSeconds) ? Math.max(1, Math.min(60, settings.timeoutSeconds)) : 30
     const response = await axios.get<unknown>(endpoint, {
-      headers: llmApiHeaders(settings),
-      proxy,
-      timeout: timeoutSeconds * 1_000,
+      headers: options.headers,
+      ...(options.proxy === undefined ? {} : { proxy: options.proxy }),
+      timeout: options.timeout,
       maxContentLength: MAX_RESPONSE_BYTES,
       maxBodyLength: MAX_RESPONSE_BYTES,
       maxRedirects: 0,
@@ -147,7 +146,27 @@ export async function listLlmReviewModels(settings: StoredLlmReviewSettings): Pr
       validateStatus: () => true,
     })
     if (!Number.isInteger(response.status) || response.status < 200 || response.status >= 300) throw statusError(response.status)
-    return parseModelIds(response.data, secrets)
+    return parseModelIds(response.data, options.secrets)
+  } catch (error) {
+    throw safeLlmApiError(error)
+  }
+}
+
+/** Fetches in the main process; neither credentials nor upstream bodies leave here. */
+export async function listLlmReviewModels(settings: StoredLlmReviewSettings): Promise<string[]> {
+  try {
+    const apiKey = settings.apiKey?.trim()
+    if (!apiKey || apiKey.length > 16_384 || UNSAFE_TEXT.test(settings.apiKey!)) throw new LlmModelCatalogError('configuration')
+    const endpoint = resolveLlmApiEndpoint(settings.baseUrl ?? '', 'models')
+    const proxy = configuredProxy(settings)
+    const secrets = protectedLlmApiValues(settings)
+    const timeoutSeconds = Number.isFinite(settings.timeoutSeconds) ? Math.max(1, Math.min(60, settings.timeoutSeconds)) : 30
+    return await requestLlmModels(endpoint, {
+      headers: llmApiHeaders(settings),
+      proxy,
+      timeout: timeoutSeconds * 1_000,
+      secrets,
+    })
   } catch (error) {
     // Do not attach causes, stringify errors, or expose axios request/response/config.
     throw safeLlmApiError(error)

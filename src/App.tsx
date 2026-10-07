@@ -19,7 +19,10 @@ import { playAttentionAudio } from './attention-audio'
 import AttentionSoundSettingsDialog from './AttentionSoundSettingsDialog'
 import NetworkRetryControls from './NetworkRetryControls'
 import AutoCompactControls from './AutoCompactControls'
+import ProviderModelField from './ProviderModelField'
 import SessionContinuationDialog from './SessionContinuationDialog'
+import SessionBindingDialog from './SessionBindingDialog'
+import SessionRecoveryDialog from './SessionRecoveryDialog'
 import type { NetworkRetrySettings } from './shared/network-retry'
 import ApprovalModeDialog from './ApprovalModeDialog'
 import { APPROVAL_MODE_LABEL, approvalModeOf } from './shared/approval-mode'
@@ -611,7 +614,7 @@ function NewAgentForm({ open, initialImport, onClose, onCreated }: { open: boole
             {configSource === 'custom' ? <><div className='launcher-config-form'>
               <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} placeholder={agentKind === 'claude' ? 'https://api.anthropic.com' : agentKind === 'deepseek' ? 'https://api.deepseek.com' : 'https://api.openai.com/v1'} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => setConfigApiKey(event.target.value)} placeholder='仅加密保存在本机' /></label>
-              <label>Model<input className='launcher-field' disabled={!configEnabled || agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
+              <ProviderModelField baseUrl={configBaseUrl} apiKey={configApiKey} disabled={!configEnabled} deepseek={agentKind === 'deepseek'} value={configModel} onChange={setConfigModel} />
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} placeholder={'--feature\nvalue'} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 不写入 Host 注册表、审计正文或终端回放；Manager 启动 Agent 时才临时解密。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
@@ -783,7 +786,7 @@ function EditAgentForm({ open, session, onClose, onSaved }: { open: boolean; ses
               <label>Base URL<input className='launcher-field' disabled={!configEnabled} value={configBaseUrl} onChange={(event) => setConfigBaseUrl(event.target.value)} /></label>
               <label>API Key<input className='launcher-field' disabled={!configEnabled} type='password' autoComplete='off' value={configApiKey} onChange={(event) => { setConfigApiKey(event.target.value); if (event.target.value) setClearApiKey(false) }} placeholder={session.agentConfig?.hasApiKey ? '已安全保存，留空保持不变' : '仅加密保存在本机'} /></label>
               {session.agentConfig?.hasApiKey && <label className='launcher-clear-secret'><input type='checkbox' disabled={!configEnabled} checked={clearApiKey} onChange={(event) => { setClearApiKey(event.target.checked); if (event.target.checked) setConfigApiKey('') }} />清除已保存的 API Key</label>}
-              <label>Model<input className='launcher-field' disabled={!configEnabled || session.agentKind === 'deepseek'} value={configModel} onChange={(event) => setConfigModel(event.target.value)} placeholder={session.agentKind === 'deepseek' ? '请在 DeepSeek Harness Web 设置中配置' : '留空时继承本机默认模型'} /></label>
+              <ProviderModelField baseUrl={configBaseUrl} apiKey={configApiKey} sessionId={session.sessionId} clearApiKey={clearApiKey} disabled={!configEnabled} deepseek={session.agentKind === 'deepseek'} value={configModel} onChange={setConfigModel} />
               <label>启动参数（每行一个）<textarea className='launcher-field' disabled={!configEnabled} rows={4} value={configArgs} onChange={(event) => setConfigArgs(event.target.value)} /></label>
             </div>
             <div className='launcher-config-security'><strong>安全边界</strong><span>API Key 只保存在 Manager 的加密配置中，不修改 Agent 本机配置。</span></div></> : <CCSwitchProviderList providers={ccSwitchProviders} selectedId={ccSwitchProviderId} loading={ccSwitchLoading} error={ccSwitchError} disabled={!configEnabled} onSelect={(provider) => setCCSwitchProviderId(provider.id)} onRefresh={() => { void loadCCSwitchProviders() }} />}
@@ -828,6 +831,9 @@ export default function App(): JSX.Element {
   const [llmReviewInitialView, setLlmReviewInitialView] = useState<'settings' | 'results'>('settings')
   const [showEditor, setShowEditor] = useState(false)
   const [continuationSource, setContinuationSource] = useState<SessionSummary>()
+  const [bindingTarget, setBindingTarget] = useState<{ session: SessionSummary; mode: 'history' | 'fresh' }>()
+  const [recoveryChoiceId, setRecoveryChoiceId] = useState<string>()
+  const dismissedRecoveryChoices = useRef(new Set<string>())
   const [editingSessionId, setEditingSessionId] = useState<string>()
   const [navigationMenuOpen, setNavigationMenuOpen] = useState(false)
   const [fullAutoSessionId, setFullAutoSessionId] = useState<string>()
@@ -849,7 +855,23 @@ export default function App(): JSX.Element {
   useEffect(() => {
     writeOverviewPreferences({ overviewMode, arrangement, groupByWorkspace, ...(activeWorkspace ? { activeWorkspace } : {}), sessionOrder, statusFilter })
   }, [activeWorkspace, groupByWorkspace, overviewMode, arrangement, sessionOrder, statusFilter])
+  const recoveryChoice = sessions.find(session => session.sessionId === recoveryChoiceId && session.startupRecoveryRequired)
+  useEffect(() => {
+    if (recoveryChoiceId && !sessions.some(session => session.sessionId === recoveryChoiceId && session.startupRecoveryRequired)) setRecoveryChoiceId(undefined)
+  }, [sessions, recoveryChoiceId])
+  useEffect(() => {
+    if (bindingTarget || recoveryChoiceId || showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || fullAutoSessionId || continuationSource || navigationMenuOpen) return
+    const failed = sessions.find(session => session.startupRecoveryRequired && ['codex', 'claude'].includes(session.agentKind)
+      && !dismissedRecoveryChoices.current.has(session.sessionId + ':' + session.activitySince))
+    if (failed) setRecoveryChoiceId(failed.sessionId)
+  }, [sessions, bindingTarget, recoveryChoiceId, showForm, showEditor, showApprovalRules, showContinueKeywords, showSessionSafety, showDingTalkSettings, showLlmReviewSettings, showAttentionSoundSettings, fullAutoSessionId, continuationSource, navigationMenuOpen])
+  const dismissRecoveryChoice = (): void => {
+    if (recoveryChoice) dismissedRecoveryChoices.current.add(recoveryChoice.sessionId + ':' + recoveryChoice.activitySince)
+    setRecoveryChoiceId(undefined)
+  }
   const closeOtherOverlays = useCallback((except: OverlayKind | 'navigation'): void => {
+    setBindingTarget(undefined)
+    setRecoveryChoiceId(undefined)
     if (except !== 'continuation') setContinuationSource(undefined)
     if (except !== 'agent-form') setShowForm(false)
     if (except !== 'agent-editor') setShowEditor(false)
@@ -993,7 +1015,7 @@ export default function App(): JSX.Element {
   const listSessions = overviewSessions
   const activeListSessionId = listSessions.some((session) => session.sessionId === listActiveId) ? listActiveId : listSessions[0]?.sessionId
   const hasAttentionOverlay = showForm || showEditor || showApprovalRules || showContinueKeywords || showSessionSafety
-    || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || Boolean(fullAutoSessionId || continuationSource) || navigationMenuOpen
+    || showDingTalkSettings || showLlmReviewSettings || showAttentionSoundSettings || Boolean(fullAutoSessionId || continuationSource) || navigationMenuOpen || Boolean(bindingTarget || recoveryChoice)
   const candidateSoundSessionId = view !== 'overview' || hasAttentionOverlay ? undefined : selected?.sessionId
     ?? (overviewMode === 'list' ? activeListSessionId : wallActiveId && overviewSessionIds.has(wallActiveId) ? wallActiveId : undefined)
   const runningCount = useMemo(() => overviewSessions.filter((session) => sessionDisplayStatus(session) === 'running').length, [overviewSessions])
@@ -1114,7 +1136,9 @@ export default function App(): JSX.Element {
                 retained={retainedTerminals.has(session.sessionId)}
                 freeLayout={freeMode && freeLayout.windows[session.sessionId] ? { rect: freeLayout.windows[session.sessionId]!, start: (edge, event) => freeLayout.start(session.sessionId, edge, event), keyAdjust: (edge, event) => freeLayout.keyAdjust(session.sessionId, edge, event) } : undefined}
                 onOpen={() => setSelectedId(session.sessionId)}
-                onEdit={() => openAgentEditor(session.sessionId)}
+                onEdit={() => openAgentEditor(session.sessionId)} onBinding={mode => {
+                  closeOtherOverlays('navigation'); setBindingTarget({ session, mode })
+                }}
                 onContinuation={() => { closeOtherOverlays('continuation'); setContinuationSource(session) }}
                 onFullAuto={() => openFullAuto(session.sessionId)}
                 draggable={!selected && overviewMode === 'wall' && !freeMode}
@@ -1138,6 +1162,14 @@ export default function App(): JSX.Element {
       <MotionPresence open={Boolean(formMounted)}>{formMounted && <NewAgentForm open={showForm} initialImport={externalImport} onClose={() => setShowForm(false)} onCreated={(workspace, sessionId) => { setActiveWorkspace(workspace); if (sessionId) { setListActiveId(sessionId); setWallActiveId(sessionId); setSelectedId(sessionId); setView('overview') } setShowForm(false); setFormMounted(false); setExternalImport(undefined); void reload() }} />}</MotionPresence>
       <MotionPresence open={Boolean(editingSession)}>{editingSession && <EditAgentForm open={showEditor} session={editingSession} onClose={() => setShowEditor(false)} onSaved={() => { setShowEditor(false); void reload() }} />}</MotionPresence>
       <MotionPresence open={Boolean(continuationSource)}>{continuationSource && <SessionContinuationDialog source={continuationSource} onClose={() => setContinuationSource(undefined)} onCreated={session => { setActiveWorkspace(session.workspace); setListActiveId(session.sessionId); void reload() }} onRemoved={() => { void reload() }} />}</MotionPresence>
+      <MotionPresence open={Boolean(bindingTarget)}>{bindingTarget && <SessionBindingDialog key={bindingTarget.session.sessionId + ':' + bindingTarget.mode} session={bindingTarget.session} mode={bindingTarget.mode} onClose={() => setBindingTarget(undefined)} onChanged={() => { void reload() }} />}</MotionPresence>
+      <MotionPresence open={Boolean(recoveryChoice)}>{recoveryChoice && <SessionRecoveryDialog session={recoveryChoice} onClose={dismissRecoveryChoice}
+        onChoose={choice => {
+          const target = recoveryChoice
+          dismissRecoveryChoice()
+          if (choice === 'retry') void window.agentManager.restartSession(target.sessionId).catch(() => undefined).finally(() => { void reload() })
+          else setBindingTarget({ session: target, mode: choice })
+        }} />}</MotionPresence>
       <MotionPresence open={Boolean(showApprovalRules)}>{showApprovalRules && <ApprovalRulesDialog onClose={() => setShowApprovalRules(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showContinueKeywords)}>{showContinueKeywords && <ContinueKeywordDialog onClose={() => setShowContinueKeywords(false)} />}</MotionPresence>
       <MotionPresence open={Boolean(showSessionSafety)}>{showSessionSafety && <SessionSafetyDialog onClose={() => setShowSessionSafety(false)} />}</MotionPresence>

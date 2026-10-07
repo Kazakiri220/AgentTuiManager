@@ -105,6 +105,7 @@ interface TerminalTileProps {
   onActivate?: () => void
   onOpen?: () => void
   onEdit?: () => void
+  onBinding?: (mode: 'history' | 'fresh') => void
   onContinuation?: () => void
   onFullAuto?: () => void
   draggable?: boolean
@@ -114,7 +115,7 @@ interface TerminalTileProps {
   onDragOver?: () => void
 }
 
-export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver, freeLayout }: TerminalTileProps): JSX.Element {
+export default function TerminalTile({ session, approval, detail = false, embedded = false, hidden = false, retained = true, active = false, onActivate, onOpen, onEdit, onContinuation, onBinding, onFullAuto, draggable = false, dragging = false, onDragStart, onDragEnd, onDragOver, freeLayout }: TerminalTileProps): JSX.Element {
   const hostRef = useRef<HTMLDivElement>(null)
   const [actionError, setActionError] = useState('')
   const [actionBusy, setActionBusy] = useState<'restart' | 'remove'>()
@@ -684,6 +685,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
       setActionError((message) => isClosedPreviousHostError(message) ? '' : message)
     }
   }, [session.status])
+  useEffect(() => { setActionError('') }, [session.activitySince, session.nativeSessionId])
 
   const openDetail = (): void => { if (!detail && !embedded && !terminalEnded) onOpen?.() }
   const runAction = (action: () => Promise<void> | void, busy?: 'restart' | 'remove'): void => {
@@ -719,7 +721,7 @@ export default function TerminalTile({ session, approval, detail = false, embedd
           </div></div>
         </div>
         <div className="terminal-actions">
-          <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
+          <span title={session.activityError ?? session.lastError} className={'status-badge status-' + sessionDisplayStatus(session)}>{session.status === 'starting' ? '正在启动' : SESSION_STATUS_LABEL[sessionDisplayStatus(session)]}</span>
           {!terminalEnded && !deepSeekWeb && onFullAuto && <button className={'full-auto-tile-button' + (approvalModeOf(session) !== 'manual' ? ' active' : '')} type="button" title="随时切换审批模式" aria-label={'审批模式：' + APPROVAL_MODE_LABEL[approvalModeOf(session)]} onClick={(event) => { event.stopPropagation(); onFullAuto() }}>{APPROVAL_MODE_LABEL[approvalModeOf(session)]}</button>}
           <button className="button-ghost workspace-folder-button" type="button" title="打开工作区文件夹" aria-label={`打开 ${session.displayName} 的工作区文件夹`} onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.openSessionWorkspace(session.sessionId)) }}><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M3 7V5a1 1 0 0 1 1-1h5l2 3h9a1 1 0 0 1 1 1v2M3 7v12a1 1 0 0 0 1 1h15l3-10H7L4 20" /></svg></button>
           {onEdit && <button className="button-ghost" type="button" title="编辑 Agent" onClick={(event) => { event.stopPropagation(); onEdit() }} aria-label={`编辑 ${session.displayName}`}>✎</button>}
@@ -731,6 +733,10 @@ export default function TerminalTile({ session, approval, detail = false, embedd
           </> : <button className="button-danger" type="button" aria-label="停止" title="停止" onClick={(event) => { event.stopPropagation(); runAction(() => window.agentManager.stopSession(session.sessionId)) }}>■</button>}
         </div>
       </header>
+      {onBinding && (terminalEnded || session.status === 'needs_attention') && ['codex', 'claude'].includes(session.agentKind) && <div className='session-binding-actions' onClick={event => event.stopPropagation()}>
+        <button type='button' className='button-secondary mini-button' onClick={() => onBinding('history')}>切换历史会话</button>
+        <button type='button' className='button-secondary mini-button' onClick={() => onBinding('fresh')}>按原配置开启新会话</button>
+      </div>}
       {terminalEnded ? <div className="terminal-ended" onClick={(event) => event.stopPropagation()}>
         <div className="terminal-ended-icon">›_</div>
         <strong>{session.status === 'completed' ? 'Agent 已正常完成' : session.status === 'stopped' ? 'Agent 已停止' : 'Agent 运行失败'}</strong>

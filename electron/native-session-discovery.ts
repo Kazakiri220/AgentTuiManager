@@ -40,6 +40,7 @@ const MAX_HISTORY_LINE_BYTES = 2 * 1024 * 1024
 const MAX_RESULTS = 200
 const READ_CHUNK_BYTES = 64 * 1024
 const DISCOVERY_CONCURRENCY = 24
+const MAX_CLAUDE_BINDING_LINES = 100
 
 async function walk(root: string): Promise<string[]> {
   const files: string[] = []
@@ -487,6 +488,42 @@ export async function discoverGlobalCodexSessions(
   const excluded = new Set(options.excludeSessionIds)
   const sessions = await cache.inFlight
   return sessions.filter((session) => !excluded.has(session.id)).slice(0, limit).map((session) => ({ ...session }))
+}
+
+/** 切换绑定时只接受存在实际对话内容的会话，不把输入历史当成对话。 */
+export async function discoverBindableSessions(agentKind: AgentKind, workspace: string, options: NativeSessionDiscoveryOptions = {}): Promise<NativeSessionSummary[]> {
+  if (agentKind !== 'claude') return discoverNativeSessions(agentKind, workspace, options)
+  const reader = options.reader ?? defaultReader
+  const root = options.roots?.claude ?? process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
+  const history = new Map((await discoverClaude(workspace, root, reader)).map(item => [item.id, item]))
+  const listedFiles = await reader.listFiles(join(root, 'projects')).catch(() => [])
+  // Enumerate all directories before selecting results, with bounded parallel
+  // prefix reads. Neither transcript contents nor paths leave this function.
+  const files = [...new Set(listedFiles)].filter(file => /\.jsonl$/i.test(file) && !/[\\/]subagents[\\/]/i.test(file))
+  const sessions = new Map<string, NativeSessionSummary>()
+  let cursor = 0
+  await Promise.all(Array.from({ length: Math.min(DISCOVERY_CONCURRENCY, files.length) }, async () => {
+    while (cursor < files.length) {
+      const file = files[cursor++]!
+      const id = basename(file).replace(/\.jsonl$/i, '')
+      if (!id.trim()) continue
+      let count = 0
+      for await (const line of linesOrEmpty(reader, file)) {
+        count += 1
+        const record = jsonRecord(line)
+        if (record && record.sessionId === id && record.isSidechain !== true && !record.agentId
+          && sameWorkspace(record.cwd, workspace) && (record.type === 'user' || record.type === 'assistant')) {
+          const previous = history.get(id)
+          const state = await fileState(reader, file)
+          const candidate = { id, workspace, title: previous?.title ?? titleFrom(id)!, updatedAt: Math.max(state.updatedAt, previous?.updatedAt ?? 0) }
+          if (!sessions.has(id) || candidate.updatedAt > sessions.get(id)!.updatedAt) sessions.set(id, candidate)
+          break
+        }
+        if (count >= MAX_CLAUDE_BINDING_LINES) break
+      }
+    }
+  }))
+  return sortSessions(sessions.values())
 }
 
 export async function discoverRecentNativeSessions(
